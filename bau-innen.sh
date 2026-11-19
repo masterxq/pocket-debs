@@ -133,6 +133,37 @@ export DEB_BUILD_OPTIONS="$OPTIONEN noautodbgsym parallel=$(nproc)"
 [ -z "$PROFILE" ] || export DEB_BUILD_PROFILES="$PROFILE"
 dpkg-buildpackage --build=$BAUART -sa -us -uc > $L/build.log 2>&1 || { tail -80 $L/build.log; fehler "dpkg-buildpackage"; }
 cd $B
+
+# Absicherung gegen stille Fehlfunde: findet der Bau eine optionale Abhaengigkeit nicht, baut er ohne Fehler mit
+# weniger Funktionen. Daher jedes Binaerpaket mit Debians Paket der Grundfassung vergleichen (Dateiliste ohne
+# usr/share/doc, Paketnamen in Depends/Pre-Depends/Recommends). Fehlt bei uns etwas: Fehler. Ergebnis in
+# /out/log/vergleich.txt. Pakete, deren Debian-Fassung nicht mehr im Index steht, werden nicht verglichen.
+namen() { dpkg-deb -f "$1" Depends Pre-Depends Recommends | sed 's/^[A-Za-z-]*: //; s/([^)]*)//g; s/:any//g' \
+	| tr ',|' '\n\n' | tr -d ' ' | sed '/^$/d' | sort -u; }
+dateien() { dpkg-deb --fsys-tarfile "$1" | tar -t | sed 's|^\./||; \|^usr/share/doc/|d; \|/$|d' | sort -u; }
+mkdir -p $B/debian-ref
+V=$L/vergleich.txt
+: > $V
+abw=0
+for d in $B/*.deb; do
+	p=$(dpkg-deb -f "$d" Package)
+	dv=$(apt-cache madison "$p" 2>/dev/null | awk -v v="$DEBIAN" '$3 == v || index($3, v "+b") == 1 {print $3}' | sort -V | tail -1)
+	if [ -z "$dv" ]; then echo "$p: Debian $DEBIAN nicht im Index, nicht verglichen" >> $V; continue; fi
+	(cd $B/debian-ref && apt-get download -q "$p=$dv" > /dev/null 2>&1) || { echo "$p: Debian $dv nicht ladbar, nicht verglichen" >> $V; continue; }
+	r=$(ls $B/debian-ref/${p}_*.deb)
+	T=$B/debian-ref
+	dateien "$r" > $T/r.d; dateien "$d" > $T/e.d; namen "$r" > $T/r.n; namen "$d" > $T/e.n
+	fehlt=$(comm -23 $T/r.d $T/e.d; comm -23 $T/r.n $T/e.n | sed 's/^/Abhaengigkeit /')
+	mehr=$(comm -13 $T/r.d $T/e.d; comm -13 $T/r.n $T/e.n | sed 's/^/Abhaengigkeit /')
+	rm -f "$r"
+	echo "$p: verglichen mit Debian $dv" >> $V
+	[ -z "$mehr" ] || printf '%s\n' "$mehr" | sed "s|^|  $p mehr: |" >> $V
+	if [ -n "$fehlt" ]; then printf '%s\n' "$fehlt" | sed "s|^|  $p FEHLT: |" >> $V; abw=1; fi
+done
+rm -rf $B/debian-ref
+cat $V
+[ $abw = 0 ] || fehler "Binaerpakete weichen von Debian ab (fehlende Dateien oder Abhaengigkeiten, siehe oben): Bauumgebung pruefen"
+
 V0=${FASSUNG#*:}
 for f in *.deb ${QUELLE}_$V0.dsc ${QUELLE}_$V0.debian.tar.* *.orig.tar.* *.orig-*.tar.* *.buildinfo *.changes; do
 	[ -f "$f" ] && cp "$f" /out/
