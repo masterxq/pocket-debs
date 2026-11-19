@@ -312,6 +312,7 @@ nachziehen() {   # nachziehen <quelle> [<fassung>] [--suite <s>] [--uebernehmen]
 		sed -i -e "s|^DEBIAN=.*|DEBIAN=$ziel|" -e "s|^DSC_SHA256=.*|DSC_SHA256=$neu_sum|" -e "s|^LISBON=.*|LISBON=1|" "$R/$q/paket.conf"
 		echo "uebernommen in $R/$q (pruefen mit git -C $R diff, dann ./bau.sh bau $q)"
 	else
+		rm -rf "$O/dl/$q/$oe"
 		echo "trocken: nichts geaendert. Uebernehmen mit: ./bau.sh nachziehen $q $ziel --suite $s --uebernehmen"
 		echo "  (DEBIAN=$ziel DSC_SHA256=$neu_sum LISBON=1)"
 	fi
