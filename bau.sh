@@ -21,6 +21,7 @@
 #   PAKETE_TIMEOUT (Sekunden je Containerlauf, Standard 21600), NICE (Standard 10).
 # Rueckgabe: 0 gut, 1 Fehler, 2 Aufruf, 3 neuere Debian-Fassung (pruefen) bzw. Patch-Konflikt (nachziehen).
 set -euo pipefail
+{ # ganzes Skript als ein Block: bash liest es vor dem Start vollstaendig (Aenderungen waehrend eines Laufs schaden nicht)
 R=$(cd "$(dirname "$0")" && pwd)
 PROJEKT=${PAKETE_PROJEKT:-$(dirname "$R")}
 O=${PAKETE_OUT:-$PROJEKT/out/pakete}
@@ -54,7 +55,7 @@ images() {
 lade_conf() {   # lade_conf <quelle>: Variablen aus <quelle>/paket.conf
 	local q=$1
 	[ -f "$R/$q/paket.conf" ] || fehler "unbekanntes Paket $q ($R/$q/paket.conf fehlt)"
-	QUELLE= DEBIAN= DSC_SHA256= LISBON= OPTIONEN=nocheck PROFILE= BAUART=source,any IMAGE= IMAGE_AN=0 STATUS=aktiv DATEIEN= DATEIEN_KOPF= CHANGELOG=
+	QUELLE= DEBIAN= DSC_SHA256= LISBON= OPTIONEN=nocheck PROFILE= BAUART=source,any IMAGE= IMAGE_AN=0 STATUS=aktiv DATEIEN= DATEIEN_KOPF= CHANGELOG= PRUEFEN=
 	. "$R/$q/paket.conf"
 	[ "$QUELLE" = "$q" ] || fehler "$q/paket.conf: QUELLE=$QUELLE passt nicht zum Ordner"
 	OHNE_EPOCHE=${DEBIAN#*:}
@@ -147,7 +148,7 @@ Description: $REPO_DESCRIPTION
 $sign
 EOF
 	printf 'verbose\nbasedir /repo\n' > "$O/repo/conf/options"
-	docker run --rm -u "$(id -u):$(id -g)" -v "$O/repo:/repo" -v "$O/bau:/bau:ro" \
+	flock -w 600 "$O/.repo.lock" docker run --rm -u "$(id -u):$(id -g)" -v "$O/repo:/repo" -v "$O/bau:/bau:ro" \
 		${sign:+-v "$(cd "$g" && pwd):/gnupg" -e GNUPGHOME=/gnupg} "$REPOIMG" reprepro -b /repo "$@"
 }
 im_repo() {   # im_repo: Quelle in unserer Fassung im Repo und mit diesem Schluessel gebaut?
@@ -160,6 +161,9 @@ bau() {   # bau <quelle> <neu 0|1>
 	lade_conf "$1"
 	local K W rc
 	K=$(schluessel)
+	# Sperre je Paket: parallele Aufrufe (z. B. zwei Image-Bauten) bauen dasselbe Paket nicht doppelt
+	exec 7>> "$O/.bau-$QUELLE.lock"
+	flock -w "$TIMEOUT" 7 || fehler "Sperre $O/.bau-$QUELLE.lock"
 	if [ "$2" = 0 ] && im_repo "$K"; then
 		log "$QUELLE $FASSUNG: uebersprungen (gleicher Eingabeschluessel $K im Repo; --neu erzwingt)"
 		return 0
@@ -180,16 +184,21 @@ bau() {   # bau <quelle> <neu 0|1>
 		"$BAUIMG" $NI sh /pakete/bau-innen.sh || rc=$?
 	[ $rc = 0 ] || fehler "$QUELLE: Bau fehlgeschlagen (rc $rc, Logs in $W/out/log)"
 	echo "Bauzeit $(( (SECONDS - t0) / 60 )) min"
+	# Pruefung aus paket.conf (Shell, laeuft im Ergebnisordner mit den .deb)
+	if [ -n "$PRUEFEN" ]; then
+		(cd "$W/out" && eval "$PRUEFEN") > "$W/pruefung.log" 2>&1 || { cat "$W/pruefung.log"; fehler "$QUELLE: PRUEFEN fehlgeschlagen"; }
+		cat "$W/pruefung.log"
+	fi
 	# Ergebnis ins Repo; gleiche Fassung mit anderem Inhalt wird ersetzt (lokal) bzw. abgelehnt (PAKETE_STRENG=1)
 	if [ -f "$O/repo/pool/$POOL/${QUELLE}_$FASSUNG_DATEI.dsc" ]; then
 		[ "${PAKETE_STRENG:-0}" != 1 ] || fehler "$QUELLE $FASSUNG liegt mit anderem Inhalt im Repo: LISBON in $QUELLE/paket.conf erhoehen"
 		echo "WARNUNG: $QUELLE $FASSUNG lag mit anderen Eingaben im Repo und wird ersetzt (vor einer Veroeffentlichung LISBON erhoehen)" >&2
 	fi
 	repo removesrc "$SUITE" "$QUELLE" > /dev/null 2>&1 || true
-	repo includedsc "$SUITE" "/bau/$QUELLE/$FASSUNG_DATEI/out/${QUELLE}_$FASSUNG_DATEI.dsc"
+	repo -C "$REPO_COMPONENT" includedsc "$SUITE" "/bau/$QUELLE/$FASSUNG_DATEI/out/${QUELLE}_$FASSUNG_DATEI.dsc"
 	local debs=
 	for e in "$W"/out/*.deb; do debs="$debs /bau/$QUELLE/$FASSUNG_DATEI/out/$(basename "$e")"; done
-	repo includedeb "$SUITE" $debs
+	repo -C "$REPO_COMPONENT" includedeb "$SUITE" $debs
 	mkdir -p "$O/repo/lisbon"
 	echo "fassung=$FASSUNG schluessel=$K" > "$O/repo/lisbon/$QUELLE.stand"
 	{
@@ -338,8 +347,6 @@ case "$CMD" in
 			case $a in --neu) neu=1 ;; alle|image) qs="$qs $(alle_pakete "$a" | tr '\n' ' ')" ;; -*) fehler "unbekannte Option $a" ;; *) qs="$qs $a" ;; esac
 		done
 		[ -n "${qs// /}" ] || { [ "$*" = image ] || [ "$*" = alle ] || { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }; echo "keine Pakete fuer $*"; exit 0; }
-		exec 8>> "$O/.bau.lock"
-		flock -w "$TIMEOUT" 8 || fehler "Sperre $O/.bau.lock"
 		images
 		for q in $qs; do ( bau "$q" "$neu" ); done
 		;;
@@ -350,3 +357,5 @@ case "$CMD" in
 	schluessel) lade_conf "${1:?quelle}"; images; schluessel_teile; echo "schluessel=$(schluessel)" ;;
 	*) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
+exit
+}
