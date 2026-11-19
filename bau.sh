@@ -60,6 +60,7 @@ lade_conf() {   # lade_conf <quelle>: Variablen aus <quelle>/paket.conf
 	OHNE_EPOCHE=${DEBIAN#*:}
 	FASSUNG=$DEBIAN+$VERSION_TAG$LISBON
 	FASSUNG_DATEI=${FASSUNG#*:}
+	export QUELLE DEBIAN FASSUNG OPTIONEN PROFILE BAUART MAINTAINER SUITE CHANGELOG DATEIEN_KOPF
 	case $QUELLE in lib?*) POOL=main/${QUELLE:0:4}/$QUELLE ;; *) POOL=main/${QUELLE:0:1}/$QUELLE ;; esac
 }
 
