@@ -35,7 +35,7 @@ FORMAT=$(cat debian/source/format 2>/dev/null || echo "1.0")
 [ "$FORMAT" = "3.0 (quilt)" ] || fehler "Quellformat $FORMAT: nur 3.0 (quilt) wird unterstuetzt"
 
 export QUILT_PATCHES=debian/patches QUILT_PC=.pc
-export QUILT_REFRESH_ARGS="-p ab --no-timestamps --no-index"
+auffrischen() { quilt refresh -p ab --no-timestamps --no-index > /dev/null; }
 mkdir -p debian/patches/lisbon
 touch debian/patches/series
 # Debian-Patches sind nach dpkg-source -x angewendet; quilt muss das ebenso sehen
@@ -56,7 +56,7 @@ if [ -n "$(find /dateien -type f 2>/dev/null | head -1)" ]; then
 		cp "/dateien/$f" "$f"
 	done
 	printf '%s\n' "$DATEIEN_KOPF" | quilt header -r > /dev/null
-	quilt refresh > /dev/null
+	auffrischen
 	echo "$P ok (erzeugt aus DATEIEN)" >> /out/patches.txt
 fi
 # 2. Patches aus pakete/<quelle>/patches, nach Namen sortiert
@@ -68,7 +68,7 @@ for p in /rezept/patches/*.patch; do
 	if quilt push --fuzz=0 > $L/quilt-$(basename "$p").log 2>&1; then
 		if grep -q 'offset' $L/quilt-$(basename "$p").log; then
 			echo "$n versatz" >> /out/patches.txt
-			[ "$MODUS" != nachziehen ] || quilt refresh > /dev/null
+			[ "$MODUS" != nachziehen ] || auffrischen
 		else
 			echo "$n ok" >> /out/patches.txt
 		fi
@@ -81,7 +81,7 @@ for p in /rezept/patches/*.patch; do
 		sed -i "\|^$n\$|d" debian/patches/series
 		rm -f "debian/patches/$n"
 	elif [ "$MODUS" = nachziehen ] && quilt push --fuzz=3 > $L/quilt-fuzz-$(basename "$p").log 2>&1; then
-		quilt refresh > /dev/null
+		auffrischen
 		echo "$n unschaerfe (mit fuzz angewendet und aufgefrischt: Ergebnis pruefen)" >> /out/patches.txt
 	elif patch -p1 -F3 --dry-run -s -f < "debian/patches/$n" > /dev/null 2>&1; then
 		echo "$n unschaerfe (nur mit fuzz anwendbar: build/pakete.sh nachziehen)" >> /out/patches.txt
@@ -90,9 +90,8 @@ for p in /rezept/patches/*.patch; do
 	else
 		echo "$n konflikt" >> /out/patches.txt
 		mkdir -p /out/konflikte
-		patch -p1 -f --dry-run < "debian/patches/$n" > /out/konflikte/$(basename "$p").txt 2>&1 || true
-		# .rej-Dateien fuer die Nacharbeit (Baum wird verworfen)
-		patch -p1 -f -r - < "debian/patches/$n" >> /out/konflikte/$(basename "$p").txt 2>&1 || true
+		# Ausgabe von patch und die abgelehnten Hunks fuer die Nacharbeit (der Baum wird verworfen)
+		patch -p1 -f -r /out/konflikte/$(basename "$p").rej < "debian/patches/$n" > /out/konflikte/$(basename "$p").txt 2>&1 || true
 		STATUS=fehler
 		break
 	fi
@@ -134,7 +133,8 @@ export DEB_BUILD_OPTIONS="$OPTIONEN noautodbgsym parallel=$(nproc)"
 [ -z "$PROFILE" ] || export DEB_BUILD_PROFILES="$PROFILE"
 dpkg-buildpackage --build=$BAUART -sa -us -uc > $L/build.log 2>&1 || { tail -80 $L/build.log; fehler "dpkg-buildpackage"; }
 cd $B
-for f in *.deb *.dsc *.debian.tar.* *.orig.tar.* *.buildinfo *.changes; do
+V0=${FASSUNG#*:}
+for f in *.deb ${QUELLE}_$V0.dsc ${QUELLE}_$V0.debian.tar.* *.orig.tar.* *.orig-*.tar.* *.buildinfo *.changes; do
 	[ -f "$f" ] && cp "$f" /out/
 done
 cp $B/src/debian/changelog /out/log/changelog

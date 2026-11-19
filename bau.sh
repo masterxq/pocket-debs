@@ -195,7 +195,7 @@ bau() {   # bau <quelle> <neu 0|1>
 		echo "WARNUNG: $QUELLE $FASSUNG lag mit anderen Eingaben im Repo und wird ersetzt (vor einer Veroeffentlichung LISBON erhoehen)" >&2
 	fi
 	repo removesrc "$SUITE" "$QUELLE" > /dev/null 2>&1 || true
-	repo -C "$REPO_COMPONENT" includedsc "$SUITE" "/bau/$QUELLE/$FASSUNG_DATEI/out/${QUELLE}_$FASSUNG_DATEI.dsc"
+	repo -C "$REPO_COMPONENT" -P optional includedsc "$SUITE" "/bau/$QUELLE/$FASSUNG_DATEI/out/${QUELLE}_$FASSUNG_DATEI.dsc"
 	local debs=
 	for e in "$W"/out/*.deb; do debs="$debs /bau/$QUELLE/$FASSUNG_DATEI/out/$(basename "$e")"; done
 	repo -C "$REPO_COMPONENT" includedeb "$SUITE" $debs
@@ -214,7 +214,7 @@ bau() {   # bau <quelle> <neu 0|1>
 	cat "$W/SHA256SUMS"
 	# Platz: Pakete und Quellen liegen jetzt im Repo-Pool; im Bauordner bleiben Logs, .buildinfo, .changes, Stand.
 	# Aeltere Bauordner dieser Quelle entfallen.
-	rm -f "$W"/out/*.deb "$W"/out/*.orig.tar.* "$W"/out/*.debian.tar.* "$W"/out/*.dsc
+	rm -f "$W"/out/*.deb "$W"/out/*.orig.tar.* "$W"/out/*.orig-*.tar.* "$W"/out/*.debian.tar.* "$W"/out/*.dsc
 	rm -rf "$W/dateien"
 	find "$O/bau/$QUELLE" -mindepth 1 -maxdepth 1 -type d ! -name "$FASSUNG_DATEI" -exec rm -rf {} +
 }
