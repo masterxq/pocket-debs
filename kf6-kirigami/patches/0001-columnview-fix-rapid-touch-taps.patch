@@ -1,0 +1,148 @@
+From: Devin Lin <espidev@gmail.com>
+Date: Sat, 19 Sep 2026 08:27:42 -0400
+Subject: [PATCH] columnview: Fix rapid touch taps not working by fasttracking anim
+Description:
+ BUG: 523866
+ .
+ If the x position is already at the end state, directly finish the
+ animation instead of waiting for the animation to end and eating tap
+ events from the content.
+ .
+ This fixes repeated touches not triggering anything, causing buttons to
+ stop working if pressed more than once repeatedly.
+Origin: upstream, https://invent.kde.org/frameworks/kirigami/-/commit/0810418b1109e06a17f615dcf4b41ffcc1962ccd
+Bug: https://bugs.kde.org/523866
+Applied-Upstream: 6.31.0
+License: LGPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-19
+---
+diff --git a/autotests/tst_columnview.qml b/autotests/tst_columnview.qml
+index dfa67899c..df2dc6a23 100644
+--- a/autotests/tst_columnview.qml
++++ b/autotests/tst_columnview.qml
+@@ -5,6 +5,7 @@
+  */
+ 
+ import QtQuick
++import QtQuick.Controls as QQC2
+ import org.kde.kirigami as Kirigami
+ import QtTest
+ 
+@@ -27,6 +28,46 @@ TestCase {
+         Item {}
+     }
+ 
++    Component {
++        id: touchColumnViewComponent
++        Kirigami.ColumnView {
++            width: 300
++            height: 200
++            columnResizeMode: Kirigami.ColumnView.SingleColumn
++            scrollDuration: 1000
++
++            readonly property alias button: button
++
++            Item {
++                QQC2.Button {
++                    id: button
++                    anchors.centerIn: parent
++                    text: "Tap"
++                    property int clickCount: 0
++                    onClicked: clickCount++
++                }
++            }
++        }
++    }
++
++    function test_rapid_touch_taps() {
++        const view = createTemporaryObject(touchColumnViewComponent, this);
++        verify(view);
++        waitForPolish(view);
++        view.currentIndex = 0;
++        tryCompare(view, "moving", false);
++
++        const touch = touchEvent(view.button);
++        for (let i = 0; i < 10; ++i) {
++            touch.press(0, view.button).commit();
++            wait(1);
++            touch.release(0, view.button).commit();
++            wait(1);
++            compare(view.button.clickCount, i + 1);
++        }
++        compare(view.moving, false);
++    }
++
+     function createViewWith3Items() {
+         const view = createTemporaryObject(columnViewComponent, this);
+         verify(view);
+diff --git a/src/layouts/columnview.cpp b/src/layouts/columnview.cpp
+index bb850511c..759437c20 100644
+--- a/src/layouts/columnview.cpp
++++ b/src/layouts/columnview.cpp
+@@ -460,19 +460,7 @@ ContentItem::ContentItem(ColumnView *parent)
+     // NOTE: the duration will be taken from kirigami units upon classBegin
+     m_slideAnim->setDuration(0);
+     m_slideAnim->setEasingCurve(QEasingCurve(QEasingCurve::OutExpo));
+-    connect(m_slideAnim, &QPropertyAnimation::finished, this, [this]() {
+-        while (!m_disappearingItems.isEmpty()) {
+-            m_view->removeItem(m_disappearingItems.first());
+-        }
+-        if (!m_view->currentItem()) {
+-            m_view->setCurrentIndex(m_items.indexOf(m_viewAnchorItem));
+-        } else {
+-            QRectF mapped = m_view->currentItem()->mapRectToItem(m_view, QRectF(QPointF(0, 0), m_view->currentItem()->size()));
+-            if (!QRectF(QPointF(0, 0), m_view->size()).intersects(mapped)) {
+-                m_view->setCurrentIndex(m_items.indexOf(m_viewAnchorItem));
+-            }
+-        }
+-    });
++    connect(m_slideAnim, &QPropertyAnimation::finished, this, &ContentItem::finishAnimation);
+ 
+     m_creationInProgress = false;
+ }
+@@ -481,6 +469,21 @@ ContentItem::~ContentItem()
+ {
+ }
+ 
++void ContentItem::finishAnimation()
++{
++    while (!m_disappearingItems.isEmpty()) {
++        m_view->removeItem(m_disappearingItems.first());
++    }
++    if (!m_view->currentItem()) {
++        m_view->setCurrentIndex(m_items.indexOf(m_viewAnchorItem));
++    } else {
++        QRectF mapped = m_view->currentItem()->mapRectToItem(m_view, QRectF(QPointF(0, 0), m_view->currentItem()->size()));
++        if (!QRectF(QPointF(0, 0), m_view->size()).intersects(mapped)) {
++            m_view->setCurrentIndex(m_items.indexOf(m_viewAnchorItem));
++        }
++    }
++}
++
+ void ContentItem::setBoundedX(qreal x)
+ {
+     if (!parentItem()) {
+@@ -499,6 +502,10 @@ void ContentItem::animateX(qreal newX)
+     const qreal to = qRound(qBound(qMin(0.0, -width() + parentItem()->width()), newX, 0.0));
+ 
+     m_slideAnim->stop();
++    if (qFuzzyCompare(x(), to)) {
++        finishAnimation();
++        return;
++    }
+     m_slideAnim->setStartValue(x());
+     m_slideAnim->setEndValue(to);
+     m_slideAnim->start();
+diff --git a/src/layouts/columnview_p.h b/src/layouts/columnview_p.h
+index 14b382dcb..170da9889 100644
+--- a/src/layouts/columnview_p.h
++++ b/src/layouts/columnview_p.h
+@@ -71,6 +71,8 @@ private Q_SLOTS:
+     void updateRepeaterModel();
+ 
+ private:
++    void finishAnimation();
++
+     // Returns the item x position in the layout:
+     // if is a normal item returns just the item x
+     // if is pinned returns the position of the "hole" in the layout the item leaves

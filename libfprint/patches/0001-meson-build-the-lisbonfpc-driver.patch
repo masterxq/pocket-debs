@@ -1,0 +1,29 @@
+Description: Build the lisbonfpc driver
+ Add lisbonfpc to the default driver list and to the driver sources, so that
+ the Debian build (-Ddrivers=all) includes it. The driver source itself is
+ added by debian/patches/lisbon/0000-lisbon-files.patch.
+Author: lisbon <lisbon@localhost>
+Forwarded: not-needed
+License: LGPL-2.1-or-later (as libfprint)
+Last-Update: 2026-11-19
+--- a/meson.build
++++ b/meson.build
+@@ -115,6 +115,7 @@
+ ]
+ 
+ default_drivers = [
++    'lisbonfpc',
+     'upektc_img',
+     'vfs5011',
+     'vfs7552',
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -87,6 +87,8 @@
+ ]
+ 
+ driver_sources = {
++    'lisbonfpc' :
++        [ 'drivers/lisbonfpc.c' ],
+     'upekts' :
+         [ 'drivers/upekts.c', 'drivers/upek_proto.c' ],
+     'upektc' :

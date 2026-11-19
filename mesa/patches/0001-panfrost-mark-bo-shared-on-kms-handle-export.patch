@@ -1,0 +1,23 @@
+Description: panfrost: mark a BO shared when its KMS handle is exported
+ The caller of resource_get_handle() with WINSYS_HANDLE_TYPE_KMS can turn the
+ GEM handle into a dma-buf itself (drmPrimeHandleToFD(), as Chromium does).
+ Mark the BO as shared so that it does not go back to the BO cache and get
+ recycled while another user still holds it. freedreno does the same.
+Author: lisbon <lisbon@localhost>
+Forwarded: no
+License: MIT (as the patched file)
+Last-Update: 2026-11-19
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -471,6 +471,11 @@
+    if (handle->type == WINSYS_HANDLE_TYPE_KMS && dev->ro) {
+       return renderonly_get_handle(scanout, handle);
+    } else if (handle->type == WINSYS_HANDLE_TYPE_KMS) {
++      /* The caller can turn the GEM handle into a dma-buf itself
++       * (drmPrimeHandleToFD()), so the BO must not go back to the BO cache
++       * and be recycled while someone else still uses it.
++       */
++      rsrc->bo->flags |= PAN_BO_SHARED;
+       handle->handle = panfrost_bo_handle(rsrc->bo);
+    } else if (handle->type == WINSYS_HANDLE_TYPE_FD) {
+       int fd = panfrost_bo_export(rsrc->bo);
