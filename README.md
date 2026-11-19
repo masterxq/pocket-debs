@@ -5,6 +5,7 @@ Debian source package of the target suite plus a few patches, built for arm64 as
 
 | Source | What the patches change | Why |
 |---|---|---|
+| callaudiod | EnableSpeaker selects the voice call profile with the speaker port | with one sink per UCM device the earpiece sink has no speaker port, the speaker button of the call UI did nothing |
 | libfprint | adds the driver `lisbonfpc` | fingerprint sensor of the phone, reached through a local bridge service to the TEE |
 | libcamera | sensor helpers and properties for OV64B40 and OV16A1Q | correct gain, black level and delays for the phone cameras with the software ISP |
 | kf6-kirigami | upstream fix 0810418b (KDE bug 523866, in KF 6.31); a build-only CMake lookup order change | rapid taps in ColumnView pages got lost; the lookup change works around cmake sporadically missing Qt6QmlIntegration under qemu-user |

@@ -1,0 +1,137 @@
+From: lisbon <lisbon@localhost>
+Date: Thu, 19 Nov 2026 12:00:00 +0100
+Subject: [PATCH] cad-pulse: switch the speaker through the card profile
+Description:
+ With one sink per UCM device (PipeWire, PulseAudio 17 and later) the speaker
+ and the earpiece of a phone belong to different card profiles of the voice
+ call verb, e.g. "Voice Call (Earpiece, Mic)" and "Voice Call (Mic, Speaker)".
+ The sink of the active profile has only one of them as a port, so setting the
+ sink port for EnableSpeaker has no effect.
+ .
+ When the sink lacks the port to switch to and a voice call profile is active,
+ select the available voice call profile with the highest priority that has
+ (or does not have) the speaker port.
+Forwarded: no
+License: GPL-3.0-or-later (as the patched file)
+Last-Update: 2026-11-19
+---
+--- a/src/cad-pulse.c
++++ b/src/cad-pulse.c
+@@ -912,6 +912,87 @@
+     }
+ }
+ 
++/*
++ * With one sink per UCM device (PipeWire, PulseAudio 17 and later) the speaker
++ * and the earpiece belong to different card profiles of the voice call verb,
++ * and the sink of the active profile has only one of them as a port. Switching
++ * the speaker then means selecting the voice call profile with, or without,
++ * the speaker port.
++ */
++static void set_speaker_profile(pa_context *ctx, const pa_card_info *info, int eol, void *data)
++{
++    CadPulseOperation *operation = data;
++    pa_card_port_info *speaker = NULL;
++    const char *target_profile = NULL;
++    uint32_t target_priority = 0;
++    pa_operation *op = NULL;
++    guint i, j;
++
++    if (eol != 0)
++        return;
++
++    if (!info) {
++        g_critical("PA returned no card info (eol=%d)", eol);
++        return;
++    }
++
++    if (info->index != operation->pulse->card_id)
++        return;
++
++    for (i = 0; i < info->n_ports; i++) {
++        if (info->ports[i]->direction == PA_DIRECTION_OUTPUT &&
++            info->ports[i]->type == PA_DEVICE_PORT_TYPE_SPEAKER) {
++            speaker = info->ports[i];
++            break;
++        }
++    }
++
++    if (speaker && info->active_profile2 &&
++        g_str_has_prefix(info->active_profile2->name, SND_USE_CASE_VERB_VOICECALL)) {
++        for (i = 0; i < info->n_profiles; i++) {
++            pa_card_profile_info2 *profile = info->profiles2[i];
++            gboolean has_speaker = FALSE;
++
++            if (!profile->available ||
++                !g_str_has_prefix(profile->name, SND_USE_CASE_VERB_VOICECALL))
++                continue;
++
++            for (j = 0; j < speaker->n_profiles; j++) {
++                if (g_strcmp0(speaker->profiles2[j]->name, profile->name) == 0) {
++                    has_speaker = TRUE;
++                    break;
++                }
++            }
++
++            if (has_speaker != !!operation->value)
++                continue;
++
++            if (!target_profile || profile->priority > target_priority) {
++                target_profile = profile->name;
++                target_priority = profile->priority;
++            }
++        }
++    }
++
++    if (target_profile && g_strcmp0(target_profile, info->active_profile2->name) != 0) {
++        g_debug("switching to profile '%s'", target_profile);
++        op = pa_context_set_card_profile_by_index(ctx, operation->pulse->card_id,
++                                                  target_profile,
++                                                  operation_complete_cb, operation);
++    }
++
++    if (op) {
++        pa_operation_unref(op);
++    } else {
++        /*
++         * Outside of a call there is no profile to select: the speaker cannot
++         * be forced then, and turning it off needs no action.
++         */
++        g_debug("%s: nothing to be done", __func__);
++        operation_complete_cb(ctx, target_profile || !operation->value, operation);
++    }
++}
++
+ static void set_output_port(pa_context *ctx, const pa_sink_info *info, int eol, void *data)
+ {
+     CadPulseOperation *operation = data;
+@@ -954,6 +1035,29 @@
+             target_port = get_available_sink_port(info, operation->pulse->speaker_port);
+     }
+ 
++    if (operation->op && operation->op->type == CAD_OPERATION_ENABLE_SPEAKER &&
++        operation->pulse->has_voice_profile) {
++        gboolean found = FALSE;
++        guint i;
++
++        for (i = 0; target_port && i < info->n_ports; i++) {
++            if (g_strcmp0(info->ports[i]->name, target_port) == 0) {
++                found = TRUE;
++                break;
++            }
++        }
++
++        if (!found) {
++            g_debug("sink has no port to switch to, looking for a profile");
++            op = pa_context_get_card_info_by_index(ctx, operation->pulse->card_id,
++                                                   set_speaker_profile, operation);
++            if (op) {
++                pa_operation_unref(op);
++                return;
++            }
++        }
++    }
++
+     g_debug("active port is '%s', target port is '%s'", info->active_port->name, target_port);
+ 
+     if (target_port && g_strcmp0(info->active_port->name, target_port) != 0) {
