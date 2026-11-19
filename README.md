@@ -7,7 +7,7 @@ Debian source package of the target suite plus a few patches, built for arm64 as
 |---|---|---|
 | libfprint | adds the driver `lisbonfpc` | fingerprint sensor of the phone, reached through a local bridge service to the TEE |
 | libcamera | sensor helpers and properties for OV64B40 and OV16A1Q | correct gain, black level and delays for the phone cameras with the software ISP |
-| kf6-kirigami | upstream fix 0810418b (KDE bug 523866, in KF 6.31) | rapid taps in ColumnView pages got lost (draft, not built yet) |
+| kf6-kirigami | upstream fix 0810418b (KDE bug 523866, in KF 6.31); a build-only CMake lookup order change | rapid taps in ColumnView pages got lost; the lookup change works around cmake sporadically missing Qt6QmlIntegration under qemu-user |
 | mesa | panfrost: mark a BO shared when its KMS handle is exported (draft) | an exported buffer must not be recycled from the BO cache (not built yet) |
 
 Patches are in `<source>/patches/` in DEP-3 format and are appended to `debian/patches/series` (as
@@ -24,6 +24,8 @@ Needs Docker with qemu-user binfmt for arm64. One entry point, non-interactive:
 
 Each build fetches the Debian source package (the `.dsc` is checked against `DSC_SHA256` in `paket.conf`, all other
 files against the `.dsc`), applies the patches without fuzz, builds in a throwaway `debian:<suite>` container for
-linux/arm64 and adds source and binaries to a reprepro repository (`$PAKETE_OUT/repo`). A build is skipped when the
+linux/arm64, compares every binary package with Debian's package of the same base version (file list without
+`usr/share/doc`, dependency names; anything missing fails the build, so a dependency that the build silently did not
+find cannot drop a feature) and adds source and binaries to a reprepro repository (`$PAKETE_OUT/repo`). A build is skipped when the
 repository already holds the package built from the same inputs (suite, build image, recipe, patches, extra
 files); `--neu` forces it.
