@@ -7,8 +7,8 @@ Debian source package of the target suite plus a few patches, built for arm64 as
 |---|---|---|
 | libfprint | adds the driver `lisbonfpc` | fingerprint sensor of the phone, reached through a local bridge service to the TEE |
 | libcamera | sensor helpers and properties for OV64B40 and OV16A1Q | correct gain, black level and delays for the phone cameras with the software ISP |
-| kf6-kirigami | upstream fix 0810418b (KDE bug 523866, in KF 6.31) | rapid taps in ColumnView pages got lost |
-| mesa | panfrost: mark a BO shared when its KMS handle is exported (draft) | an exported buffer must not be recycled from the BO cache |
+| kf6-kirigami | upstream fix 0810418b (KDE bug 523866, in KF 6.31) | rapid taps in ColumnView pages got lost (draft, not built yet) |
+| mesa | panfrost: mark a BO shared when its KMS handle is exported (draft) | an exported buffer must not be recycled from the BO cache (not built yet) |
 
 Patches are in `<source>/patches/` in DEP-3 format and are appended to `debian/patches/series` (as
 `debian/patches/lisbon/*`), so the resulting source package carries them. Patches in `patches/aus/` are prepared
