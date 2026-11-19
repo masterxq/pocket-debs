@@ -212,6 +212,11 @@ bau() {   # bau <quelle> <neu 0|1>
 	(cd "$W/out" && sha256sum *.deb > ../SHA256SUMS)
 	cat "$W/out/patches.txt"
 	cat "$W/SHA256SUMS"
+	# Platz: Pakete und Quellen liegen jetzt im Repo-Pool; im Bauordner bleiben Logs, .buildinfo, .changes, Stand.
+	# Aeltere Bauordner dieser Quelle entfallen.
+	rm -f "$W"/out/*.deb "$W"/out/*.orig.tar.* "$W"/out/*.debian.tar.* "$W"/out/*.dsc
+	rm -rf "$W/dateien"
+	find "$O/bau/$QUELLE" -mindepth 1 -maxdepth 1 -type d ! -name "$FASSUNG_DATEI" -exec rm -rf {} +
 }
 
 # ---------------- Debian-Fassungen abfragen (signierte Quellen-Indizes ueber apt) ----------------
