@@ -271,7 +271,7 @@ holen() {   # holen <quelle> <trotzdem 0|1>
 	local K name z run art ck
 	K=$(schluessel)
 	name=${QUELLE}_$FASSUNG_DATEI
-	z=$(cd "$R" && gh api "repos/{owner}/{repo}/actions/artifacts?name=$name&per_page=100" --jq \
+	z=$(cd "$R" && gh api -X GET "repos/{owner}/{repo}/actions/artifacts" -f name="$name" -f per_page=100 --jq \
 		'[.artifacts[] | select(.expired | not) | select(.workflow_run.head_branch == "main")] | sort_by(.created_at) | last | "\(.workflow_run.id) \(.id)"') \
 		|| fehler "gh api: Artefakte nicht abfragbar (gh angemeldet, Remote auf GitHub?)"
 	run=${z%% *} art=${z#* }
