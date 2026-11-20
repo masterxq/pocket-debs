@@ -1,10 +1,10 @@
 #!/bin/sh
-# Laeuft im Container lisbon-pakete-bau-<suite>-arm64 als root (Aufruf durch build/pakete.sh, nicht direkt).
-# Packt ein Debian-Quellpaket aus, haengt unsere Patches an debian/patches/series an (Unterordner lisbon/), setzt
-# die Fassung <debian>+lisbon<n> und baut Quell- und arch-abhaengige Binaerpakete.
+# Laeuft im Container pocket-debs-bau-<suite>-arm64 als root (Aufruf durch bau.sh, nicht direkt).
+# Packt ein Debian-Quellpaket aus, haengt unsere Patches an debian/patches/series an (Unterordner pocket-debs/),
+# setzt die Fassung <debian>+<tag><n> und baut Quell- und arch-abhaengige Binaerpakete.
 #   /rezept   pakete/<quelle> (nur lesend): paket.conf, patches/*.patch
 #   /dl       Debian-Quellpaket dieser Fassung (.dsc und die Dateien daraus, nur lesend)
-#   /dateien  zusaetzliche Dateien aus dem Projekt (DATEIEN in paket.conf), als Baum unter ihrem Zielpfad
+#   /dateien  zusaetzliche Dateien (<quelle>/dateien/), als Baum unter ihrem Pfad in der Quelle
 #   /out      Ergebnisse: Pakete, .dsc/.changes/.buildinfo, log/, patches-neu/, konflikte/
 # Umgebung: QUELLE DEBIAN FASSUNG MODUS (bau|probe|nachziehen) OPTIONEN PROFILE BAUART MAINTAINER DATUM SUITE APT_QUELLE
 #           CHANGELOG (Zeilen fuer den Changelog-Eintrag) DATEIEN_KOPF (DEP-3-Kopf des Datei-Patches) HUID HGID
@@ -28,7 +28,7 @@ cp /dl/* $B/
 DSC=$(ls $B/*.dsc)
 [ "$(echo "$DSC" | wc -l)" = 1 ] || fehler "genau eine .dsc in /dl erwartet"
 cd $B
-# dpkg-source prueft die Dateien gegen die Pruefsummen der .dsc (die .dsc selbst hat build/pakete.sh geprueft)
+# dpkg-source prueft die Dateien gegen die Pruefsummen der .dsc (die .dsc selbst hat bau.sh geprueft)
 dpkg-source --no-check -x "$DSC" src > $L/dpkg-source-x.log 2>&1 || { cat $L/dpkg-source-x.log; fehler "dpkg-source -x"; }
 cd src
 FORMAT=$(cat debian/source/format 2>/dev/null || echo "1.0")
@@ -36,7 +36,8 @@ FORMAT=$(cat debian/source/format 2>/dev/null || echo "1.0")
 
 export QUILT_PATCHES=debian/patches QUILT_PC=.pc
 auffrischen() { quilt refresh -p ab --no-timestamps --no-index > /dev/null; }
-mkdir -p debian/patches/lisbon
+Z=pocket-debs
+mkdir -p debian/patches/$Z
 touch debian/patches/series
 # Debian-Patches sind nach dpkg-source -x angewendet; quilt muss das ebenso sehen
 if [ -n "$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' debian/patches/series)" ]; then
@@ -45,9 +46,9 @@ fi
 
 : > /out/patches.txt
 STATUS=ok
-# 1. Zusaetzliche Dateien als eigener Patch (Quelle der Dateien bleibt das Projekt, siehe DATEIEN in paket.conf)
+# 1. Zusaetzliche Dateien als eigener Patch (<quelle>/dateien/, Kopf aus DATEIEN_KOPF in paket.conf)
 if [ -n "$(find /dateien -type f 2>/dev/null | head -1)" ]; then
-	P=lisbon/0000-lisbon-files.patch
+	P=$Z/0000-$Z-files.patch
 	quilt new $P > /dev/null
 	(cd /dateien && find . -type f | sort) | while read -r f; do
 		f=${f#./}
@@ -57,12 +58,12 @@ if [ -n "$(find /dateien -type f 2>/dev/null | head -1)" ]; then
 	done
 	printf '%s\n' "$DATEIEN_KOPF" | quilt header -r > /dev/null
 	auffrischen
-	echo "$P ok (erzeugt aus DATEIEN)" >> /out/patches.txt
+	echo "$P ok (erzeugt aus dateien/)" >> /out/patches.txt
 fi
 # 2. Patches aus pakete/<quelle>/patches, nach Namen sortiert
 for p in /rezept/patches/*.patch; do
 	[ -f "$p" ] || continue
-	n=lisbon/$(basename "$p")
+	n=$Z/$(basename "$p")
 	cp "$p" debian/patches/$n
 	echo "$n" >> debian/patches/series
 	if quilt push --fuzz=0 > $L/quilt-$(basename "$p").log 2>&1; then
@@ -84,7 +85,7 @@ for p in /rezept/patches/*.patch; do
 		auffrischen
 		echo "$n unschaerfe (mit fuzz angewendet und aufgefrischt: Ergebnis pruefen)" >> /out/patches.txt
 	elif patch -p1 -F3 --dry-run -s -f < "debian/patches/$n" > /dev/null 2>&1; then
-		echo "$n unschaerfe (nur mit fuzz anwendbar: build/pakete.sh nachziehen)" >> /out/patches.txt
+		echo "$n unschaerfe (nur mit fuzz anwendbar: bau.sh nachziehen)" >> /out/patches.txt
 		STATUS=fehler
 		break
 	else
@@ -99,8 +100,8 @@ done
 cat /out/patches.txt
 if [ "$MODUS" = nachziehen ]; then
 	mkdir -p /out/patches-neu
-	for p in debian/patches/lisbon/*.patch; do
-		case "$p" in */0000-lisbon-files.patch) continue ;; esac
+	for p in debian/patches/$Z/*.patch; do
+		case "$p" in */0000-$Z-files.patch) continue ;; esac
 		[ -f "$p" ] && cp "$p" /out/patches-neu/
 	done
 fi
@@ -108,12 +109,12 @@ echo "$STATUS" > /out/patches.status
 [ "$STATUS" = ok ] || fehler "Patches lassen sich nicht sauber anwenden (siehe oben und /out/konflikte)"
 [ "$MODUS" = bau ] || exit 0
 
-# Changelog-Eintrag unserer Fassung (Datum kommt von build/pakete.sh: Commit-Zeit des Rezepts)
+# Changelog-Eintrag unserer Fassung (Datum kommt von bau.sh: Commit-Zeit des Rezepts)
 {
 	printf '%s (%s) %s; urgency=medium\n\n' "$QUELLE" "$FASSUNG" "$SUITE"
-	printf '  * lisbon build of Debian %s.\n' "$DEBIAN"
+	printf '  * pocket-debs build of Debian %s.\n' "$DEBIAN"
 	printf '%s\n' "$CHANGELOG" | sed -e '/^[[:space:]]*$/d' -e 's/^/  * /'
-	for p in $(sed -n 's|^lisbon/||p' debian/patches/series); do printf '  * debian/patches/lisbon/%s\n' "$p"; done
+	for p in $(sed -n "s|^$Z/||p" debian/patches/series); do printf '  * debian/patches/%s/%s\n' "$Z" "$p"; done
 	printf '\n -- %s  %s\n\n' "$MAINTAINER" "$DATUM"
 	cat debian/changelog
 } > $B/changelog.neu

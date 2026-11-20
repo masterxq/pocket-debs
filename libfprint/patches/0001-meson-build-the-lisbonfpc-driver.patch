@@ -1,8 +1,8 @@
 Description: Build the lisbonfpc driver
  Add lisbonfpc to the default driver list and to the driver sources, so that
  the Debian build (-Ddrivers=all) includes it. The driver source itself is
- added by debian/patches/lisbon/0000-lisbon-files.patch.
-Author: lisbon <lisbon@localhost>
+ added by debian/patches/pocket-debs/0000-pocket-debs-files.patch.
+Author: pocket-debs
 Forwarded: not-needed
 License: LGPL-2.1-or-later (as libfprint)
 Last-Update: 2026-11-19

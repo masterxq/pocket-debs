@@ -5,7 +5,7 @@ Description: Look up Qt6QmlIntegration on the top level before Qt6 Quick
  Qt6QmlIntegration (missing: Qt6QmlIntegration_DIR)"). Finding it once on the top
  level sets Qt6QmlIntegration_FOUND, so the nested lookup is skipped. Build
  environment workaround only; no change to the built code.
-Author: lisbon <lisbon@localhost>
+Author: pocket-debs
 Forwarded: not-needed
 License: LGPL-2.0-or-later (as the patched file, debian/copyright "Files: *")
 Last-Update: 2026-11-19

@@ -1,4 +1,4 @@
-From: lisbon <lisbon@localhost>
+From: pocket-debs
 Date: Thu, 19 Nov 2026 04:31:29 +0100
 Subject: [PATCH] software_isp: Allocate the output buffers outside the CMA area
 Description:

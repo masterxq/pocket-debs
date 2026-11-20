@@ -3,7 +3,7 @@ Description: panfrost: mark a BO shared when its KMS handle is exported
  GEM handle into a dma-buf itself (drmPrimeHandleToFD(), as Chromium does).
  Mark the BO as shared so that it does not go back to the BO cache and get
  recycled while another user still holds it. freedreno does the same.
-Author: lisbon <lisbon@localhost>
+Author: pocket-debs
 Forwarded: no
 License: MIT (as the patched file)
 Last-Update: 2026-11-19
