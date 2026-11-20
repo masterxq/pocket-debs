@@ -1,0 +1,38 @@
+From: Benjamin Otte <otte@redhat.com>
+Date: Thu, 22 Oct 2026 18:26:59 +0200
+Subject: [PATCH] gstreamer: mark EGL display as foreign
+Description:
+ The EGL display is owned by GTK, so it needs to be marked as foreign.
+ .
+ Other backends use a different function that already marks the display
+ as foreign, so they don't need fixing.
+ .
+ Without this, GStreamer calls eglTerminate() on the EGLDisplay GTK renders
+ with as soon as the first GtkMediaFile of a process is released: the GL
+ renderer then fails with EGL_BAD_DISPLAY and the application crashes. Seen
+ with GNOME Snapshot, which plays its shutter sound through a new
+ GtkMediaFile per picture and crashed on the second picture.
+Origin: upstream, https://gitlab.gnome.org/GNOME/gtk/-/commit/d4fa0b3ba61c1054a9179b8868779c30c9f31d96
+Bug: https://gitlab.gnome.org/GNOME/gtk/-/issues/8456
+License: LGPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-21
+---
+diff --git a/gtk/media/gtkgstsink.c b/gtk/media/gtkgstsink.c
+index a706b0981e8..22ca97d702c 100644
+--- a/gtk/media/gtkgstsink.c
++++ b/gtk/media/gtkgstsink.c
+@@ -888,9 +888,14 @@ G_GNUC_END_IGNORE_DEPRECATIONS
+       if (gl_handle)
+         {
+           struct wl_display *wayland_display;
++          gpointer display_ptr;
+ 
+           wayland_display = gdk_wayland_display_get_wl_display (display);
+           self->gst_display = GST_GL_DISPLAY (gst_gl_display_wayland_new_with_display (wayland_display));
++          display_ptr = gst_gl_display_egl_from_gl_display (self->gst_display);
++          g_assert (display_ptr);
++          gst_gl_display_egl_set_foreign (display_ptr, TRUE);
++          gst_object_unref (display_ptr);
+           self->gst_gdk_context = gst_gl_context_new_wrapped (self->gst_display, gl_handle, platform, gl_api);
+         }
+       else
