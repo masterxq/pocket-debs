@@ -60,14 +60,14 @@ images() { bild "$BAUIMG" --platform linux/arm64; bild "$REPOIMG"; }
 lade_conf() {   # lade_conf <quelle>: Variablen aus <quelle>/paket.conf
 	local q=$1
 	[ -f "$R/$q/paket.conf" ] || fehler "unbekanntes Paket $q ($R/$q/paket.conf fehlt)"
-	QUELLE= DEBIAN= DSC_SHA256= REVISION= OPTIONEN=nocheck PROFILE= BAUART=source,any IMAGE= IMAGE_AN=0 STATUS=aktiv DATEIEN_KOPF= CHANGELOG= PRUEFEN=
+	QUELLE= DEBIAN= DSC_SHA256= REVISION= OPTIONEN=nocheck PROFILE= BAUART=source,any IMAGE= IMAGE_AN=0 STATUS=aktiv DATEIEN_KOPF= CHANGELOG= PRUEFEN= FEHLT_ERLAUBT=
 	. "$R/$q/paket.conf"
 	[ "$QUELLE" = "$q" ] || fehler "$q/paket.conf: QUELLE=$QUELLE passt nicht zum Ordner"
 	[ -n "$REVISION" ] || fehler "$q/paket.conf: REVISION fehlt"
 	OHNE_EPOCHE=${DEBIAN#*:}
 	FASSUNG=$DEBIAN+$VERSION_TAG$REVISION
 	FASSUNG_DATEI=${FASSUNG#*:}
-	export QUELLE DEBIAN FASSUNG OPTIONEN PROFILE BAUART MAINTAINER SUITE CHANGELOG DATEIEN_KOPF
+	export QUELLE DEBIAN FASSUNG OPTIONEN PROFILE BAUART MAINTAINER SUITE CHANGELOG DATEIEN_KOPF FEHLT_ERLAUBT
 	POOL=$(pool "$QUELLE")
 }
 pool() { case $1 in lib?*) echo "main/${1:0:4}/$1" ;; *) echo "main/${1:0:1}/$1" ;; esac; }
@@ -129,7 +129,7 @@ quelle_holen() {
 schluessel_teile() {
 	local f
 	echo "suite=$SUITE snapshot=${SNAPSHOT:--} spiegel=$MIRROR"
-	(cd "$R" && sha256sum pakete.conf Dockerfile bau-innen.sh "$QUELLE/paket.conf" && find "$QUELLE/patches" -maxdepth 1 -type f -name '*.patch' 2>/dev/null | LC_ALL=C sort | xargs -r sha256sum)
+	(cd "$R" && sha256sum pakete.conf Dockerfile bau-innen.sh "$QUELLE/paket.conf" && find "$QUELLE/patches" "$QUELLE/debian-patches" -maxdepth 1 -type f -name '*.patch' 2>/dev/null | LC_ALL=C sort | xargs -r sha256sum)
 	dateien | while read -r f; do echo "$(sha256sum < "$R/$QUELLE/dateien/$f" | cut -d' ' -f1)  $f"; done
 }
 schluessel() { schluessel_teile | sha256sum | cut -c1-16; }
@@ -217,7 +217,7 @@ bau() {   # bau <quelle> <neu 0|1>
 	local t0=$SECONDS
 	rc=0
 	timeout "$TIMEOUT" docker run --rm --platform linux/arm64 \
-		-e QUELLE -e DEBIAN -e FASSUNG -e MODUS=bau -e OPTIONEN -e PROFILE -e BAUART -e MAINTAINER -e SUITE -e CHANGELOG -e DATEIEN_KOPF \
+		-e QUELLE -e DEBIAN -e FASSUNG -e MODUS=bau -e OPTIONEN -e PROFILE -e BAUART -e MAINTAINER -e SUITE -e CHANGELOG -e DATEIEN_KOPF -e FEHLT_ERLAUBT \
 		-e DATUM="$(datum)" -e APT_QUELLE="deb $APT_OPT$APT_BASIS $SUITE main" -e HUID="$(id -u)" -e HGID="$(id -g)" \
 		-v "$R:/pakete:ro" -v "$R/$QUELLE:/rezept:ro" -v "$D:/dl:ro" -v "$W/dateien:/dateien:ro" -v "$W/out:/out" \
 		"$BAUIMG" $NI sh /pakete/bau-innen.sh || rc=$?

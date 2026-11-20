@@ -16,7 +16,9 @@ Layout per source package: `<source>/paket.conf` (Debian version, `.dsc` checksu
 packages a rootfs installs), `<source>/patches/*.patch` in DEP-3 format, applied in name order and appended to
 `debian/patches/series` as `debian/patches/pocket-debs/*`, so the resulting source package carries them.
 `<source>/dateien/` holds additional files as a tree relative to the source root (e.g.
-`libfprint/dateien/libfprint/drivers/lisbonfpc.c`); they become the patch `0000-pocket-debs-files.patch`. Patches
+`libfprint/dateien/libfprint/drivers/lisbonfpc.c`); they become the patch `0000-pocket-debs-files.patch`. Changes to the
+packaging itself that quilt cannot carry go to `<source>/debian-patches/*.patch` (applied to `debian/` before the
+build); `FEHLT_ERLAUBT` in `paket.conf` names files that are then missing on purpose compared with Debian. Patches
 in `patches/aus/` are prepared but not applied. Every patch is under the license of the files it changes (named in
 its header). `STATUS=entwurf` marks drafts, which are only built on request.
 

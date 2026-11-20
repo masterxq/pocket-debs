@@ -109,6 +109,14 @@ echo "$STATUS" > /out/patches.status
 [ "$STATUS" = ok ] || fehler "Patches lassen sich nicht sauber anwenden (siehe oben und /out/konflikte)"
 [ "$MODUS" = bau ] || exit 0
 
+# 3. Aenderungen an der Paketierung selbst (debian/rules und Aehnliches), die quilt nicht fuehren kann:
+#    <quelle>/debian-patches/*.patch, nach Namen sortiert, muessen ohne Unschaerfe passen
+for p in /rezept/debian-patches/*.patch; do
+	[ -f "$p" ] || continue
+	patch -p1 --fuzz=0 -s < "$p" || fehler "debian-patches/$(basename "$p") passt nicht auf die Paketierung von $DEBIAN"
+	echo "debian-patches/$(basename "$p") ok" >> /out/patches.txt
+done
+
 # Changelog-Eintrag unserer Fassung (Datum kommt von bau.sh: Commit-Zeit des Rezepts)
 {
 	printf '%s (%s) %s; urgency=medium\n\n' "$QUELLE" "$FASSUNG" "$SUITE"
@@ -158,6 +166,11 @@ for d in $B/*.deb; do
 	mehr=$(comm -13 $T/r.d $T/e.d; comm -13 $T/r.n $T/e.n | sed 's/^/Abhaengigkeit /')
 	rm -f "$r"
 	echo "$p: verglichen mit Debian $dv" >> $V
+	# bewusst weggelassene Teile (FEHLT_ERLAUBT in paket.conf: erweiterter regulaerer Ausdruck) nur vermerken
+	if [ -n "${FEHLT_ERLAUBT:-}" ] && [ -n "$fehlt" ]; then
+		printf '%s\n' "$fehlt" | grep -E -- "$FEHLT_ERLAUBT" | sed "s|^|  $p fehlt wie vorgesehen: |" >> $V || true
+		fehlt=$(printf '%s\n' "$fehlt" | grep -Ev -- "$FEHLT_ERLAUBT" || true)
+	fi
 	[ -z "$mehr" ] || printf '%s\n' "$mehr" | sed "s|^|  $p mehr: |" >> $V
 	if [ -n "$fehlt" ]; then printf '%s\n' "$fehlt" | sed "s|^|  $p FEHLT: |" >> $V; abw=1; fi
 done
