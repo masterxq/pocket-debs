@@ -129,7 +129,7 @@ quelle_holen() {
 schluessel_teile() {
 	local f
 	echo "suite=$SUITE snapshot=${SNAPSHOT:--} spiegel=$MIRROR"
-	(cd "$R" && sha256sum pakete.conf Dockerfile bau-innen.sh "$QUELLE/paket.conf" && find "$QUELLE/patches" "$QUELLE/debian-patches" -maxdepth 1 -type f -name '*.patch' 2>/dev/null | LC_ALL=C sort | xargs -r sha256sum)
+	(cd "$R" && sha256sum pakete.conf Dockerfile bau-innen.sh "$QUELLE/paket.conf" && { find "$QUELLE/patches" "$QUELLE/debian-patches" -maxdepth 1 -type f -name '*.patch' 2>/dev/null || true; } | LC_ALL=C sort | xargs -r sha256sum)
 	dateien | while read -r f; do echo "$(sha256sum < "$R/$QUELLE/dateien/$f" | cut -d' ' -f1)  $f"; done
 }
 schluessel() { schluessel_teile | sha256sum | cut -c1-16; }
