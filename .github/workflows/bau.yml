@@ -1,0 +1,141 @@
+# Builds the packages natively on the GitHub arm64 runner, only those whose inputs changed.
+#
+# Change detection: ./bau.sh schluessel <source> hashes everything that determines a package (suite, mirror,
+# snapshot, pakete.conf, Dockerfile, bau-innen.sh, <source>/paket.conf, <source>/patches/*.patch, <source>/dateien/).
+# Each package's build result is kept in the Actions cache under paket-<source>-<key>. A package whose key is in
+# the cache is restored instead of built; every run still uploads one artifact per package (<source>_<version>)
+# and the complete APT repository (apt-repo), so a run always carries all packages.
+# Cache entries not used for 7 days are evicted; the weekly scheduled run uses them all. Missing entries are
+# simply rebuilt.
+name: bau
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '23 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      pakete:
+        description: 'Additional packages besides the active ones, e.g. drafts like mesa (space separated)'
+        type: string
+        default: ''
+      neu:
+        description: 'Build without the cache'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bau-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: plan
+        env:
+          EXTRA: ${{ inputs.pakete }}
+        run: |
+          set -eu
+          qs=$(./bau.sh namen alle)
+          for q in $EXTRA; do
+            [ -f "$q/paket.conf" ] || { echo "::error::unknown package $q"; exit 1; }
+            qs="$qs $q"
+          done
+          for q in $(printf '%s\n' $qs | awk '!s[$0]++'); do
+            ./bau.sh schluessel "$q" | awk -F= -v q="$q" '$1 == "fassung" {f = $2} $1 == "schluessel" {k = $2} END {print q, k, f}'
+          done > plan.txt
+          matrix=$(jq -Rsc 'split("\n") | map(select(length > 0) | split(" ")
+            | {quelle: .[0], schluessel: .[1], fassung: .[2], artefakt: (.[0] + "_" + (.[2] | sub("^[0-9]+:"; "")))})' plan.txt)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          { echo '| source | version | key |'; echo '|---|---|---|'; awk '{print "| " $1 " | " $3 " | " $2 " |"}' plan.txt; } >> "$GITHUB_STEP_SUMMARY"
+
+  bau:
+    needs: plan
+    name: ${{ matrix.quelle }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      Q: ${{ matrix.quelle }}
+      K: ${{ matrix.schluessel }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # the changelog date is the commit time of the recipe (git log), so the history is needed
+          fetch-depth: 0
+      - name: paths
+        run: |
+          echo "PAKETE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "PAKETE_ERGEBNIS=$RUNNER_TEMP/ergebnis" >> "$GITHUB_ENV"
+      - id: cache
+        if: ${{ !inputs.neu }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/ergebnis/${{ matrix.quelle }}
+          key: paket-${{ matrix.quelle }}-${{ matrix.schluessel }}
+      - name: build
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          PAKETE_TIMEOUT: '20400'
+        run: ./bau.sh bau "$Q" --neu
+      - name: check
+        run: |
+          set -eu
+          E=$PAKETE_ERGEBNIS/$Q
+          grep -qx "schluessel=$K" "$E/STAND" || { echo "::error::$Q: key in STAND differs from $K"; exit 1; }
+          (cd "$E" && sha256sum -c --quiet SHA256SUMS)
+          how=built; [ "${{ steps.cache.outputs.cache-hit }}" != true ] || how="from cache"
+          { echo '| source | version | result | build time |'; echo '|---|---|---|---|'
+            echo "| $Q | $(sed -n 's/^fassung=//p' "$E/STAND") | $how | $(sed -n 's/^bauzeit_min=//p' "$E/BUILDINFO") min |"; } >> "$GITHUB_STEP_SUMMARY"
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/ergebnis/${{ matrix.quelle }}
+          key: paket-${{ matrix.quelle }}-${{ matrix.schluessel }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artefakt }}
+          path: ${{ runner.temp }}/ergebnis/${{ matrix.quelle }}/
+          if-no-files-found: error
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: log-${{ matrix.quelle }}
+          path: ${{ runner.temp }}/out/bau/${{ matrix.quelle }}/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  repo:
+    needs: bau
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: '*_*'
+          path: ${{ runner.temp }}/ergebnis
+      - name: APT repository
+        run: |
+          set -eu
+          export PAKETE_OUT=$RUNNER_TEMP/out
+          ./bau.sh einlegen "$RUNNER_TEMP"/ergebnis/*
+          mkdir -p "$RUNNER_TEMP/apt-repo"
+          cp -a "$PAKETE_OUT/repo/dists" "$PAKETE_OUT/repo/pool" "$PAKETE_OUT/repo/stand" "$RUNNER_TEMP/apt-repo/"
+          { echo '```'; ./bau.sh liste; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: apt-repo
+          path: ${{ runner.temp }}/apt-repo/
+          retention-days: 30
