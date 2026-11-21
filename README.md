@@ -12,6 +12,7 @@ the Motorola Moto G60s ("lisbon"); device specific parts keep the device name (e
 | kf6-kirigami | upstream fix 0810418b (KDE bug 523866, in KF 6.31); a build-only CMake lookup order change | rapid taps in ColumnView pages got lost; the lookup change works around cmake sporadically missing Qt6QmlIntegration under qemu-user |
 | gtk4 | upstream fix d4fa0b3b (GTK issue 8456): the GStreamer media backend marks the EGL display as foreign on Wayland | GStreamer terminated the EGL display GTK renders with when the first GtkMediaFile was released; GNOME Snapshot crashed on the second picture (shutter sound) |
 | mesa | panfrost: mark a BO shared when its KMS handle is exported (draft) | an exported buffer must not be recycled from the BO cache (not tested on a device yet) |
+| omacam | no Debian package: upstream commit, own `debian/`; lens table for the Moto G60s, NV12 frames converted to XRGB8888 (draft) | camera app with tap to focus, pinch zoom and photos from the full sensor mode, talking to libcamera directly |
 
 Layout per source package: `<source>/paket.conf` (Debian version, `.dsc` checksum, `REVISION`, status, binary
 packages a rootfs installs), `<source>/patches/*.patch` in DEP-3 format, applied in name order and appended to
@@ -22,6 +23,15 @@ packaging itself that quilt cannot carry go to `<source>/debian-patches/*.patch`
 build); `FEHLT_ERLAUBT` in `paket.conf` names files that are then missing on purpose compared with Debian. Patches
 in `patches/aus/` are prepared but not applied. Every patch is under the license of the files it changes (named in
 its header). `STATUS=entwurf` marks drafts, which are only built on request.
+
+Sources without a Debian package (`ART=upstream` in `paket.conf`): `UPSTREAM_URL` names an archive of a fixed
+commit, `UPSTREAM_TAR_SHA256` the checksum of the uncompressed tar (the content of `git archive` is fixed, the
+compression of the hosting site is not); the packaging is `<source>/debian/`, its `debian/changelog` version is
+`DEBIAN`. With `CARGO_VENDOR=1` every crate of the `Cargo.lock` in the archive is fetched from crates.io and checked
+against the checksum there. `quelle-upstream.sh` then builds a Debian source package in a container without network
+(`orig.tar.gz` = the archive, `orig-vendor.tar.xz` = `vendor/` with all crates, the debian tarball from this
+repository); from there the build is the same as for a Debian source package, the patches included. The input key
+of such a package also covers `quelle-upstream.sh` and `<source>/debian/`.
 
 ## Build locally
 
@@ -42,7 +52,7 @@ adds source and binaries to a reprepro repository (`$PAKETE_OUT/repo`).
 
 A build is skipped when the repository already holds the package built from the same inputs; `--neu` forces it.
 The input key hashes the suite, mirror and snapshot, `pakete.conf`, `Dockerfile`, `bau-innen.sh`, the package's
-`paket.conf`, `patches/*.patch` and `dateien/`. It depends only on files in this repository, so it is the same on
+`paket.conf`, `patches/*.patch` and `dateien/` (with `ART=upstream` also `quelle-upstream.sh` and `debian/`). It depends only on files in this repository, so it is the same on
 every machine and in CI. Not part of the key: `bau.sh` itself, the state of the build image and of the build
 dependencies in the mirror at build time (pinned only with `SNAPSHOT` in `pakete.conf`); build with `--neu` after
 changing those.

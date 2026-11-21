@@ -1,0 +1,127 @@
+From: pocket-debs
+Date: Sat, 21 Nov 2026 01:19:20 +0100
+Subject: [PATCH] omacam: lens table for the Moto G60s (lisbon)
+Description:
+ Add data/lisbon.toml, chosen when the device tree says motorola,lisbon: the
+ OV64B40 main camera at the back with autofocus (preview 2304x1728, photos
+ from the 4624x3472 mode) and the OV16A1Q at the front (2304x1728, mirrored).
+ Both are full field modes. One lens per side, so zoom is digital, up to 4x.
+ Without it the app falls back to the Pixel 7 Pro table, matches no camera
+ and runs the cameras at libcamera's default sizes.
+Forwarded: no
+License: GPL-3.0-or-later (as the patched files)
+Last-Update: 2026-11-21
+---
+diff --git a/crates/omacam-core/src/lens.rs b/crates/omacam-core/src/lens.rs
+index 91bb743..53c5b09 100644
+--- a/crates/omacam-core/src/lens.rs
++++ b/crates/omacam-core/src/lens.rs
+@@ -185,6 +185,8 @@ pub struct TableSpec {
+ pub const CHEETAH: &str = include_str!("../../../data/cheetah.toml");
+ /// The built-in table for the Pixel 9a.
+ pub const TEGU: &str = include_str!("../../../data/tegu.toml");
++/// The built-in table for the Moto G60s.
++pub const LISBON: &str = include_str!("../../../data/lisbon.toml");
+ 
+ /// Highest zoom when the table doesn't say.
+ pub const DEFAULT_MAX_ZOOM: f64 = 8.0;
+@@ -253,11 +255,17 @@ impl TableSpec {
+         TableSpec::parse(TEGU).expect("built-in lens table parses")
+     }
+ 
++    pub fn lisbon() -> TableSpec {
++        TableSpec::parse(LISBON).expect("built-in lens table parses")
++    }
++
+     /// The built-in table for the device whose device-tree `compatible`
+     /// strings are given (the Pixel 7 Pro's when none matches).
+     pub fn builtin(compatible: &[&str]) -> TableSpec {
+         if compatible.contains(&"google,zumapro-tegu") {
+             TableSpec::tegu()
++        } else if compatible.contains(&"motorola,lisbon") {
++            TableSpec::lisbon()
+         } else {
+             TableSpec::cheetah()
+         }
+@@ -465,6 +473,32 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn lisbon_table_matches_its_two_cameras() {
++        let cam = |id: &str, location, rotation| CameraInfo {
++            id: id.into(),
++            location,
++            rotation,
++            model: "sensor".into(),
++            autofocus: true,
++            ..CameraInfo::default()
++        };
++        let cams = vec![
++            cam("/base/soc/i2c@11009000/camera@22", Location::Back, 90),
++            cam("/base/soc/i2c@11011000/camera@10", Location::Front, 270),
++        ];
++        let t = TableSpec::builtin(&["motorola,lisbon", "mediatek,mt6785"]).resolve(&cams);
++        assert_eq!(t.lenses().len(), 2);
++        let main = t.get(t.by_role(Role::Main).expect("main"));
++        assert_eq!(main.still, Some(Size::new(4624, 3472)));
++        assert_eq!(main.rotation, 90);
++        assert!(main.autofocus);
++        assert_eq!(main.shown_coverage(), (1.0, 1.0));
++        let front = t.get(t.by_role(Role::Front).expect("front"));
++        assert!(front.mirror && !front.autofocus);
++        assert_eq!(t.max_zoom(Facing::Back), 4.0);
++    }
++
+     #[test]
+     fn builtin_picks_cheetah_elsewhere() {
+         let t = TableSpec::builtin(&["google,gs201-cheetah", "google,gs201"])
+diff --git a/data/lisbon.toml b/data/lisbon.toml
+new file mode 100644
+index 0000000..1b8ffe9
+--- /dev/null
++++ b/data/lisbon.toml
+@@ -0,0 +1,43 @@
++# Lens table for the Motorola Moto G60s (lisbon, MT6785) running Debian or
++# Mobian with mainline Linux, in the same format as data/cheetah.toml, which
++# explains every field. Chosen when the device tree says motorola,lisbon.
++#
++# One lens per side has a driver: the OV64B40 main camera at the back (with
++# the DW9800V focus motor) and the OV16A1Q at the front. The ultrawide,
++# macro and depth cameras have none, so zoom is digital only: a crop of the
++# main camera's frames.
++#
++# preview/still: the sensor modes the drivers offer. OV64B40: 2304x1728
++#   (full field, 30 fps) and 4624x3472 (2x2 binned, full field). OV16A1Q:
++#   one mode, 2304x1728 (2x2 binned, full field). All
++#   modes show the whole field of view, hence coverage [1, 1]. libcamera may
++#   adjust the sizes (the software ISP on the GPU or CPU leaves a few
++#   columns at the edge); the app uses what it gets.
++# rotation: left out, libcamera's Rotation property comes from the device
++#   tree (back 90, front 270).
++# f_number, focal lengths, base_iso: left out until measured.
++# max_zoom: 4, a digital crop of the full mode keeps 1156x868 there.
++
++device = "lisbon"
++max_zoom = 4.0
++
++[[lens]]
++role = "main"
++name = "Main"
++id = "/base/soc/i2c@11009000/camera@22" # OmniVision OV64B40
++zoom = 1.0
++preview = [2304, 1728]
++still = [4624, 3472]
++coverage = [1.0, 1.0]
++autofocus = true
++
++[[lens]]
++role = "front"
++name = "Front"
++id = "/base/soc/i2c@11011000/camera@10" # OmniVision OV16A1Q
++zoom = 1.0
++preview = [2304, 1728]
++still = [2304, 1728]
++coverage = [1.0, 1.0]
++autofocus = false
++mirror = true
