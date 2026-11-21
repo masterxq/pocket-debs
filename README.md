@@ -60,6 +60,11 @@ cache).
 - **Every run carries all packages.** Each run uploads one artifact per package, named `<source>_<version>`
   (`.deb` files, source package, `STAND` with version and key, `BUILDINFO`, `SHA256SUMS`, patch and comparison
   results), and `apt-repo` with the complete repository (`dists/`, `pool/`, `stand/`).
+- **Compiler cache.** Builds run through ccache. Locally the cache lives in `$PAKETE_OUT/ccache/<source>/`
+  (`PAKETE_CCACHE=0` builds without it, `PAKETE_CCACHE_MAX` caps it per package, default 2G); in CI each built
+  package restores the newest `ccache-<source>-*` entry and saves the updated one, so rebuilding the same package
+  after a patch change mostly hits the cache. A hit yields the same object file as the compiler, so the cache is not
+  part of the input key. `BUILDINFO` records the hit rate (`ccache_treffer`).
 - **Expiry.** Cache entries unused for 7 days and artifacts after 90 days (`apt-repo` after 30) are deleted by
   GitHub. The weekly run keeps the cache in use. A missing cache entry simply means the package is built again.
 

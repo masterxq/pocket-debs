@@ -24,7 +24,10 @@
 # Umgebung: PAKETE_OUT, PAKETE_ERGEBNIS (Ordner: Ergebnis jedes Baus zusaetzlich nach <ordner>/<quelle>/, fuer einlegen),
 #   PAKETE_STRENG=1 (gleiche Fassung mit anderem Inhalt ist ein Fehler statt einer Warnung),
 #   PAKETE_GPG_KEY (Schluessel zum Signieren des Repos) mit PAKETE_GNUPGHOME (Standard $GNUPGHOME bzw. ~/.gnupg),
-#   PAKETE_TIMEOUT (Sekunden je Containerlauf, Standard 21600), NICE (Standard 10).
+#   PAKETE_TIMEOUT (Sekunden je Containerlauf, Standard 21600), NICE (Standard 10),
+#   PAKETE_CCACHE=0 (ohne Compiler-Cache bauen), PAKETE_CCACHE_MAX (Obergrenze je Paket, Standard 2G).
+# Compiler-Cache: $PAKETE_OUT/ccache/<quelle>/ (ccache), bleibt ueber Bauten erhalten; geht nicht in den Schluessel ein,
+#   weil ein Treffer dieselbe Objektdatei liefert wie der Compiler.
 # Rueckgabe: 0 gut, 1 Fehler, 2 Aufruf, 3 neuere Debian-Fassung (pruefen) bzw. Patch-Konflikt (nachziehen).
 set -euo pipefail
 { # ganzes Skript als ein Block: bash liest es vor dem Start vollstaendig (Aenderungen waehrend eines Laufs schaden nicht)
@@ -214,16 +217,19 @@ bau() {   # bau <quelle> <neu 0|1>
 	rm -rf "$W"; mkdir -p "$W/out" "$W/dateien"
 	dateien_kopieren "$W/dateien"
 	schluessel_teile > "$W/EINGABEN"
-	local t0=$SECONDS
+	local t0=$SECONDS cc=
+	if [ "${PAKETE_CCACHE:-1}" != 0 ]; then mkdir -p "$O/ccache/$QUELLE"; cc="$O/ccache/$QUELLE"; fi
 	rc=0
 	timeout "$TIMEOUT" docker run --rm --platform linux/arm64 \
 		-e QUELLE -e DEBIAN -e FASSUNG -e MODUS=bau -e OPTIONEN -e PROFILE -e BAUART -e MAINTAINER -e SUITE -e CHANGELOG -e DATEIEN_KOPF -e FEHLT_ERLAUBT \
 		-e DATUM="$(datum)" -e APT_QUELLE="deb $APT_OPT$APT_BASIS $SUITE main" -e HUID="$(id -u)" -e HGID="$(id -g)" \
 		-v "$R:/pakete:ro" -v "$R/$QUELLE:/rezept:ro" -v "$D:/dl:ro" -v "$W/dateien:/dateien:ro" -v "$W/out:/out" \
+		${cc:+-v "$cc:/ccache" -e CCACHE_MAXSIZE="${PAKETE_CCACHE_MAX:-2G}"} \
 		"$BAUIMG" $NI sh /pakete/bau-innen.sh || rc=$?
 	[ $rc = 0 ] || fehler "$QUELLE: Bau fehlgeschlagen (rc $rc, Logs in $W/out/log)"
-	local min=$(( (SECONDS - t0) / 60 ))
-	echo "Bauzeit $min min"
+	local min=$(( (SECONDS - t0) / 60 )) cct=-
+	[ ! -f "$W/out/log/ccache.txt" ] || cct=$(sed -n 's/^ *Hits: *//p' "$W/out/log/ccache.txt" | head -1 | tr -d ' ')
+	echo "Bauzeit $min min, ccache-Treffer ${cct:--}"
 	# Pruefung aus paket.conf (Shell, laeuft im Ergebnisordner mit den .deb)
 	if [ -n "$PRUEFEN" ]; then
 		(cd "$W/out" && eval "$PRUEFEN") > "$W/pruefung.log" 2>&1 || { cat "$W/pruefung.log"; fehler "$QUELLE: PRUEFEN fehlgeschlagen"; }
@@ -242,6 +248,7 @@ bau() {   # bau <quelle> <neu 0|1>
 		echo "pakete_commit=$(git -C "$R" describe --always --dirty 2>/dev/null || echo -)"
 		echo "bauimage=$BAUIMG $(docker image inspect -f '{{.Id}}' "$BAUIMG")"
 		echo "bauzeit_min=$min"
+		echo "ccache_treffer=${cct:--}"
 	} > "$E/BUILDINFO"
 	cp "$W/out/patches.txt" "$E/"
 	cp "$W/out/log/vergleich.txt" "$E/" 2>/dev/null || true

@@ -6,12 +6,14 @@
 #   /dl       Debian-Quellpaket dieser Fassung (.dsc und die Dateien daraus, nur lesend)
 #   /dateien  zusaetzliche Dateien (<quelle>/dateien/), als Baum unter ihrem Pfad in der Quelle
 #   /out      Ergebnisse: Pakete, .dsc/.changes/.buildinfo, log/, patches-neu/, konflikte/
+#   /ccache   Compiler-Cache dieses Pakets (ccache, optional; fehlt der Ordner, baut der Container ohne)
 # Umgebung: QUELLE DEBIAN FASSUNG MODUS (bau|probe|nachziehen) OPTIONEN PROFILE BAUART MAINTAINER DATUM SUITE APT_QUELLE
 #           CHANGELOG (Zeilen fuer den Changelog-Eintrag) DATEIEN_KOPF (DEP-3-Kopf des Datei-Patches) HUID HGID
+#           CCACHE_MAXSIZE (Obergrenze des Caches, Standard 2G)
 # probe: nur auspacken und Patches anwenden (fuzz 0), Ergebnis je Patch in /out/patches.txt.
 # nachziehen: wie probe, Patches mit Versatz oder Unschaerfe werden aufgefrischt (/out/patches-neu/).
 set -eu
-trap 'chown -R "$HUID:$HGID" /out 2>/dev/null || true' EXIT
+trap 'chown -R "$HUID:$HGID" /out /ccache 2>/dev/null || true' EXIT
 export DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8
 L=/out/log
 mkdir -p $L
@@ -140,7 +142,15 @@ dpkg-query -W -f '${Package} ${Version} ${Architecture}\n' > $L/bauumgebung.txt
 # haengen (BAUART=source,any,all), sonst bleiben es die von Debian
 export DEB_BUILD_OPTIONS="$OPTIONEN noautodbgsym parallel=$(nproc)"
 [ -z "$PROFILE" ] || export DEB_BUILD_PROFILES="$PROFILE"
+# ccache vor allen Compilern (cc/gcc/g++/clang ueber /usr/lib/ccache, gilt fuer meson, cmake und make gleich). Gebaut
+# wird immer in /build/src, die Pfade (auch in -ffile-prefix-map der Debian-Flags) bleiben also von Lauf zu Lauf gleich.
+# Ein Treffer liefert dieselbe Objektdatei wie der Compiler, das Ergebnis haengt nicht am Cache.
+if [ -d /ccache ] && command -v ccache > /dev/null; then
+	export PATH=/usr/lib/ccache:$PATH CCACHE_DIR=/ccache CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-2G}
+	ccache -z > /dev/null
+fi
 dpkg-buildpackage --build=$BAUART -sa -us -uc > $L/build.log 2>&1 || { tail -80 $L/build.log; fehler "dpkg-buildpackage"; }
+[ -z "${CCACHE_DIR:-}" ] || ccache -s > $L/ccache.txt
 cd $B
 
 # Absicherung gegen stille Fehlfunde: findet der Bau eine optionale Abhaengigkeit nicht, baut er ohne Fehler mit
