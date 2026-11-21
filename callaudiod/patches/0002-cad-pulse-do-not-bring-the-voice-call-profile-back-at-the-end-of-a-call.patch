@@ -1,0 +1,196 @@
+From: pocket-debs
+Date: Sat, 21 Nov 2026 20:30:00 +0100
+Subject: [PATCH] cad-pulse: do not bring the voice call profile back at the end of a call
+Description:
+ When a call ends, callaudiod turns the speaker off right before it selects
+ the normal profile, and call UIs turn it off as well. With the speaker
+ switched through the card profile (previous patch) such a request read the
+ card while it still showed "Voice Call (Mic, Speaker)" and selected
+ "Voice Call (Earpiece, Mic)" after the normal profile had been requested.
+ The card then stayed in the call profile, with the speech path of the modem
+ open, until the profile was changed by hand.
+ .
+ Remember that the end of the call was requested (SelectMode with a mode other
+ than call) until the card is seen outside of a voice call profile again, and
+ do not switch the speaker profile meanwhile; turning the speaker off then
+ succeeds without touching the profile. Card information arrives in the order
+ it was requested, so the check sees no profile older than the request. The
+ next call can switch the speaker as soon as the card is in its voice call
+ profile, before the call UI selects the call mode.
+ .
+ With WirePlumber newer than 0.5.10, which selects the call profile itself,
+ callaudiod ignored SelectMode entirely: the speaker state was never reset at
+ the end of a call (the setting carried over into the next call) and a muted
+ microphone stayed muted. Note the requested mode in that case too and leave
+ the state a mode switch leaves: speaker off, microphone unmuted.
+ .
+ The mode found at startup now takes any active voice call profile into
+ account, not only the first one of the card.
+Forwarded: no
+License: GPL-3.0-or-later (as the patched files)
+Last-Update: 2026-11-21
+---
+--- a/src/cad-manager.c
++++ b/src/cad-manager.c
+@@ -72,6 +72,12 @@
+     }
+ 
+     if (self->routing_disabled) {
++        /*
++         * WirePlumber selects the card profile for the call, but the speaker
++         * is still switched here: keep track of the call.
++         */
++        g_debug("Select mode: %u (routing by WirePlumber)", mode);
++        cad_pulse_note_mode((CallAudioMode)mode);
+         call_audio_dbus_call_audio_complete_select_mode(object, invocation, TRUE);
+         return TRUE;
+     }
+--- a/src/cad-pulse.c
++++ b/src/cad-pulse.c
+@@ -44,6 +44,12 @@
+     int source_id;
+ 
+     gboolean has_voice_profile;
++    /*
++     * The end of the call was requested and the card has not been seen outside
++     * of a voice call profile since then: the speaker must not select a voice
++     * call profile (see set_speaker_profile()).
++     */
++    gboolean call_ending;
+     gchar *speaker_port;
+     gchar *earpiece_port;
+ 
+@@ -67,6 +73,26 @@
+ static gboolean pulseaudio_connect(CadPulse *self);
+ static gboolean init_pulseaudio_objects(gpointer data);
+ 
++static gboolean is_voice_profile(const pa_card_info *info)
++{
++    return info->active_profile2 &&
++           g_str_has_prefix(info->active_profile2->name, SND_USE_CASE_VERB_VOICECALL);
++}
++
++/* Once the card has left the voice call profile, the call has ended for good. */
++static void track_card_profile(pa_context *ctx, const pa_card_info *info, int eol, void *data)
++{
++    CadPulse *self = data;
++
++    if (eol != 0 || !info || info->index != self->card_id)
++        return;
++
++    if (self->call_ending && !is_voice_profile(info)) {
++        g_debug("card left the voice call profile");
++        self->call_ending = FALSE;
++    }
++}
++
+ /******************************************************************************
+  * Source management
+  *
+@@ -507,7 +533,7 @@
+ 
+         if (g_str_has_prefix(profile->name, SND_USE_CASE_VERB_VOICECALL)) {
+             self->has_voice_profile = TRUE;
+-            if (info->active_profile2 == profile)
++            if (is_voice_profile(info))
+                 self->audio_mode = CALL_AUDIO_MODE_CALL;
+             else
+                 self->audio_mode = CALL_AUDIO_MODE_DEFAULT;
+@@ -643,6 +669,9 @@
+             g_idle_add(init_pulseaudio_objects, self);
+         } else if (idx == self->card_id && kind == PA_SUBSCRIPTION_EVENT_CHANGE) {
+             g_debug("card %u changed", idx);
++            op = pa_context_get_card_info_by_index(ctx, idx, track_card_profile, self);
++            if (op)
++                pa_operation_unref(op);
+             if (self->sink_id != -1) {
+                 op = pa_context_get_sink_info_by_index(ctx, self->sink_id,
+                                                        change_sink_info, self);
+@@ -939,6 +968,23 @@
+     if (info->index != operation->pulse->card_id)
+         return;
+ 
++    /*
++     * Call UIs turn the speaker off when a call ends, and callaudiod does so
++     * itself right before it selects the normal profile. Such a request reads
++     * the card while it may still show the voice call profile with the speaker
++     * and must not select the one without it: that would undo the switch to the
++     * normal profile, and the card would stay in the call profile. Card
++     * information arrives in the order it was requested, so a profile seen
++     * here is not older than an end of the call requested before.
++     */
++    if (!is_voice_profile(info))
++        operation->pulse->call_ending = FALSE;
++    if (operation->pulse->call_ending) {
++        g_debug("%s: the call is ending, the card profile is left alone", __func__);
++        operation_complete_cb(ctx, !operation->value, operation);
++        return;
++    }
++
+     for (i = 0; i < info->n_ports; i++) {
+         if (info->ports[i]->direction == PA_DIRECTION_OUTPUT &&
+             info->ports[i]->type == PA_DEVICE_PORT_TYPE_SPEAKER) {
+@@ -947,8 +993,7 @@
+         }
+     }
+ 
+-    if (speaker && info->active_profile2 &&
+-        g_str_has_prefix(info->active_profile2->name, SND_USE_CASE_VERB_VOICECALL)) {
++    if (speaker && is_voice_profile(info)) {
+         for (i = 0; i < info->n_profiles; i++) {
+             pa_card_profile_info2 *profile = info->profiles2[i];
+             gboolean has_speaker = FALSE;
+@@ -1099,6 +1144,7 @@
+     operation->pulse = cad_pulse_get_default();
+     operation->op = cad_op;
+     operation->value = mode;
++    operation->pulse->call_ending = mode != CALL_AUDIO_MODE_CALL;
+ 
+     if (mode != CALL_AUDIO_MODE_CALL) {
+         /*
+@@ -1255,6 +1301,35 @@
+         free(operation);
+ }
+ 
++/*
++ * The mode was requested, but WirePlumber selects the card profile (routing
++ * disabled). Keep the state a mode switch would leave: after a call the speaker
++ * is off for the next one and the microphone is not muted.
++ */
++void cad_pulse_note_mode(CallAudioMode mode)
++{
++    CadPulse *self = cad_pulse_get_default();
++
++    self->call_ending = mode != CALL_AUDIO_MODE_CALL;
++
++    if (self->audio_mode != mode) {
++        self->audio_mode = mode;
++        g_object_set(self->manager, "audio-mode", mode, NULL);
++    }
++
++    if (mode != CALL_AUDIO_MODE_CALL) {
++        CadOperation *unmute_op = g_new0(CadOperation, 1);
++
++        unmute_op->type = CAD_OPERATION_MUTE_MIC;
++        cad_pulse_mute_mic(FALSE, unmute_op);
++
++        if (self->speaker_state != CALL_AUDIO_SPEAKER_OFF) {
++            self->speaker_state = CALL_AUDIO_SPEAKER_OFF;
++            g_object_set(self->manager, "speaker-state", self->speaker_state, NULL);
++        }
++    }
++}
++
+ CallAudioMode cad_pulse_get_audio_mode(void)
+ {
+     CadPulse *self = cad_pulse_get_default();
+--- a/src/cad-pulse.h
++++ b/src/cad-pulse.h
+@@ -22,6 +22,7 @@
+ void cad_pulse_select_mode(CallAudioMode mode, CadOperation *op);
+ void cad_pulse_enable_speaker(gboolean enable, CadOperation *op);
+ void cad_pulse_mute_mic(gboolean mute, CadOperation *op);
++void cad_pulse_note_mode(CallAudioMode mode);
+ 
+ CallAudioMode cad_pulse_get_audio_mode(void);
+ CallAudioSpeakerState cad_pulse_get_speaker_state(void);
