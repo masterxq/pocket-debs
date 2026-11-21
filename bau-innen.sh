@@ -150,7 +150,7 @@ if [ -d /ccache ] && command -v ccache > /dev/null; then
 	ccache -z > /dev/null
 fi
 dpkg-buildpackage --build=$BAUART -sa -us -uc > $L/build.log 2>&1 || { tail -80 $L/build.log; fehler "dpkg-buildpackage"; }
-[ -z "${CCACHE_DIR:-}" ] || ccache -s > $L/ccache.txt
+[ -z "${CCACHE_DIR:-}" ] || { ccache -s > $L/ccache.txt; cat $L/ccache.txt; }
 cd $B
 
 # Absicherung gegen stille Fehlfunde: findet der Bau eine optionale Abhaengigkeit nicht, baut er ohne Fehler mit
