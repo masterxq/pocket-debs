@@ -1,0 +1,37 @@
+#!/usr/bin/make -f
+# omacam is a Rust workspace. cargo builds it from the vendored crates (vendor/, the orig-vendor component of the
+# source package) without network access; only the app with the libcamera backend is built and installed.
+
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+export CARGO_NET_OFFLINE = true
+export CARGO_TERM_COLOR = never
+JOBS := $(patsubst parallel=%,-j %,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p $(CARGO_HOME)
+	printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "%s/vendor"\n' \
+		"$(CURDIR)" > $(CARGO_HOME)/config.toml
+
+override_dh_auto_build:
+	cargo build --release --frozen $(JOBS) -p omacam --features libcamera
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test --release --frozen $(JOBS) -p omacam-core -p omacam-libcamera
+endif
+
+override_dh_auto_install:
+	install -D -m 755 target/release/omacam debian/omacam/usr/bin/omacam
+	install -D -m 644 pkgbuild/omacam.desktop debian/omacam/usr/share/applications/omacam.desktop
+	install -D -m 644 pkgbuild/omacam.svg debian/omacam/usr/share/icons/hicolor/scalable/apps/omacam.svg
+	install -D -m 644 NOTICE debian/omacam/usr/share/doc/omacam/NOTICE
+	sh debian/crate-licenses.sh vendor > debian/omacam/usr/share/doc/omacam/crate-licenses.txt
+
+override_dh_auto_clean:
+	rm -rf target $(CARGO_HOME)
+
+# The release profile strips the binary already (strip = true in Cargo.toml): no debug info for dwz
+override_dh_dwz:

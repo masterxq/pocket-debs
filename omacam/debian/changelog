@@ -1,0 +1,6 @@
+omacam (0.3.3+git20261027.8d4981c-1) forky; urgency=medium
+
+  * Package upstream commit 8d4981cfe86da734141a92d60661ecd9cb188ea1 (0.3.3).
+  * Rust crates from Cargo.lock in the orig-vendor component, built offline.
+
+ -- pocket-debs <masterxq@users.noreply.github.com>  Sat, 21 Nov 2026 01:18:51 +0100

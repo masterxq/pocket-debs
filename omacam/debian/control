@@ -1,0 +1,42 @@
+Source: omacam
+Section: graphics
+Priority: optional
+Maintainer: pocket-debs <masterxq@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.87),
+               pkgconf,
+               clang,
+               libclang-dev,
+               libcamera-dev (>= 0.7),
+               libcamera-dev (<< 0.8),
+               libgtk-4-dev (>= 4.14),
+               libadwaita-1-dev (>= 1.5),
+               libturbojpeg0-dev,
+               libgstreamer1.0-dev,
+               libgstreamer-plugins-base1.0-dev
+Standards-Version: 4.7.2
+Homepage: https://github.com/derekross/omacam
+Rules-Requires-Root: no
+
+Package: omacam
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         libcamera-ipa,
+         gstreamer1.0-plugins-base,
+         gstreamer1.0-plugins-good,
+         gstreamer1.0-pipewire
+Recommends: gstreamer1.0-plugins-ugly,
+            sound-theme-freedesktop,
+            pipewire-bin
+Suggests: iio-sensor-proxy,
+          geoclue-2.0
+Description: phone camera app on libcamera
+ omacam ("Camera") talks to the cameras through libcamera directly, not
+ through PipeWire: tap to focus, pinch to zoom, photos from the camera's
+ full-resolution mode, video as H.264/Opus in MP4.
+ .
+ Video needs the x264 or openh264 encoder of GStreamer (x264enc from
+ gstreamer1.0-plugins-ugly); the shutter sound plays camera-shutter.oga
+ with canberra-gtk-play, pw-play or paplay.
