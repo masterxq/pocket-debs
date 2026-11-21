@@ -12,7 +12,7 @@ Description:
  - Statistics buffer layout (mtkisp50/stats.h) shaped like a hardware
    statistics unit: cell grid up to 128x128 with means, sample and
    saturation counts, histograms, focus blocks with bands, raw frame
-   sequence and timestamp.
+   sequence and timestamp, phase detection results of a grid of windows.
  - IPA interface (mtkisp50.mojom) and IPA module: the algorithms of the
    simple IPA with the MediaTek extensions, unchanged apart from their
    types, the DIP parameter encoder of 0004, a statistics view that
@@ -26,7 +26,17 @@ Description:
    ISP statistics writing the statistics buffer) in a thread of their own.
    Up to two processed streams and one raw stream (MediaTek packed 10-bit)
    per camera; raw only for sensors the DIP does not take; one camera at
-   a time.
+   a time. For sensors that send phase detection (PD) pixels on a stream
+   of their own (OV64B40 in the large mode) a second route through seninf
+   to a free CAMSV, PD frames paired with raw frames by timestamp and PD
+   statistics on the CPU; other modes and kernels without the PD stream as
+   before, the routing goes back when the camera is released.
+ - Phase detection autofocus (tuning block "pd" of Af): a search moves the
+   lens to the PD target and refines it with a short contrast search;
+   while focused the lens only moves when PD results in a row depart from
+   the PD target seen in focus by more than a deadband; a change of the
+   light alone starts no search while PD sees the subject in focus;
+   without reliable PD the contrast search and watch as before.
  - Streams: NV12 on the main output (a crop of the sensor mode, as
    before), YUYV on the scaled output (1/2 to 1/16 of the processed area,
    for instance 1920x1080 video from 16:9 of the whole large mode). With
@@ -54,8 +64,10 @@ Description:
    spare frame in the camera memory region.
  - Tests: bookkeeping and order of the ISP queues, scheduling of jobs with
    different outputs, stream planning (validate cases), autofocus over a
-   new configuration, frame length of the exposure regulation; CPU statistics against the software ISP statistics
-   frame by frame.
+   new configuration, frame length of the exposure regulation, PD
+   statistics (synthetic frames, optional real frames against reference
+   results), pairing of PD and raw frames, autofocus with PD; CPU
+   statistics against the software ISP statistics frame by frame.
  .
  Applies on top of 0001, 0003 and 0004.
 Forwarded: no
@@ -65,10 +77,10 @@ Last-Update: 2026-11-21
 ---
 diff --git a/include/libcamera/internal/mtkisp50/stats.h b/include/libcamera/internal/mtkisp50/stats.h
 new file mode 100644
-index 0000000..5905166
+index 0000000..29b7c0d
 --- /dev/null
 +++ b/include/libcamera/internal/mtkisp50/stats.h
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,176 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Statistics buffer of the mtkisp50 pipeline
@@ -85,7 +97,10 @@ index 0000000..5905166
 + * - a grid of focus blocks with a level and up to kMaxAfBands filter bands per
 + *   block;
 + * - the sequence number and timestamp of the raw frame the statistics were
-+ *   computed on, as statistics and image may come from different counters.
++ *   computed on, as statistics and image may come from different counters;
++ * - the phase detection (PD) result of a grid of windows and of all of them
++ *   together, for sensors that send their phase detection pixels on a
++ *   stream of their own.
 + *
 + * The buffer is plain data without pointers, shared between processes.
 + */
@@ -110,6 +125,7 @@ index 0000000..5905166
 +	StatsValidCells = 1 << 0,
 +	StatsValidHistograms = 1 << 1,
 +	StatsValidAf = 1 << 2,
++	StatsValidPd = 1 << 3,
 +};
 +
 +/* Kind of a histogram */
@@ -148,8 +164,30 @@ index 0000000..5905166
 +	uint32_t band[2];
 +};
 +
++/*
++ * Phase detection result of a window. The shift is the distance in pixels of
++ * the sensor output frame between the images of the left and the right phase
++ * detection pixels: zero in focus, the sign tells the direction of the lens
++ * move. The confidence (0..100) grows with the depth of the match minimum and
++ * the contrast, and drops with saturation.
++ */
++struct StatsPdWindow {
++	/* Window in pixels of the sensor output frame */
++	uint32_t x, y, width, height;
++	float shift;
++	float confidence;
++	/* Mean absolute difference of neighbouring profile samples, relative */
++	float contrast;
++	/* Fraction of saturated phase detection samples */
++	float saturation;
++	/* Mean level of the samples above the black level, raw sample units */
++	float level;
++	/* Curvature of the match at its minimum */
++	float curvature;
++};
++
 +struct StatsBuffer {
-+	static constexpr uint32_t kVersion = 1;
++	static constexpr uint32_t kVersion = 2;
 +
 +	static constexpr unsigned int kMaxGridWidth = 128;
 +	static constexpr unsigned int kMaxGridHeight = 128;
@@ -159,6 +197,7 @@ index 0000000..5905166
 +	static constexpr unsigned int kMaxAfWidth = 160;
 +	static constexpr unsigned int kMaxAfHeight = 128;
 +	static constexpr unsigned int kMaxAfBands = 2;
++	static constexpr unsigned int kMaxPdWindows = 25;
 +
 +	uint32_t version;
 +	uint32_t source;
@@ -202,6 +241,17 @@ index 0000000..5905166
 +	std::array<StatsCell, kMaxGridWidth * kMaxGridHeight> cells;
 +	std::array<StatsHistogram, kMaxHistograms> histograms;
 +	std::array<StatsAfBlock, kMaxAfWidth * kMaxAfHeight> af;
++
++	/*
++	 * Phase detection (StatsValidPd): sequence and timestamp of the
++	 * phase detection frame, grid of windows (rows from the top) and the
++	 * result of all windows together
++	 */
++	uint32_t pdSequence;
++	uint64_t pdTimestamp;
++	uint32_t pdGridWidth, pdGridHeight;
++	StatsPdWindow pdRegion;
++	std::array<StatsPdWindow, kMaxPdWindows> pd;
 +};
 +
 +} /* namespace mtkisp50 */
@@ -221,10 +271,10 @@ index 3ee3ada..4ce3df8 100644
      'rpi/vc4': 'raspberrypi.mojom',
 diff --git a/include/libcamera/ipa/mtkisp50.mojom b/include/libcamera/ipa/mtkisp50.mojom
 new file mode 100644
-index 0000000..5dab6ff
+index 0000000..988866a
 --- /dev/null
 +++ b/include/libcamera/ipa/mtkisp50.mojom
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,112 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +
 +/*
@@ -259,6 +309,8 @@ index 0000000..5dab6ff
 +	uint32 paramsBufferSize;
 +	/* Layout of the statistics buffers (StatsSource in mtkisp50/stats.h) */
 +	uint32 statsSource;
++	/* The sensor mode sends phase detection frames and they are captured */
++	bool pdAvailable;
 +};
 +
 +/*
@@ -286,6 +338,17 @@ index 0000000..5dab6ff
 +	uint8 afRegionMode;
 +	/* Focus area in 1/65536 of the sensor output */
 +	array<uint16> afRegion;
++	/*
++	 * Phase detection statistics: a grid of windows over a region (in
++	 * 1/65536 of the sensor output), the search range of the match in
++	 * profile samples and the black level of the PD samples
++	 */
++	bool pd;
++	array<uint16> pdRegion;
++	uint8 pdGridWidth;
++	uint8 pdGridHeight;
++	uint8 pdMaxShift;
++	uint16 pdBlackLevel;
 +};
 +
 +/*
@@ -735,10 +798,10 @@ index 0000000..d3a5751
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/af.cpp b/src/ipa/mtkisp50/algorithms/af.cpp
 new file mode 100644
-index 0000000..05773c1
+index 0000000..5a37dc5
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/af.cpp
-@@ -0,0 +1,761 @@
+@@ -0,0 +1,1286 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast detect autofocus for the software ISP
@@ -749,6 +812,7 @@ index 0000000..05773c1
 +#include <algorithm>
 +#include <cmath>
 +#include <errno.h>
++#include <sstream>
 +
 +#include <linux/v4l2-controls.h>
 +
@@ -808,6 +872,39 @@ index 0000000..05773c1
 + *   changeSharpnessRise: its thresholds (defaults 0.3, 0.6, 1.8)
 + * - mode: initial AfMode, "manual", "auto" or "continuous" (default
 + *   continuous)
++ * - pd: phase detection, for sensors whose pipeline delivers PD statistics
++ *   (Statistics::pdValid); without it, or without PD in the sensor mode,
++ *   the focus is found by contrast alone. Keys:
++ *   - slope (required): lens units per pixel of phase shift, the lens target
++ *     is position + slope * (shift - offset); offset: shift in focus (0)
++ *   - minConfidence: PD confidence (0..100) a result needs (40); minLevel:
++ *     mean PD level above black, in raw units, below which PD is not used (30)
++ *   - grid: [w, h] windows (3x3); region: centred fraction of the frame
++ *     (default the focus region); tapSize: smallest fraction of the frame
++ *     around an AfWindows rectangle (0.2); maxShift: search range of the
++ *     match in profile samples (8)
++ *   - deadband: lens units a PD target must differ from the one seen when
++ *     focused to move the lens, at least three times the spread of the
++ *     results in focus (12); agreement: lens units within which results of
++ *     consecutive frames agree (16); confirmFrames: results in a row beyond
++ *     the deadband before a move in continuous mode while focused (3);
++ *     maxBias: lens units the PD target may differ from the focused position
++ *     before the lens goes to it once (30); startFrames:
++ *     the same when a search is due (2); waitFrames: frames a search waits
++ *     for a reliable PD result before it falls back to the contrast search
++ *     (6); holdFrames: frames a PD result in focus keeps the contrast watch
++ *     off (15); maxJumps: PD moves of one search (2)
++ *   - fineRange, fineStep: contrast search around the PD target, in lens
++ *     units (24, 8); fineRange 0 ends the search at the PD target
++ *   - margin: lens units a PD target may lie outside the scan range (60)
++ *
++ * With PD a search (continuous: at the start, after a scene change or a new
++ * AfWindows; auto: AfTrigger) moves the lens to the PD target as soon as
++ * startFrames results agree, checks it once more and refines it with a short
++ * contrast search. While focused in continuous mode the lens only moves when
++ * confirmFrames reliable results in a row ask for more than the deadband; a
++ * reliable result in focus keeps the contrast watch from starting a search.
++ * Without reliable PD the contrast search and watch work as without PD.
 + *
 + * While waiting for a steady scene and while searching the focus grid is
 + * requested on every frame (DipFrameParams::afEveryFrame). AfMetering Windows
@@ -874,6 +971,42 @@ index 0000000..05773c1
 +		analogCrop_ = Rectangle(sensorSize_);
 +	monitorInterval_ = std::clamp(tuningData["monitorInterval"].get<unsigned int>(1), 1u, 255u);
 +
++	pdTuned_ = false;
++	if (tuningData.contains("pd")) {
++		const ValueNode &pd = tuningData["pd"];
++		pdSlope_ = pd["slope"].get<double>(0.0);
++		pdOffset_ = pd["offset"].get<double>(0.0);
++		pdMinConfidence_ = pd["minConfidence"].get<double>(40.0);
++		pdMinLevel_ = pd["minLevel"].get<double>(30.0);
++		pdRegion_ = pd["region"].get<double>(region_);
++		pdTapSize_ = pd["tapSize"].get<double>(0.2);
++		auto grid = pd["grid"].get<std::vector<unsigned int>>();
++		if (grid && grid->size() == 2) {
++			pdGridWidth_ = (*grid)[0];
++			pdGridHeight_ = (*grid)[1];
++		}
++		pdMaxShift_ = std::clamp(pd["maxShift"].get<unsigned int>(8), 2u, 32u);
++		pdDeadband_ = pd["deadband"].get<int32_t>(12);
++		pdAgreement_ = pd["agreement"].get<int32_t>(16);
++		pdConfirmFrames_ = std::max(1u, pd["confirmFrames"].get<unsigned int>(3));
++		pdStartFrames_ = std::max(1u, pd["startFrames"].get<unsigned int>(2));
++		pdWaitFrames_ = pd["waitFrames"].get<unsigned int>(6);
++		pdHoldFrames_ = pd["holdFrames"].get<unsigned int>(15);
++		pdMaxJumps_ = std::max(1u, pd["maxJumps"].get<unsigned int>(2));
++		pdFineRange_ = std::max(0, pd["fineRange"].get<int32_t>(24));
++		pdFineStep_ = std::max(1, pd["fineStep"].get<int32_t>(8));
++		pdMargin_ = std::max(0, pd["margin"].get<int32_t>(60));
++		pdMaxBias_ = std::max(0, pd["maxBias"].get<int32_t>(30));
++
++		if (pdSlope_ == 0.0 || pdRegion_ <= 0.0 || pdRegion_ > 1.0 ||
++		    pdTapSize_ <= 0.0 || pdTapSize_ > 1.0 || !pdGridWidth_ || !pdGridHeight_ ||
++		    pdGridWidth_ * pdGridHeight_ > Statistics::kPdMaxWindows) {
++			LOG(IPAMtkIsp50Af, Error) << "Invalid Af pd tuning parameters";
++			return -EINVAL;
++		}
++		pdTuned_ = true;
++	}
++
 +	std::string mode = tuningData["mode"].get<std::string>("continuous");
 +	if (mode == "manual")
 +		initialMode_ = controls::AfModeManual;
@@ -914,7 +1047,8 @@ index 0000000..05773c1
 +	LOG(IPAMtkIsp50Af, Info)
 +		<< "Af: lens " << lensMin_ << "-" << lensMax_
 +		<< ", scan " << toCode(rangeMin_) << "-" << toCode(rangeMax_)
-+		<< " step " << step_ << " dpt, default " << toCode(defaultDioptres_);
++		<< " step " << step_ << " dpt, default " << toCode(defaultDioptres_)
++		<< (pdTuned_ ? ", phase detection" : "");
 +
 +	return 0;
 +}
@@ -946,8 +1080,7 @@ index 0000000..05773c1
 +	return interpolate(map_, code, true);
 +}
 +
-+int Af::configure(IPAContext &context,
-+		  [[maybe_unused]] const IPAConfigInfo &configInfo)
++int Af::configure(IPAContext &context, const IPAConfigInfo &configInfo)
 +{
 +	if (!enabled_)
 +		return 0;
@@ -956,6 +1089,18 @@ index 0000000..05773c1
 +	frame_ = 0;
 +	lastPrepared_ = 0;
 +	moveFrame_ = 0;
++
++	/* Phase detection where the sensor mode has it */
++	pdActive_ = pdTuned_ && configInfo.pdAvailable;
++	pdFrom_ = 0;
++	pdCount_ = 0;
++	pdWindow_ = kPdAnyWindow;
++	pdLastReliable_ = 0;
++	pdInFocus_ = 0;
++	pdSeenInFocus_ = false;
++	pdJumps_ = 0;
++	fine_ = false;
++	LOG(IPAMtkIsp50Af, Debug) << "Phase detection " << (pdActive_ ? "on" : "off");
 +
 +	if (configured_ && lensCode_) {
 +		/*
@@ -986,7 +1131,8 @@ index 0000000..05773c1
 +			}
 +		} else {
 +			/* A scan of the old session does not go on */
-+			if (phase_ == Phase::Scan)
++			if (phase_ == Phase::Scan || phase_ == Phase::PdWait ||
++			    phase_ == Phase::PdMove)
 +				state_ = controls::AfStateIdle;
 +			phase_ = Phase::Idle;
 +		}
@@ -1072,6 +1218,8 @@ index 0000000..05773c1
 +	phase_ = Phase::Scan;
 +	state_ = controls::AfStateScanning;
 +	scanStart_ = frame_;
++	fine_ = false;
++	pdWindow_ = kPdAnyWindow;
 +	moveLens(context, search_.target());
 +
 +	LOG(IPAMtkIsp50Af, Debug) << "Scan " << config.min << "-" << config.max
@@ -1086,6 +1234,11 @@ index 0000000..05773c1
 +		moveLens(context, search_.target());
 +		baseSharpness_ = search_.peak();
 +		rebase_ = false;
++	} else if (fine_) {
++		/* No contrast peak around the PD target: the target holds */
++		state_ = controls::AfStateFocused;
++		moveLens(context, fineCenter_);
++		rebase_ = true;
 +	} else {
 +		state_ = controls::AfStateFailed;
 +		moveLens(context, toCode(defaultDioptres_));
@@ -1096,6 +1249,13 @@ index 0000000..05773c1
 +	baseLevel_ = m.level;
 +	changeCount_ = 0;
 +	phase_ = mode_ == controls::AfModeContinuous ? Phase::Monitor : Phase::Idle;
++	/* The PD reference comes from the next frames at the new position */
++	pdRefValid_ = false;
++	pdRefCount_ = 0;
++	pdRefSum_ = 0.0;
++	pdOut_ = 0;
++	pdSeenInFocus_ = false;
++	pdFrom_ = std::max(moveFrame_ + settleFrames_, frame_ + 1);
 +	if (pauseDeferred_) {
 +		pauseDeferred_ = false;
 +		paused_ = true;
@@ -1103,12 +1263,22 @@ index 0000000..05773c1
 +	}
 +
 +	LOG(IPAMtkIsp50Af, Info)
-+		<< (result == AfSearch::Result::Done ? "Focused" : "Focus failed")
++		<< (state_ == controls::AfStateFocused ? "Focused" : "Focus failed")
 +		<< " at " << lensCode_ << " (" << toDioptres(lensCode_)
-+		<< " dpt) after " << frame_ - scanStart_ << " frames";
++		<< " dpt) after " << frame_ - scanStart_ << " frames"
++		<< (fine_ ? (result == AfSearch::Result::Done ? ", PD and contrast"
++							      : ", PD target") : "");
++	fine_ = false;
++	pdJumps_ = 0;
++	pdCount_ = 0;
 +}
 +
-+void Af::monitor(const AfMeasurement &m, bool exposureSteady)
++/*
++ * @pdFocused: PD saw the subject in focus since the search. A change of the
++ * level alone (the light) or a scene too dark to measure is then no reason
++ * for a search: PD tells when the subject moves.
++ */
++void Af::monitor(const AfMeasurement &m, bool exposureSteady, bool pdFocused)
 +{
 +	/*
 +	 * While the exposure moves, level and (at low levels, through the
@@ -1141,12 +1311,13 @@ index 0000000..05773c1
 +	}
 +
 +	/* Below a level of 1 the level is mostly noise, only a valid measurement counts. */
-+	const bool levelChange = baseLevel_ >= 1.0 &&
++	const bool levelChange = !pdFocused && baseLevel_ >= 1.0 &&
 +				 std::abs(m.level / baseLevel_ - 1.0) > changeLevel_;
 +	const bool sharpnessChange = m.sharpness >= 0.0 && baseSharpness_ > 0.0 &&
 +				     (m.sharpness < baseSharpness_ * changeSharpnessDrop_ ||
 +				      m.sharpness > baseSharpness_ * changeSharpnessRise_);
-+	const bool invalidChange = (m.sharpness < 0.0) != (baseSharpness_ < 0.0);
++	const bool invalidChange = !pdFocused &&
++				   (m.sharpness < 0.0) != (baseSharpness_ < 0.0);
 +
 +	if (levelChange || sharpnessChange || invalidChange) {
 +		if (!changeCount_++)
@@ -1160,13 +1331,11 @@ index 0000000..05773c1
 +
 +	/* A change that lasts: two samples in a row and sceneChangeFrames */
 +	if (changeCount_ >= 2 && frame_ - changeSince_ >= sceneChangeFrames_) {
-+		LOG(IPAMtkIsp50Af, Debug) << "Scene change, refocus";
-+		phase_ = Phase::Wait;
-+		levelIndex_ = 0;
-+		exposureWait_ = 0;
-+		waitCount_ = 0;
-+		steadyCount_ = 0;
-+		exposureWait_ = 0;
++		LOG(IPAMtkIsp50Af, Debug)
++			<< "Scene change (level " << m.level << " against " << baseLevel_
++			<< ", sharpness " << m.sharpness << " against " << baseSharpness_
++			<< "), refocus";
++		enterWait(frame_ + 1);
 +	}
 +}
 +
@@ -1233,16 +1402,11 @@ index 0000000..05773c1
 +	if (mode && *mode != mode_) {
 +		mode_ = static_cast<controls::AfModeEnum>(*mode);
 +		state_ = controls::AfStateIdle;
-+		if (mode_ == controls::AfModeContinuous) {
-+			phase_ = Phase::Wait;
-+			levelIndex_ = 0;
-+			exposureWait_ = 0;
-+			waitCount_ = 0;
-+			steadyCount_ = 0;
-+			exposureWait_ = 0;
-+		} else {
++		fine_ = false;
++		if (mode_ == controls::AfModeContinuous)
++			enterWait(frame);
++		else
 +			phase_ = Phase::Idle;
-+		}
 +	}
 +
 +	if (mode && mode_ != controls::AfModeContinuous) {
@@ -1255,14 +1419,16 @@ index 0000000..05773c1
 +	if (pause && mode_ == controls::AfModeContinuous) {
 +		switch (*pause) {
 +		case controls::AfPauseImmediate:
-+			if (phase_ == Phase::Scan || phase_ == Phase::Wait)
++			if (phase_ == Phase::Scan || phase_ == Phase::Wait ||
++			    phase_ == Phase::PdWait || phase_ == Phase::PdMove)
 +				state_ = controls::AfStateIdle;
 +			paused_ = true;
 +			pauseDeferred_ = false;
 +			phase_ = Phase::Idle;
 +			break;
 +		case controls::AfPauseDeferred:
-+			if (phase_ == Phase::Scan) {
++			if (phase_ == Phase::Scan || phase_ == Phase::PdWait ||
++			    phase_ == Phase::PdMove) {
 +				pauseDeferred_ = true;
 +			} else {
 +				paused_ = true;
@@ -1276,12 +1442,9 @@ index 0000000..05773c1
 +				if (state_ == controls::AfStateFocused || state_ == controls::AfStateFailed) {
 +					phase_ = Phase::Monitor;
 +					rebase_ = true;
-+				} else if (phase_ != Phase::Scan) {
-+					phase_ = Phase::Wait;
-+					levelIndex_ = 0;
-+					waitCount_ = 0;
-+					steadyCount_ = 0;
-+					exposureWait_ = 0;
++				} else if (phase_ != Phase::Scan && phase_ != Phase::PdWait &&
++					   phase_ != Phase::PdMove) {
++					enterWait(frame);
 +				}
 +			}
 +			break;
@@ -1311,34 +1474,55 @@ index 0000000..05773c1
 +		const bool changed = useWindows != (wasWindows && !oldWindow.isNull()) ||
 +				     (useWindows && afWindow_ != oldWindow);
 +
-+		/* A new region in continuous mode: focus again */
++		/*
++		 * A new region in continuous mode: focus again. PD results of
++		 * frames before this one are of the old region.
++		 */
 +		if (changed && mode_ == controls::AfModeContinuous && phase_ != Phase::Idle && !paused_) {
-+			phase_ = Phase::Wait;
-+			levelIndex_ = 0;
-+			exposureWait_ = 0;
-+			waitCount_ = 0;
-+			steadyCount_ = 0;
++			fine_ = false;
++			pdJumps_ = 0;
++			enterWait(frame);
 +			state_ = controls::AfStateScanning;
++		} else if (changed) {
++			pdFrom_ = frame;
++			pdCount_ = 0;
++			pdWindow_ = kPdAnyWindow;
 +		}
 +	}
 +
 +	if (mode_ == controls::AfModeAuto) {
 +		const auto &trigger = controls.get(controls::AfTrigger);
 +		if (trigger && *trigger == controls::AfTriggerStart) {
-+			startScan(context);
++			if (pdActive_) {
++				/* Wait for a PD result of the frames from this one */
++				phase_ = Phase::PdWait;
++				state_ = controls::AfStateScanning;
++				scanStart_ = frame_;
++				pdJumps_ = 0;
++				pdBiasMoves_ = 0;
++				pdFrom_ = frame;
++				pdCount_ = 0;
++				pdMisses_ = 0;
++				pdWindow_ = kPdAnyWindow;
++				fine_ = false;
++			} else {
++				startScan(context);
++			}
 +		} else if (trigger && *trigger == controls::AfTriggerCancel &&
-+			   phase_ == Phase::Scan) {
++			   (phase_ == Phase::Scan || phase_ == Phase::PdWait ||
++			    phase_ == Phase::PdMove)) {
 +			phase_ = Phase::Idle;
 +			state_ = controls::AfStateIdle;
++			fine_ = false;
 +		}
 +	}
 +}
 +
 +/*
 + * The focus grid costs CPU time: it is gathered in every frame with
-+ * statistics while waiting for a steady scene and while scanning, in every
++ * statistics while waiting for a steady scene and while searching, in every
 + * monitorInterval-th one while watching for a scene change, and not at all
-+ * otherwise.
++ * otherwise. The PD statistics are cheap: every frame unless idle.
 + */
 +void Af::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
 +		 [[maybe_unused]] IPAFrameContext &frameContext, DipFrameParams *params)
@@ -1348,16 +1532,21 @@ index 0000000..05773c1
 +
 +	lastPrepared_ = std::max(lastPrepared_, frame);
 +
-+	/* The focus grid in every frame while waiting or scanning */
-+	const bool measuring = phase_ == Phase::Wait || phase_ == Phase::Scan;
-+	context.activeState.af.busy = phase_ == Phase::Scan || (phase_ == Phase::Wait && !dark_);
++	/* The focus grid in every frame while waiting or searching */
++	const bool searching = phase_ == Phase::Scan || phase_ == Phase::PdWait ||
++			       phase_ == Phase::PdMove;
++	const bool measuring = phase_ == Phase::Wait || searching;
++	context.activeState.af.busy = searching || (phase_ == Phase::Wait && !dark_);
 +	params->afStatsInterval = measuring ? 1 : phase_ == Phase::Monitor ? monitorInterval_ : 0;
 +	params->afEveryFrame = measuring;
 +
-+	if (meteringWindows_ && !afWindow_.isNull() && sensorSize_.width && sensorSize_.height) {
-+		auto frac = [](int64_t v, unsigned int size) {
-+			return static_cast<uint16_t>(std::clamp<int64_t>(v * 65535 / size, 0, 65535));
-+		};
++	auto frac = [](int64_t v, unsigned int size) {
++		return static_cast<uint16_t>(std::clamp<int64_t>(v * 65535 / size, 0, 65535));
++	};
++
++	const bool windows = meteringWindows_ && !afWindow_.isNull() &&
++			     sensorSize_.width && sensorSize_.height;
++	if (windows) {
 +		params->afRegionMode = 1;
 +		params->afRegion = { frac(afWindow_.x, sensorSize_.width), frac(afWindow_.y, sensorSize_.height),
 +				     frac(afWindow_.width, sensorSize_.width),
@@ -1367,6 +1556,361 @@ index 0000000..05773c1
 +		params->afRegionMode = 0;
 +		params->afRegion = { 0, 0, r, r };
 +	}
++
++	/* PD in every frame, also idle (the result goes to the log) */
++	params->pd = pdActive_;
++	if (!params->pd)
++		return;
++
++	/*
++	 * PD region: around the AfWindows rectangle, at least tapSize of the
++	 * frame, else the centred PD region
++	 */
++	Rectangle pd;
++	if (windows) {
++		const unsigned int w = std::max<unsigned int>(afWindow_.width,
++							      std::lround(pdTapSize_ * sensorSize_.width));
++		const unsigned int h = std::max<unsigned int>(afWindow_.height,
++							      std::lround(pdTapSize_ * sensorSize_.height));
++		const Point c = afWindow_.center();
++		pd = Rectangle(c.x - static_cast<int>(w / 2), c.y - static_cast<int>(h / 2), w, h)
++			     .enclosedIn(Rectangle(sensorSize_));
++		if (pd.width < w || pd.height < h) {
++			/* Shifted inside the frame, not cut */
++			const int x = std::clamp<int>(c.x - static_cast<int>(w / 2), 0,
++						      static_cast<int>(sensorSize_.width) - static_cast<int>(w));
++			const int y = std::clamp<int>(c.y - static_cast<int>(h / 2), 0,
++						      static_cast<int>(sensorSize_.height) - static_cast<int>(h));
++			pd = Rectangle(x, y, std::min(w, sensorSize_.width), std::min(h, sensorSize_.height));
++		}
++	} else {
++		const unsigned int w = std::lround(pdRegion_ * sensorSize_.width);
++		const unsigned int h = std::lround(pdRegion_ * sensorSize_.height);
++		pd = Rectangle((sensorSize_.width - w) / 2, (sensorSize_.height - h) / 2, w, h);
++	}
++
++	params->pdRegion = { frac(pd.x, sensorSize_.width), frac(pd.y, sensorSize_.height),
++			     frac(pd.width, sensorSize_.width), frac(pd.height, sensorSize_.height) };
++	params->pdGridWidth = pdGridWidth_;
++	params->pdGridHeight = pdGridHeight_;
++	params->pdMaxShift = pdMaxShift_;
++	/* The black level is on an 8 bit scale, the PD samples have 10 bits */
++	params->pdBlackLevel = context.activeState.blc.level * 4;
++}
++
++/*
++ * The lens target of a PD frame: all windows together if they are reliable,
++ * else the most reliable window. Not valid for results below the confidence
++ * or the level, or with a target far outside the scan range.
++ */
++Af::PdEstimate Af::pdEstimate(const Statistics &stats) const
++{
++	PdEstimate est;
++
++	/*
++	 * Windows at different distances blur the result of all of them:
++	 * then the reliable window nearest to the centre of the region, the
++	 * more reliable of those as far from it.
++	 */
++	const Statistics::PdWindow *best = nullptr;
++	int index = -1;
++	const int windows = stats.pdGridWidth * stats.pdGridHeight;
++	if (pdWindow_ != kPdAnyWindow) {
++		/* Kept to one window */
++		index = pdWindow_;
++		if (index < windows)
++			best = index < 0 ? &stats.pdRegion : &stats.pdWindows[index];
++		if (best && best->confidence < pdMinConfidence_)
++			best = nullptr;
++	} else if (stats.pdRegion.confidence >= pdMinConfidence_) {
++		best = &stats.pdRegion;
++	} else {
++		const double cx = (stats.pdGridWidth - 1) / 2.0;
++		const double cy = (stats.pdGridHeight - 1) / 2.0;
++		auto ring = [&](unsigned int i) {
++			return std::ceil(std::hypot(i % stats.pdGridWidth - cx,
++						    i / stats.pdGridWidth - cy) - 0.01);
++		};
++		double bestScore = 0.0;
++		for (unsigned int i = 0; i < stats.pdGridWidth * stats.pdGridHeight; i++) {
++			const Statistics::PdWindow &w = stats.pdWindows[i];
++			if (w.confidence < pdMinConfidence_)
++				continue;
++			const double score = w.confidence - 1000.0 * ring(i);
++			if (!best || score > bestScore) {
++				best = &w;
++				bestScore = score;
++				index = i;
++			}
++		}
++
++		/* The window of the results so far, while it is as good a choice */
++		const int t = pdTrackWindow_;
++		if (best && pdCount_ && t >= 0 && t < windows && t != index &&
++		    stats.pdWindows[t].confidence >= pdMinConfidence_ && ring(t) <= ring(index)) {
++			best = &stats.pdWindows[t];
++			index = t;
++		}
++	}
++
++	if (!best || best->level < pdMinLevel_)
++		return est;
++
++	const double target = lensCode_ + pdSlope_ * (best->shift - pdOffset_);
++	if (target < toCode(rangeMin_) - pdMargin_ || target > toCode(rangeMax_) + pdMargin_)
++		return est;
++
++	est.valid = true;
++	est.window = index;
++	est.shift = best->shift;
++	est.confidence = best->confidence;
++	est.target = std::clamp<int32_t>(std::lround(target), lensMin_, lensMax_);
++
++	return est;
++}
++
++/* Reliable results in a row whose targets agree */
++void Af::trackPd(const PdEstimate &est)
++{
++	if (!est.valid) {
++		pdCount_ = 0;
++		return;
++	}
++
++	pdLastReliable_ = frame_;
++
++	if (pdCount_ && est.window == pdTrackWindow_ &&
++	    std::abs(est.target - pdTarget_) <= pdAgreement_) {
++		pdTarget_ = (pdTarget_ * pdCount_ + est.target) / (pdCount_ + 1);
++		pdCount_++;
++	} else {
++		pdTarget_ = est.target;
++		pdTrackWindow_ = est.window;
++		pdCount_ = 1;
++	}
++
++	if (phase_ != Phase::Monitor)
++		return;
++
++	/* The reference: the mean of the first results after focusing */
++	if (!pdRefValid_) {
++		if (pdRefCount_ && est.window != pdRefWindow_) {
++			pdRefCount_ = 0;
++			pdRefSum_ = 0.0;
++		}
++		pdRefWindow_ = est.window;
++		pdRefSum_ += est.target;
++		if (++pdRefCount_ >= kPdRefFrames) {
++			pdRef_ = pdRefSum_ / pdRefCount_;
++			pdRefValid_ = true;
++			pdWindow_ = pdRefWindow_;
++			pdRefChecked_ = false;
++			pdVariance_ = pdDeadband_ * pdDeadband_ / 4.0;
++			pdOut_ = 0;
++			LOG(IPAMtkIsp50Af, Debug)
++				<< "PD reference " << pdRef_ << " at lens " << lensCode_
++				<< ", window " << pdWindow_;
++		}
++		return;
++	}
++
++	/*
++	 * Within the deadband, or within three times the spread of the
++	 * results in focus: in focus, the reference follows slowly. Beyond
++	 * it: count the results in a row on the same side.
++	 */
++	const double dev = est.target - pdRef_;
++	const double limit = std::max<double>(pdDeadband_, 3.0 * std::sqrt(pdVariance_));
++	if (std::abs(dev) <= limit) {
++		pdInFocus_ = frame_;
++		pdSeenInFocus_ = true;
++		pdOut_ = 0;
++		pdRef_ += 0.05 * dev;
++		pdVariance_ = 0.9 * pdVariance_ + 0.1 * dev * dev;
++		return;
++	}
++
++	const int side = dev > 0 ? 1 : -1;
++	if (!pdOut_ || side != pdOutSide_) {
++		pdOut_ = 0;
++		pdOutSum_ = 0.0;
++	}
++	pdOutSide_ = side;
++	pdOut_++;
++	pdOutSum_ += dev;
++}
++
++/* A PD result in focus not long ago: the contrast watch stays off */
++bool Af::pdHolds() const
++{
++	return pdActive_ && pdSeenInFocus_ && frame_ - pdInFocus_ <= pdHoldFrames_;
++}
++
++/* Wait for a steady scene (continuous mode), PD results from @from on */
++void Af::enterWait(uint32_t from)
++{
++	pdBiasMoves_ = 0;
++	pdMisses_ = 0;
++	pdWindow_ = kPdAnyWindow;
++	phase_ = Phase::Wait;
++	levelIndex_ = 0;
++	exposureWait_ = 0;
++	waitCount_ = 0;
++	steadyCount_ = 0;
++	pdFrom_ = from;
++	pdCount_ = 0;
++	pdJumps_ = 0;
++}
++
++/* A search with an agreeing PD target: move there, or refine where it is */
++void Af::pdStart(IPAContext &context)
++{
++	const int32_t target = std::lround(pdTarget_);
++
++	if (phase_ != Phase::PdWait)
++		scanStart_ = frame_;
++	state_ = controls::AfStateScanning;
++	pdJumps_ = 0;
++	pdWindow_ = pdTrackWindow_;
++
++	if (std::abs(target - lensCode_) > pdDeadband_)
++		pdJump(context, target);
++	else
++		startFine(context);
++}
++
++void Af::pdJump(IPAContext &context, int32_t target)
++{
++	LOG(IPAMtkIsp50Af, Debug)
++		<< "PD move " << lensCode_ << " -> " << target
++		<< " (" << pdCount_ << " results)";
++
++	pdJumps_++;
++	pdCount_ = 0;
++	phase_ = Phase::PdMove;
++	state_ = controls::AfStateScanning;
++	moveLens(context, target);
++	pdFrom_ = moveFrame_ + settleFrames_;
++}
++
++/* Contrast search in a small range around the lens position */
++void Af::startFine(IPAContext &context)
++{
++	fineCenter_ = lensCode_;
++
++	if (!pdFineRange_) {
++		fine_ = true;
++		const AfMeasurement none{ -1.0, 0.0 };
++		endScan(context, AfSearch::Result::Failed, none);
++		return;
++	}
++
++	AfSearch::Config config;
++	config.min = std::max(lensMin_, lensCode_ - pdFineRange_);
++	config.max = std::min(lensMax_, lensCode_ + pdFineRange_);
++	config.step = pdFineStep_;
++	config.climb = true;
++	config.near = true;
++	config.start = lensCode_;
++	config.peakDrop = 0.85;
++	config.minContrast = 1.02;
++
++	search_.start(config);
++	phase_ = Phase::Scan;
++	state_ = controls::AfStateScanning;
++	fine_ = true;
++	moveLens(context, search_.target());
++
++	LOG(IPAMtkIsp50Af, Debug) << "Fine search " << config.min << "-" << config.max
++				  << " step " << config.step;
++}
++
++/*
++ * The PD part of a frame with PD statistics. Returns true when it decided
++ * the frame (a lens move, or waiting for the next PD result).
++ */
++bool Af::processPd(IPAContext &context, const PdEstimate &est)
++{
++	switch (phase_) {
++	case Phase::Wait:
++	case Phase::PdWait:
++		if (est.valid && pdCount_ >= pdStartFrames_) {
++			pdStart(context);
++			return true;
++		}
++		return false;
++
++	case Phase::PdMove:
++		if (est.valid && pdCount_ >= pdStartFrames_ &&
++		    std::abs(pdTarget_ - lensCode_) > pdDeadband_ && pdJumps_ < pdMaxJumps_) {
++			pdJump(context, std::lround(pdTarget_));
++			return true;
++		}
++		if (est.valid && pdCount_ < pdStartFrames_ &&
++		    std::abs(est.target - lensCode_) > pdDeadband_)
++			return true;
++		if (est.valid) {
++			startFine(context);
++			return true;
++		}
++		return false;
++
++	case Phase::Monitor:
++		if (!est.valid || !pdRefValid_)
++			return false;
++
++		/*
++		 * Focused further from the PD target than PD and contrast
++		 * differ otherwise (a contrast search on a weak peak, or a PD
++		 * move on noise): once to the PD target.
++		 */
++		if (!pdRefChecked_) {
++			pdRefChecked_ = true;
++			if (std::abs(pdRef_ - lensCode_) > pdMaxBias_ && pdBiasMoves_ < 1) {
++				LOG(IPAMtkIsp50Af, Debug)
++					<< "Focused at " << lensCode_ << ", PD target " << pdRef_;
++				pdBiasMoves_++;
++				scanStart_ = frame_;
++				pdJumps_ = 0;
++				pdJump(context, std::lround(pdRef_));
++				return true;
++			}
++		}
++
++		if (pdOut_ >= pdConfirmFrames_) {
++			const int32_t target = std::clamp<int32_t>(
++				lensCode_ + std::lround(pdOutSum_ / pdOut_), lensMin_, lensMax_);
++			LOG(IPAMtkIsp50Af, Debug)
++				<< "PD out of focus (" << pdOutSum_ / pdOut_ << " from " << pdRef_
++				<< " over " << pdOut_ << " frames), refocus";
++			scanStart_ = frame_;
++			pdJumps_ = 0;
++			pdOut_ = 0;
++			pdJump(context, target);
++			return true;
++		}
++		return false;
++
++	case Phase::Idle:
++	case Phase::Scan:
++		break;
++	}
++
++	return false;
++}
++
++/* PD results of a frame for the log: all windows together, then each */
++static std::string pdText(const Statistics &stats)
++{
++	std::ostringstream o;
++	o.setf(std::ios::fixed);
++	o.precision(2);
++	o << " pd " << stats.pdRegion.shift << "/" << static_cast<int>(stats.pdRegion.confidence)
++	  << " level " << static_cast<int>(stats.pdRegion.level) << " win";
++	for (unsigned int i = 0; i < stats.pdGridWidth * stats.pdGridHeight; i++)
++		o << " " << stats.pdWindows[i].shift << "/"
++		  << static_cast<int>(stats.pdWindows[i].confidence);
++	return o.str();
 +}
 +
 +void Af::process(IPAContext &context, const uint32_t frame,
@@ -1389,8 +1933,12 @@ index 0000000..05773c1
 +	metadata.set(controls::LensPosition,
 +		     static_cast<float>(std::max(toDioptres(lensCode_), 0.0)));
 +
-+	if (phase_ == Phase::Idle)
++	if (phase_ == Phase::Idle) {
++		if (pdActive_ && stats->pdValid)
++			LOG(IPAMtkIsp50Af, Debug)
++				<< "frame " << frame << " lens " << lensCode_ << " idle" << pdText(*stats);
 +		return;
++	}
 +
 +	if (stats->valid && (!stats->afGridWidth || !stats->afGridHeight)) {
 +		LOG(IPAMtkIsp50Af, Warning) << "No focus statistics, autofocus off";
@@ -1398,12 +1946,27 @@ index 0000000..05773c1
 +		return;
 +	}
 +
-+	/* Frame without the focus grid (not requested, see prepare()) */
-+	if (!stats->afGridValid || !stats->afGridWidth || !stats->afGridHeight)
-+		return;
-+
 +	/* Statistics exposed while the lens was still moving */
 +	if (moved_ && frame < moveFrame_ + settleFrames_)
++		return;
++
++	/* Phase detection of this frame, of the current region */
++	if (pdActive_ && stats->pdValid && frame >= pdFrom_) {
++		const PdEstimate est = pdEstimate(*stats);
++		trackPd(est);
++		pdMisses_ = est.valid ? 0 : pdMisses_ + 1;
++
++		LOG(IPAMtkIsp50Af, Debug)
++			<< "frame " << frame << " lens " << lensCode_
++			<< (est.valid ? " target " + std::to_string(est.target) : std::string(" unreliable"))
++			<< " count " << pdCount_ << pdText(*stats);
++
++		if (processPd(context, est))
++			return;
++	}
++
++	/* Frame without the focus grid (not requested, see prepare()) */
++	if (!stats->afGridValid || !stats->afGridWidth || !stats->afGridHeight)
 +		return;
 +
 +	/* The grid covers the focus region: measure all of it */
@@ -1418,8 +1981,26 @@ index 0000000..05773c1
 +		<< " sharpness " << m.sharpness << " level " << m.level
 +		<< (exposureSteady ? "" : " (exposure moving)");
 +
++	/*
++	 * PD gets the first frames of a search, the contrast search follows;
++	 * at once when PD frames come and none of them is reliable
++	 */
++	const bool pdTurn = pdActive_ && frame < pdFrom_ + pdWaitFrames_ &&
++			    pdMisses_ < pdStartFrames_;
++
 +	switch (phase_) {
 +	case Phase::Idle:
++		break;
++
++	case Phase::PdWait:
++		if (!pdTurn)
++			startScan(context);
++		break;
++
++	case Phase::PdMove:
++		/* No reliable PD result at the target: refine there by contrast */
++		if (!pdTurn)
++			startFine(context);
 +		break;
 +
 +	case Phase::Wait: {
@@ -1440,12 +2021,6 @@ index 0000000..05773c1
 +		dark_ = false;
 +
 +		/*
-+		 * No separate wait for the exposure: while it moves much the
-+		 * level is not steady from frame to frame anyway, small moves
-+		 * do not change the sharpness measure (it is normalised to the
-+		 * level).
-+		 */
-+		/*
 +		 * While the exposure moves, the level must also be steady over
 +		 * the last kLevelHistory samples: a slow ramp passes the check
 +		 * between neighbouring frames.
@@ -1463,6 +2038,10 @@ index 0000000..05773c1
 +		steadyCount_ = steady ? steadyCount_ + 1 : 0;
 +		lastLevel_ = m.level;
 +		lastSharpness_ = m.sharpness;
++
++		/* The PD search has its turn first */
++		if (pdTurn)
++			break;
 +
 +		if (drifting) {
 +			/* Not forever: flicker may keep the exposure moving */
@@ -1490,7 +2069,16 @@ index 0000000..05773c1
 +	}
 +
 +	case Phase::Monitor:
-+		monitor(m, exposureSteady);
++		if (pdHolds()) {
++			/*
++			 * PD sees the subject in focus: no search from the
++			 * contrast; its reference follows the scene.
++			 */
++			changeCount_ = 0;
++			rebase_ = true;
++			break;
++		}
++		monitor(m, exposureSteady, pdActive_ && pdSeenInFocus_);
 +		break;
 +	}
 +}
@@ -1502,10 +2090,10 @@ index 0000000..05773c1
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/af.h b/src/ipa/mtkisp50/algorithms/af.h
 new file mode 100644
-index 0000000..4a9cdee
+index 0000000..c4b9ff0
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/af.h
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,219 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast detect autofocus for the software ISP
@@ -1553,6 +2141,18 @@ index 0000000..4a9cdee
 +		Wait,		/* continuous: wait for a steady scene, then scan */
 +		Scan,
 +		Monitor,	/* continuous: watch for a scene change */
++		PdWait,		/* trigger: wait a few frames for a reliable PD */
++		PdMove,		/* moved to the PD target: check it, then refine */
++	};
++
++	/* A phase detection result turned into a lens target */
++	struct PdEstimate {
++		bool valid = false;
++		double shift = 0.0;
++		double confidence = 0.0;
++		int32_t target = 0;
++		/* The window it comes from, -1 for all windows together */
++		int window = -1;
 +	};
 +
 +	int32_t toCode(double dioptres) const;
@@ -1563,7 +2163,16 @@ index 0000000..4a9cdee
 +	void startScan(IPAContext &context);
 +	void endScan(IPAContext &context, AfSearch::Result result,
 +		     const AfMeasurement &m);
-+	void monitor(const AfMeasurement &m, bool exposureSteady);
++	void monitor(const AfMeasurement &m, bool exposureSteady, bool pdFocused);
++
++	PdEstimate pdEstimate(const Statistics &stats) const;
++	void trackPd(const PdEstimate &est);
++	bool processPd(IPAContext &context, const PdEstimate &est);
++	void pdStart(IPAContext &context);
++	void pdJump(IPAContext &context, int32_t target);
++	void startFine(IPAContext &context);
++	void enterWait(uint32_t from);
++	bool pdHolds() const;
 +
 +	bool enabled_ = false;
 +
@@ -1630,6 +2239,75 @@ index 0000000..4a9cdee
 +	bool rebase_ = false;
 +	bool levelRebase_ = false;
 +	uint32_t scanStart_ = 0;
++
++	/*
++	 * Phase detection (tuning key "pd"): lens target = position + slope
++	 * * (shift - offset), shift in pixels of the sensor output frame
++	 */
++	bool pdTuned_ = false;
++	bool pdActive_ = false;
++	double pdSlope_ = 0.0;
++	double pdOffset_ = 0.0;
++	double pdMinConfidence_ = 40.0;
++	double pdMinLevel_ = 8.0;
++	double pdRegion_ = 0.0;
++	double pdTapSize_ = 0.2;
++	unsigned int pdGridWidth_ = 3;
++	unsigned int pdGridHeight_ = 3;
++	unsigned int pdMaxShift_ = 8;
++	int32_t pdDeadband_ = 12;
++	int32_t pdAgreement_ = 16;
++	unsigned int pdConfirmFrames_ = 3;
++	unsigned int pdStartFrames_ = 2;
++	unsigned int pdWaitFrames_ = 6;
++	unsigned int pdHoldFrames_ = 15;
++	unsigned int pdMaxJumps_ = 2;
++	int32_t pdFineRange_ = 24;
++	int32_t pdFineStep_ = 8;
++	int32_t pdMargin_ = 60;
++
++	/* PD results of earlier frames do not count from this frame on */
++	uint32_t pdFrom_ = 0;
++	/* Reliable PD results in a row that agree, and their mean target */
++	unsigned int pdCount_ = 0;
++	double pdTarget_ = 0.0;
++	/* Last frame with a reliable PD result, and with one in focus */
++	uint32_t pdLastReliable_ = 0;
++	uint32_t pdInFocus_ = 0;
++	bool pdSeenInFocus_ = false;
++	/*
++	 * Focused: the PD target seen at the focused position. The watch
++	 * compares with it, not with the position, so that a PD target a bit
++	 * off the contrast peak does not move the lens back and forth.
++	 */
++	/*
++	 * The PD window a search and the watch after it keep to: the windows
++	 * of a region may see subjects at different distances
++	 */
++	static constexpr int kPdAnyWindow = -2;
++	int pdWindow_ = kPdAnyWindow;
++	/* PD frames in a row without a reliable result */
++	unsigned int pdMisses_ = 0;
++	int pdTrackWindow_ = kPdAnyWindow;
++	int pdRefWindow_ = kPdAnyWindow;
++	static constexpr unsigned int kPdRefFrames = 4;
++	double pdRef_ = 0.0;
++	bool pdRefValid_ = false;
++	unsigned int pdRefCount_ = 0;
++	double pdRefSum_ = 0.0;
++	/* The focused position was checked against the PD target */
++	bool pdRefChecked_ = false;
++	unsigned int pdBiasMoves_ = 0;
++	int32_t pdMaxBias_ = 30;
++	/* Spread of the results in focus, and results in a row beyond it */
++	double pdVariance_ = 0.0;
++	unsigned int pdOut_ = 0;
++	int pdOutSide_ = 0;
++	double pdOutSum_ = 0.0;
++	unsigned int pdJumps_ = 0;
++	/* The scan is the fine search after a PD move, around this position */
++	bool fine_ = false;
++	int32_t fineCenter_ = 0;
 +};
 +
 +} /* namespace ipa::mtkisp50::algorithms */
@@ -1637,7 +2315,7 @@ index 0000000..4a9cdee
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/af_search.cpp b/src/ipa/mtkisp50/algorithms/af_search.cpp
 new file mode 100644
-index 0000000..cc4faa2
+index 0000000..5c1d21c
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/af_search.cpp
 @@ -0,0 +1,270 @@
@@ -1885,7 +2563,7 @@ index 0000000..cc4faa2
 +			bool lower = true;
 +			for (unsigned int i = 1; i < samples_.size(); i++)
 +				lower &= samples_[i].sharpness < s0 * (1.0 - 2.0 * kProbeMargin);
-+			if (lower && s0 > 0.0)
++			if ((lower || config_.near) && s0 > 0.0)
 +				return finishScan(true);
 +		}
 +		return startFullScan();
@@ -1913,10 +2591,10 @@ index 0000000..cc4faa2
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/af_search.h b/src/ipa/mtkisp50/algorithms/af_search.h
 new file mode 100644
-index 0000000..d279ea8
+index 0000000..73cdd01
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/af_search.h
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,107 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast detect focus search
@@ -1973,6 +2651,11 @@ index 0000000..d279ea8
 +		/* Climb from this position instead of scanning the whole range */
 +		bool climb = false;
 +		int32_t start = 0;
++		/*
++		 * The start is known to be close to the peak (phase detection):
++		 * a probe with no side better ends at the start
++		 */
++		bool near = false;
 +	};
 +
 +	enum class Result {
@@ -5373,10 +6056,10 @@ index 0000000..f36ae24
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/dip_params.h b/src/ipa/mtkisp50/dip_params.h
 new file mode 100644
-index 0000000..0cce600
+index 0000000..1ae460c
 --- /dev/null
 +++ b/src/ipa/mtkisp50/dip_params.h
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,228 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Translation of the frame parameters of the mtkisp50 IPA into MT6785 DIP
@@ -5430,6 +6113,13 @@ index 0000000..0cce600
 +	uint8_t afEveryFrame = 0;
 +	uint8_t afRegionMode = 0;
 +	std::array<uint16_t, 4> afRegion = {};
++	/* Phase detection statistics (see StatsConfig) */
++	bool pd = false;
++	std::array<uint16_t, 4> pdRegion = {};
++	uint8_t pdGridWidth = 0;
++	uint8_t pdGridHeight = 0;
++	uint8_t pdMaxShift = 0;
++	uint16_t pdBlackLevel = 0;
 +};
 +
 +
@@ -6010,10 +6700,10 @@ index 0000000..e38120a
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/mtkisp50.cpp b/src/ipa/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..409598b
+index 0000000..7ed86e5
 --- /dev/null
 +++ b/src/ipa/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,619 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2023, Linaro Ltd
@@ -6476,8 +7166,9 @@ index 0000000..409598b
 +
 +	IPAFrameContext &frameContext = context_.frameContexts.get(frame);
 +
-+	/* Without the Af algorithm (or with it idle) no focus grid */
++	/* Without the Af algorithm (or with it idle) no focus grid, no PD */
 +	params_.afStatsInterval = 0;
++	params_.pd = false;
 +	params_.statsInterval = settledCount_ >= 2 ? statsIntervalSettled_
 +						    : Statistics::kFramesPerStats;
 +	params_.statsLinePairStep = statsLinePairStep_;
@@ -6504,6 +7195,12 @@ index 0000000..409598b
 +	config.afEveryFrame = params_.afEveryFrame;
 +	config.afRegionMode = params_.afRegionMode;
 +	config.afRegion.assign(params_.afRegion.begin(), params_.afRegion.end());
++	config.pd = params_.pd;
++	config.pdRegion.assign(params_.pdRegion.begin(), params_.pdRegion.end());
++	config.pdGridWidth = params_.pdGridWidth;
++	config.pdGridHeight = params_.pdGridHeight;
++	config.pdMaxShift = params_.pdMaxShift;
++	config.pdBlackLevel = params_.pdBlackLevel;
 +
 +	paramsComputed.emit(frame, bytesused, config);
 +}
@@ -6628,10 +7325,10 @@ index 0000000..409598b
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/statistics.cpp b/src/ipa/mtkisp50/statistics.cpp
 new file mode 100644
-index 0000000..310b3cc
+index 0000000..8010472
 --- /dev/null
 +++ b/src/ipa/mtkisp50/statistics.cpp
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,136 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Statistics of a frame as the mtkisp50 algorithms see them
@@ -6666,6 +7363,7 @@ index 0000000..310b3cc
 +{
 +	valid = false;
 +	afGridValid = false;
++	pdValid = false;
 +
 +	if (buffer.version != StatsBuffer::kVersion || buffer.frame != frameId) {
 +		LOG(IPAMtkIsp50Stats, Warning)
@@ -6738,6 +7436,29 @@ index 0000000..310b3cc
 +		afGridValid = af && buffer.afMeasure == libcamera::mtkisp50::StatsAfLevelSum;
 +	}
 +
++	/* Phase detection: belongs to this frame only */
++	if ((buffer.valid & libcamera::mtkisp50::StatsValidPd) && buffer.pdGridWidth &&
++	    buffer.pdGridHeight &&
++	    buffer.pdGridWidth * buffer.pdGridHeight <= StatsBuffer::kMaxPdWindows) {
++		auto view = [](const libcamera::mtkisp50::StatsPdWindow &w) {
++			PdWindow v;
++			v.rect = Rectangle(w.x, w.y, w.width, w.height);
++			v.shift = w.shift;
++			v.confidence = w.confidence;
++			v.contrast = w.contrast;
++			v.saturation = w.saturation;
++			v.level = w.level;
++			return v;
++		};
++
++		pdGridWidth = buffer.pdGridWidth;
++		pdGridHeight = buffer.pdGridHeight;
++		for (unsigned int j = 0; j < pdGridWidth * pdGridHeight; j++)
++			pdWindows[j] = view(buffer.pd[j]);
++		pdRegion = view(buffer.pdRegion);
++		pdValid = true;
++	}
++
 +	return true;
 +}
 +
@@ -6746,10 +7467,10 @@ index 0000000..310b3cc
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/statistics.h b/src/ipa/mtkisp50/statistics.h
 new file mode 100644
-index 0000000..3656404
+index 0000000..1597590
 --- /dev/null
 +++ b/src/ipa/mtkisp50/statistics.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,91 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Statistics of a frame as the mtkisp50 algorithms see them
@@ -6765,6 +7486,8 @@ index 0000000..3656404
 +
 +#include <array>
 +#include <stdint.h>
++
++#include <libcamera/geometry.h>
 +
 +#include "libcamera/internal/mtkisp50/stats.h"
 +#include "libcamera/internal/vector.h"
@@ -6807,6 +7530,26 @@ index 0000000..3656404
 +	std::array<uint32_t, kAfGridMaxWidth * kAfGridMaxHeight> afGrid;
 +
 +	/*
++	 * Phase detection of this frame (pdValid): a grid of windows, rows
++	 * from the top, and all windows together. Shift in pixels of the
++	 * sensor output frame, confidence 0..100.
++	 */
++	struct PdWindow {
++		Rectangle rect;
++		double shift;
++		double confidence;
++		double contrast;
++		double saturation;
++		double level;
++	};
++	static constexpr unsigned int kPdMaxWindows = libcamera::mtkisp50::StatsBuffer::kMaxPdWindows;
++	bool pdValid = false;
++	unsigned int pdGridWidth = 0;
++	unsigned int pdGridHeight = 0;
++	std::array<PdWindow, kPdMaxWindows> pdWindows;
++	PdWindow pdRegion;
++
++	/*
 +	 * Update the view with the buffer of a frame. Like the statistics of
 +	 * the software ISP, fields of a part that is not valid for the frame
 +	 * keep the values of the last frame that had it; valid and
@@ -6821,10 +7564,10 @@ index 0000000..3656404
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/frames.cpp b/src/libcamera/pipeline/mtkisp50/frames.cpp
 new file mode 100644
-index 0000000..6efd5f2
+index 0000000..ebcc60f
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/frames.cpp
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,343 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Per request bookkeeping of the mtkisp50 pipeline
@@ -6899,6 +7642,8 @@ index 0000000..6efd5f2
 +	info->paramsBuffer = availableParamsBuffers_.front();
 +	info->statsBuffer = availableStatsBuffers_.front();
 +	info->rawSequence = 0;
++	info->rawTimestamp = 0;
++	info->pdBuffer = nullptr;
 +	info->paramsBytesused = 0;
 +	info->captured = false;
 +	info->ispQueued = false;
@@ -7168,10 +7913,10 @@ index 0000000..6efd5f2
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/frames.h b/src/libcamera/pipeline/mtkisp50/frames.h
 new file mode 100644
-index 0000000..b733be1
+index 0000000..f8778f3
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/frames.h
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,162 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Per request bookkeeping of the mtkisp50 pipeline
@@ -7231,6 +7976,9 @@ index 0000000..b733be1
 +		FrameBuffer *statsBuffer;
 +
 +		uint32_t rawSequence;
++		uint64_t rawTimestamp;
++		/* Phase detection frame of the same sensor frame, if any */
++		FrameBuffer *pdBuffer;
 +		/* Size of the parameters of the ISP job, 0 for none */
 +		uint32_t paramsBytesused;
 +
@@ -7333,24 +8081,25 @@ index 0000000..b733be1
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/meson.build b/src/libcamera/pipeline/mtkisp50/meson.build
 new file mode 100644
-index 0000000..9358d79
+index 0000000..0d69354
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/meson.build
-@@ -0,0 +1,8 @@
+@@ -0,0 +1,9 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +libcamera_internal_sources += files([
 +    'frames.cpp',
 +    'mtkisp50.cpp',
++    'pd.cpp',
 +    'raw_stats_cpu.cpp',
 +    'streams.cpp',
 +])
 diff --git a/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..0f0d68d
+index 0000000..2499557
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,1994 @@
+@@ -0,0 +1,2552 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the MediaTek MT6785 camera subsystem with the ISP pass 2
@@ -7374,6 +8123,7 @@ index 0000000..0f0d68d
 +
 +#include <algorithm>
 +#include <array>
++#include <deque>
 +#include <map>
 +#include <memory>
 +#include <optional>
@@ -7430,6 +8180,7 @@ index 0000000..0f0d68d
 +#include "libcamera/internal/v4l2_videodevice.h"
 +
 +#include "frames.h"
++#include "pd.h"
 +#include "raw_stats_cpu.h"
 +#include "streams.h"
 +
@@ -7459,6 +8210,12 @@ index 0000000..0f0d68d
 +/* Fewer buffers of a large main output next to the scaled one (memory) */
 +constexpr unsigned int kLargeOutputFrame = 12 << 20;
 +constexpr unsigned int kLargeOutputBufferCount = 2;
++
++/* Phase detection frames: buffers, and the timestamp tolerance of a pair */
++constexpr unsigned int kPdBufferCount = 4;
++constexpr uint64_t kPdTolerance = 12000000;
++/* PD frame format of the capture device (MediaTek packed 10 bit grey) */
++const V4L2PixelFormat kPdPixelFormat = V4L2PixelFormat(v4l2_fourcc('M', 'B', 'Y', 'A'));
 +
 +} /* namespace */
 +
@@ -7632,21 +8389,34 @@ index 0000000..0f0d68d
 +		return 0;
 +	}
 +
++	/* PD statistics of the frames of a layout, nullptr for none */
++	void configurePd(const MtkIsp50PdLayout *layout, unsigned int stride)
++	{
++		pdStats_ = layout ? std::make_unique<MtkIsp50PdStats>(*layout) : nullptr;
++		pdStride_ = stride;
++	}
++
 +	void process(uint32_t frame, FrameBuffer *raw, mtkisp50::StatsBuffer *out,
-+		     const ipa::mtkisp50::StatsConfig &config, bool sync);
++		     const ipa::mtkisp50::StatsConfig &config, bool sync, FrameBuffer *pd);
 +	void clear() { rawMaps_.clear(); }
 +
 +	Signal<uint32_t> done;
 +
 +private:
++	void processPd(FrameBuffer *pd, mtkisp50::StatsBuffer *out,
++		       const ipa::mtkisp50::StatsConfig &config);
++
 +	RawStatsCpu stats_;
++	std::unique_ptr<MtkIsp50PdStats> pdStats_;
++	unsigned int pdStride_ = 0;
 +	/* Raw buffers mapped for the statistics, kept while streaming */
 +	std::map<const FrameBuffer *, std::unique_ptr<MappedFrameBuffer>> rawMaps_;
 +};
 +
 +void MtkIsp50StatsWorker::process(uint32_t frame, FrameBuffer *raw,
 +				  mtkisp50::StatsBuffer *out,
-+				  const ipa::mtkisp50::StatsConfig &config, bool sync)
++				  const ipa::mtkisp50::StatsConfig &config, bool sync,
++				  FrameBuffer *pd)
 +{
 +	/* Sparse sampling by default: the ISP does the image */
 +	static constexpr unsigned int kLinePairStep = 8;
@@ -7663,6 +8433,7 @@ index 0000000..0f0d68d
 +
 +	if (!stats_.wantsFrame(frame) && !config.afEveryFrame) {
 +		stats_.finishFrame(frame, out);
++		processPd(pd, out, config);
 +		done.emit(frame);
 +		return;
 +	}
@@ -7684,7 +8455,44 @@ index 0000000..0f0d68d
 +		stats_.finishFrame(frame, out);
 +	}
 +
++	processPd(pd, out, config);
 +	done.emit(frame);
++}
++
++/* The PD part of the statistics: computed if wanted and a PD frame came */
++void MtkIsp50StatsWorker::processPd(FrameBuffer *pd, mtkisp50::StatsBuffer *out,
++				    const ipa::mtkisp50::StatsConfig &config)
++{
++	out->valid &= ~mtkisp50::StatsValidPd;
++	out->pdGridWidth = 0;
++	out->pdGridHeight = 0;
++
++	if (!pd || !pdStats_ || !config.pd)
++		return;
++
++	std::unique_ptr<MappedFrameBuffer> &in = rawMaps_[pd];
++	if (!in)
++		in = std::make_unique<MappedFrameBuffer>(pd, MappedFrameBuffer::MapFlag::Read);
++	if (!in->isValid()) {
++		LOG(MtkIsp50, Error) << "Failed to map the PD buffer";
++		rawMaps_.erase(pd);
++		return;
++	}
++
++	MtkIsp50PdConfig pdConfig{};
++	std::copy_n(config.pdRegion.begin(), std::min<size_t>(config.pdRegion.size(), 4),
++		    pdConfig.region.begin());
++	pdConfig.gridWidth = config.pdGridWidth;
++	pdConfig.gridHeight = config.pdGridHeight;
++	pdConfig.maxShift = config.pdMaxShift;
++	pdConfig.blackLevel = config.pdBlackLevel;
++
++	const Span<uint8_t> plane = in->planes()[0];
++	out->pdSequence = pd->metadata().sequence;
++	out->pdTimestamp = pd->metadata().timestamp;
++
++	DmaSyncer syncer(pd->planes()[0].fd, DmaSyncer::SyncType::Read);
++	pdStats_->compute(plane.data(), plane.size(), pdStride_, pdConfig, out);
 +}
 +
 +class MtkIsp50CameraData : public Camera::Private
@@ -7755,6 +8563,45 @@ index 0000000..0f0d68d
 +	MtkIsp50Frames frames_;
 +	std::map<unsigned int, bool> statsDone_;
 +
++	/*
++	 * Phase detection (PD) frames of sensors with a PD layout: a second
++	 * route through the router (seninf) from the sensor stream of the PD
++	 * frames to a free source pad, and its capture chain.
++	 */
++	struct Pd {
++		/* The router in entities_ (-1 for none) and its sink pad */
++		int router = -1;
++		unsigned int sinkPad = 0;
++		/* Source pad of the PD route, its subdevices and capture device */
++		unsigned int sourcePad = 0;
++		std::vector<Entity> entities;
++		std::unique_ptr<V4L2VideoDevice> video;
++		/* Routing before the first change, restored on release */
++		std::optional<V4L2Subdevice::Routing> savedRouting;
++
++		/* Layout of the configured sensor mode, nullptr without PD */
++		const MtkIsp50PdLayout *layout = nullptr;
++		V4L2DeviceFormat format;
++		/* Buffers allocated and the capture device streaming */
++		bool active = false;
++		bool streaming = false;
++		std::vector<std::unique_ptr<FrameBuffer>> buffers;
++		MtkIsp50PdMatcher matcher;
++		/* Frames whose statistics wait for their PD frame */
++		std::deque<std::pair<unsigned int, ipa::mtkisp50::StatsConfig>> waiting;
++		/* Counts of a session */
++		unsigned int frames = 0;
++		unsigned int paired = 0;
++		unsigned int unpaired = 0;
++	} pd_;
++
++	bool hasPdChain() const { return pd_.video != nullptr; }
++	int findPdChain();
++	bool pdRouted(const V4L2Subdevice::Routing &routing) const;
++	int setPdRouting(const MtkIsp50PdLayout *layout);
++	int setPdFormats();
++	void restoreRouting();
++
 +	void setSensorControls(uint32_t frame, const ControlList &sensorControls,
 +			       const ControlList &lensControls);
 +	void paramsComputed(uint32_t frame, uint32_t bytesused,
@@ -7817,8 +8664,14 @@ index 0000000..0f0d68d
 +	/* A camera of the handler streams (the DIP is in use) */
 +	bool streaming() const { return activeData_ != nullptr; }
 +
++	void dispatchStats(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info,
++			   const ipa::mtkisp50::StatsConfig &config, FrameBuffer *pd);
++	void dispatchPdWaiting(MtkIsp50CameraData *data, bool all);
++	void queuePdBuffers(MtkIsp50CameraData *data, const std::vector<FrameBuffer *> &buffers);
++
 +protected:
 +	bool acquireDevice(Camera *camera) override;
++	void releaseDevice(Camera *camera) override;
 +
 +private:
 +	MtkIsp50CameraData *cameraData(Camera *camera)
@@ -7836,6 +8689,7 @@ index 0000000..0f0d68d
 +	void ispOutputBufferReady(FrameBuffer *buffer);
 +	void ispScaledBufferReady(FrameBuffer *buffer);
 +	void ispParamsBufferReady(FrameBuffer *buffer);
++	void pdBufferReady(FrameBuffer *buffer);
 +	void statsDone(uint32_t frame);
 +
 +	std::shared_ptr<MediaDevice> camsys_;
@@ -7906,16 +8760,23 @@ index 0000000..0f0d68d
 +		if (ret)
 +			return ret;
 +
-+		/* The route from the sink pad, if the subdevice has routing */
++		/*
++		 * The route of the image (stream 0) from the sink pad, if the
++		 * subdevice has routing
++		 */
 +		const MediaPad *next = nullptr;
 +		V4L2Subdevice::Routing routing = {};
 +		if (!subdev->getRouting(&routing, V4L2Subdevice::ActiveFormat)) {
 +			for (const V4L2Subdevice::Route &route : routing) {
-+				if (route.sink.pad == sink->index() &&
++				if (route.sink.pad == sink->index() && route.sink.stream == 0 &&
 +				    (route.flags & V4L2_SUBDEV_ROUTE_FL_ACTIVE)) {
 +					next = entity->getPadByIndex(route.source.pad);
 +					break;
 +				}
++			}
++			if (next && pd_.router < 0) {
++				pd_.router = entities_.size();
++				pd_.sinkPad = sink->index();
 +			}
 +		}
 +
@@ -7945,6 +8806,10 @@ index 0000000..0f0d68d
 +
 +	properties_ = sensor_->properties();
 +
++	/* A sensor that sends PD frames: its capture chain, if there is one */
++	if (MtkIsp50PdLayout::known(sensor_->model()) && pd_.router >= 0 && findPdChain())
++		LOG(MtkIsp50, Info) << "No capture device for the PD frames of " << sensor_->id();
++
 +	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
 +	std::unordered_map<uint32_t, DelayedControls::ControlParams> params = {
 +		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
@@ -7956,6 +8821,247 @@ index 0000000..0f0d68d
 +	delayedCtrls_ = std::make_unique<DelayedControls>(sensor_->device(), params);
 +
 +	return 0;
++}
++
++/*
++ * The capture chain of the PD frames: from a source pad of the router that no
++ * image of a sensor uses (its route, if any, comes from a sink pad without a
++ * sensor), along the enabled links to a capture device that takes the PD
++ * frame format. The lowest such pad wins.
++ */
++int MtkIsp50CameraData::findPdChain()
++{
++	const Entity &router = entities_[pd_.router];
++
++	V4L2Subdevice::Routing routing;
++	if (router.subdev->getRouting(&routing, V4L2Subdevice::ActiveFormat))
++		return -ENODEV;
++
++	auto hasSensor = [&](unsigned int pad) {
++		const MediaPad *p = router.entity->getPadByIndex(pad);
++		if (!p)
++			return false;
++		for (const MediaLink *link : p->links()) {
++			if (link->source()->entity()->function() == MEDIA_ENT_F_CAM_SENSOR)
++				return true;
++		}
++		return false;
++	};
++
++	for (const MediaPad *pad : router.entity->pads()) {
++		if (!(pad->flags() & MEDIA_PAD_FL_SOURCE) || pad == router.source)
++			continue;
++
++		bool used = false;
++		for (const V4L2Subdevice::Route &route : routing) {
++			if (route.source.pad == pad->index() &&
++			    (route.flags & V4L2_SUBDEV_ROUTE_FL_ACTIVE) &&
++			    hasSensor(route.sink.pad) && route.sink.pad != pd_.sinkPad)
++				used = true;
++		}
++		if (used)
++			continue;
++
++		/* Follow the enabled links to a capture device */
++		std::vector<Entity> chain;
++		std::unique_ptr<V4L2VideoDevice> video;
++		const MediaPad *source = pad;
++		while (source && !video) {
++			const MediaLink *link = nullptr;
++			for (const MediaLink *l : source->links()) {
++				if (l->flags() & MEDIA_LNK_FL_ENABLED) {
++					link = l;
++					break;
++				}
++			}
++			if (!link)
++				break;
++
++			MediaEntity *entity = link->sink()->entity();
++			if (entity->function() == MEDIA_ENT_F_IO_V4L) {
++				video = std::make_unique<V4L2VideoDevice>(entity);
++				if (video->open())
++					video.reset();
++				break;
++			}
++
++			std::vector<const MediaPad *> sources;
++			for (const MediaPad *p : entity->pads()) {
++				if ((p->flags() & MEDIA_PAD_FL_SOURCE) && !p->links().empty())
++					sources.push_back(p);
++			}
++			if (sources.size() != 1)
++				break;
++
++			auto subdev = std::make_unique<V4L2Subdevice>(entity);
++			if (subdev->open())
++				break;
++			chain.push_back({ entity, link->sink(), sources[0], std::move(subdev) });
++			source = sources[0];
++		}
++
++		if (!video)
++			continue;
++
++		const auto formats = video->formats();
++		if (formats.find(kPdPixelFormat) == formats.end())
++			continue;
++
++		pd_.sourcePad = pad->index();
++		pd_.entities = std::move(chain);
++		pd_.video = std::move(video);
++
++		LOG(MtkIsp50, Debug)
++			<< "PD frames of " << sensor_->id() << " through "
++			<< router.entity->name() << " pad " << pd_.sourcePad
++			<< " to " << pd_.video->deviceNode();
++		return 0;
++	}
++
++	return -ENODEV;
++}
++
++/* The routing has the PD route of the configured layout */
++bool MtkIsp50CameraData::pdRouted(const V4L2Subdevice::Routing &routing) const
++{
++	for (const V4L2Subdevice::Route &route : routing) {
++		if (route.sink.pad == pd_.sinkPad && route.sink.stream != 0 &&
++		    route.source.pad == pd_.sourcePad &&
++		    (route.flags & V4L2_SUBDEV_ROUTE_FL_ACTIVE))
++			return true;
++	}
++	return false;
++}
++
++/*
++ * Route the PD stream of @layout to the PD capture chain, or (layout nullptr)
++ * take the PD route away again. A new routing resets the formats of the
++ * router: call before the formats are set.
++ */
++int MtkIsp50CameraData::setPdRouting(const MtkIsp50PdLayout *layout)
++{
++	if (!hasPdChain())
++		return layout ? -ENODEV : 0;
++
++	V4L2Subdevice *router = entities_[pd_.router].subdev.get();
++	V4L2Subdevice::Routing routing;
++	int ret = router->getRouting(&routing, V4L2Subdevice::ActiveFormat);
++	if (ret)
++		return ret;
++
++	const bool routed = pdRouted(routing);
++
++	if (!layout) {
++		if (!routed)
++			return 0;
++
++		V4L2Subdevice::Routing plain;
++		if (pd_.savedRouting && !pdRouted(*pd_.savedRouting)) {
++			plain = *pd_.savedRouting;
++		} else {
++			for (const V4L2Subdevice::Route &route : routing) {
++				if (!(route.sink.pad == pd_.sinkPad && route.sink.stream != 0))
++					plain.push_back(route);
++			}
++		}
++
++		ret = router->setRouting(&plain, V4L2Subdevice::ActiveFormat);
++		if (ret)
++			LOG(MtkIsp50, Error) << "Failed to remove the PD route: " << strerror(-ret);
++		return ret;
++	}
++
++	if (routed)
++		return 0;
++
++	if (!pd_.savedRouting)
++		pd_.savedRouting = routing;
++
++	V4L2Subdevice::Routing withPd;
++	for (const V4L2Subdevice::Route &route : routing) {
++		if (route.source.pad != pd_.sourcePad)
++			withPd.push_back(route);
++	}
++	withPd.emplace_back(V4L2Subdevice::Stream{ pd_.sinkPad, layout->stream },
++			    V4L2Subdevice::Stream{ pd_.sourcePad, 0 },
++			    V4L2_SUBDEV_ROUTE_FL_ACTIVE);
++
++	ret = router->setRouting(&withPd, V4L2Subdevice::ActiveFormat);
++	if (ret) {
++		LOG(MtkIsp50, Info)
++			<< "No PD route on " << entities_[pd_.router].entity->name()
++			<< ": " << strerror(-ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++/* Formats of the PD route and of the PD capture chain */
++int MtkIsp50CameraData::setPdFormats()
++{
++	const MtkIsp50PdLayout *layout = pd_.layout;
++	V4L2Subdevice *router = entities_[pd_.router].subdev.get();
++
++	V4L2SubdeviceFormat format;
++	format.code = layout->mbusCode;
++	format.size = layout->size;
++
++	int ret = router->setFormat(V4L2Subdevice::Stream{ pd_.sinkPad, layout->stream }, &format);
++	if (ret)
++		return ret;
++	ret = router->setFormat(V4L2Subdevice::Stream{ pd_.sourcePad, 0 }, &format);
++	if (ret)
++		return ret;
++
++	for (Entity &e : pd_.entities) {
++		ret = e.subdev->setFormat(e.sink->index(), &format);
++		if (ret)
++			return ret;
++
++		V4L2SubdeviceFormat sourceFormat = format;
++		ret = e.subdev->getFormat(e.source->index(), &sourceFormat);
++		if (ret)
++			return ret;
++		if (sourceFormat.code != format.code || sourceFormat.size != format.size) {
++			ret = e.subdev->setFormat(e.source->index(), &format);
++			if (ret)
++				return ret;
++		}
++	}
++
++	if (format.code != layout->mbusCode || format.size != layout->size) {
++		LOG(MtkIsp50, Error) << "PD format " << format << " instead of " << layout->size;
++		return -EINVAL;
++	}
++
++	V4L2DeviceFormat video;
++	video.fourcc = kPdPixelFormat;
++	video.size = layout->size;
++	ret = pd_.video->setFormat(&video);
++	if (ret)
++		return ret;
++	if (video.fourcc != kPdPixelFormat || video.size != layout->size) {
++		LOG(MtkIsp50, Error) << "PD capture format " << video;
++		return -EINVAL;
++	}
++	pd_.format = video;
++
++	return 0;
++}
++
++/* The routing as it was before the first change */
++void MtkIsp50CameraData::restoreRouting()
++{
++	if (!pd_.savedRouting || pd_.router < 0)
++		return;
++
++	V4L2Subdevice::Routing routing = *pd_.savedRouting;
++	int ret = entities_[pd_.router].subdev->setRouting(&routing, V4L2Subdevice::ActiveFormat);
++	if (ret)
++		LOG(MtkIsp50, Warning) << "Failed to restore the routing: " << strerror(-ret);
++	pd_.savedRouting.reset();
++	pd_.layout = nullptr;
 +}
 +
 +int MtkIsp50CameraData::loadIPA()
@@ -8031,16 +9137,32 @@ index 0000000..0f0d68d
 +
 +	/* The raw buffer stays until the statistics are done */
 +	statsDone_[frame] = false;
-+	FrameBuffer *raw = info->rawBuffer;
-+	mtkisp50::StatsBuffer *out = statsMaps_[info->statsBuffer];
 +
 +	frames_.submitIspJob(info, bytesused);
 +	pipe->runIspJobs(this);
 +
-+	/* The statistics of the raw frame, also while the ISP works on it */
-+	pipe->statsWorker_->invokeMethod(&MtkIsp50StatsWorker::process,
-+					 ConnectionTypeQueued, frame, raw, out,
-+					 config, true);
++	if (!pd_.streaming) {
++		pipe->dispatchStats(this, info, config, nullptr);
++		return;
++	}
++
++	/*
++	 * The statistics of a frame with its PD frame: earlier frames still
++	 * waiting go without theirs, this one waits for its PD frame if it may
++	 * still come.
++	 */
++	pipe->dispatchPdWaiting(this, true);
++
++	std::vector<FrameBuffer *> release;
++	FrameBuffer *pd = pd_.matcher.take(info->rawTimestamp, &release);
++	pipe->queuePdBuffers(this, release);
++
++	if (!pd && pd_.matcher.mayCome(info->rawTimestamp)) {
++		pd_.waiting.emplace_back(frame, config);
++		return;
++	}
++
++	pipe->dispatchStats(this, info, config, pd);
 +}
 +
 +void MtkIsp50CameraData::metadataReady(uint32_t frame, const ControlList &metadata)
@@ -8384,31 +9506,71 @@ index 0000000..0f0d68d
 +		static_cast<MtkIsp50CameraConfiguration *>(c);
 +	MtkIsp50CameraData *data = cameraData(camera);
 +
++	/*
++	 * The sensor mode with PD frames gets the PD route, the others not
++	 * (the route of a stream the sensor does not send fails the start).
++	 * A new routing resets the formats of the router: first the routing.
++	 */
++	const MtkIsp50PdLayout *pdLayout = data->hasPdChain()
++		? MtkIsp50PdLayout::find(data->sensor_->model(), config->sensorFormat.size)
++		: nullptr;
++	int ret = data->setPdRouting(pdLayout);
++	if (ret && pdLayout) {
++		pdLayout = nullptr;
++		ret = data->setPdRouting(nullptr);
++	}
++	if (ret)
++		return ret;
++
 +	V4L2SubdeviceFormat format = config->sensorFormat;
-+	int ret = data->sensor_->setFormat(&format);
++	ret = data->sensor_->setFormat(&format);
 +	if (ret)
 +		return ret;
 +	data->sensorFormat_ = format;
 +
 +	/* Propagate the format along the subdevices */
-+	for (MtkIsp50CameraData::Entity &e : data->entities_) {
-+		ret = e.subdev->setFormat(e.sink->index(), &format);
-+		if (ret)
-+			return ret;
++	auto propagate = [&]() {
++		V4L2SubdeviceFormat f = data->sensorFormat_;
++		for (MtkIsp50CameraData::Entity &e : data->entities_) {
++			int r = e.subdev->setFormat(e.sink->index(), &f);
++			if (r)
++				return r;
 +
-+		V4L2SubdeviceFormat sourceFormat = format;
-+		ret = e.subdev->getFormat(e.source->index(), &sourceFormat);
-+		if (ret)
-+			return ret;
++			V4L2SubdeviceFormat sourceFormat = f;
++			r = e.subdev->getFormat(e.source->index(), &sourceFormat);
++			if (r)
++				return r;
 +
-+		if (sourceFormat.code != format.code || sourceFormat.size != format.size) {
-+			ret = e.subdev->setFormat(e.source->index(), &format);
++			if (sourceFormat.code != f.code || sourceFormat.size != f.size) {
++				r = e.subdev->setFormat(e.source->index(), &f);
++				if (r)
++					return r;
++			}
++
++			LOG(MtkIsp50, Debug)
++				<< e.entity->name() << ": " << f;
++		}
++		return 0;
++	};
++
++	ret = propagate();
++	if (ret)
++		return ret;
++
++	/* The PD stream; without it the route goes again */
++	data->pd_.layout = pdLayout;
++	if (pdLayout) {
++		ret = data->setPdFormats();
++		if (ret) {
++			LOG(MtkIsp50, Warning)
++				<< "No PD frames, formats not taken: " << strerror(-ret);
++			data->pd_.layout = nullptr;
++			ret = data->setPdRouting(nullptr);
++			if (!ret)
++				ret = propagate();
 +			if (ret)
 +				return ret;
 +		}
-+
-+		LOG(MtkIsp50, Debug)
-+			<< e.entity->name() << ": " << format;
 +	}
 +
 +	BayerFormat bayer = BayerFormat::fromMbusCode(data->sensorFormat_.code);
@@ -8538,6 +9700,9 @@ index 0000000..0f0d68d
 +		LOG(MtkIsp50, Error) << "Statistics not possible on " << rawConfig.pixelFormat;
 +		return ret;
 +	}
++	statsWorker_->invokeMethod(&MtkIsp50StatsWorker::configurePd, ConnectionTypeBlocking,
++				   data->pd_.layout,
++				   data->pd_.layout ? data->pd_.format.planes[0].bpl : 0u);
 +
 +	/*
 +	 * The processed area in active pixel array coordinates, through the
@@ -8583,6 +9748,7 @@ index 0000000..0f0d68d
 +		<< (scaledCfg ? ", scaled " + scaledCfg->toString() : "");
 +	ipaConfig.paramsBufferSize = MTK_DIP_PARAMS_MAX_SIZE;
 +	ipaConfig.statsSource = static_cast<uint32_t>(mtkisp50::StatsSource::Cpu);
++	ipaConfig.pdAvailable = data->pd_.layout != nullptr;
 +
 +	ret = data->ipa_->configure(ipaConfig, &data->ipaControls_);
 +	if (ret) {
@@ -8721,6 +9887,19 @@ index 0000000..0f0d68d
 +
 +	data->frames_.init(data->paramsBuffers_, data->statsBuffers_);
 +
++	/* PD frames: without their buffers the image goes on alone */
++	data->pd_.active = false;
++	if (data->pd_.layout) {
++		ret = data->pd_.video->allocateBuffers(kPdBufferCount, &data->pd_.buffers);
++		if (ret < 0) {
++			LOG(MtkIsp50, Warning)
++				<< "No PD frames, no buffers: " << strerror(-ret);
++			data->pd_.buffers.clear();
++		} else {
++			data->pd_.active = true;
++		}
++	}
++
 +	return 0;
 +}
 +
@@ -8757,6 +9936,12 @@ index 0000000..0f0d68d
 +	data->availableRawBuffers_ = {};
 +	data->video_->releaseBuffers();
 +	data->rawBuffers_.clear();
++
++	if (data->pd_.active) {
++		data->pd_.video->releaseBuffers();
++		data->pd_.buffers.clear();
++		data->pd_.active = false;
++	}
 +}
 +
 +int PipelineHandlerMtkIsp50::start(Camera *camera, const ControlList *controls)
@@ -8822,6 +10007,26 @@ index 0000000..0f0d68d
 +		goto error;
 +	}
 +
++	/* The PD frames join the running sensor; the image goes on without */
++	if (data->pd_.active) {
++		data->pd_.matcher.reset();
++		data->pd_.matcher.setTolerance(kPdTolerance);
++		data->pd_.waiting.clear();
++		data->pd_.frames = data->pd_.paired = data->pd_.unpaired = 0;
++
++		int r = 0;
++		for (std::unique_ptr<FrameBuffer> &buffer : data->pd_.buffers) {
++			r = data->pd_.video->queueBuffer(buffer.get());
++			if (r)
++				break;
++		}
++		if (!r)
++			r = data->pd_.video->streamOn();
++		if (r)
++			LOG(MtkIsp50, Warning) << "No PD frames, start failed: " << strerror(-r);
++		data->pd_.streaming = !r;
++	}
++
 +	/*
 +	 * The capture side may move the lens when the stream starts (seninf
 +	 * has a default position for it): the kept position goes again.
@@ -8847,6 +10052,15 @@ index 0000000..0f0d68d
 +	/* Returned buffers come back cancelled and complete their requests */
 +	data->stopping_ = true;
 +	data->frames_.holdIsp(true);
++	if (data->pd_.streaming) {
++		data->pd_.video->streamOff();
++		data->pd_.streaming = false;
++		data->pd_.waiting.clear();
++		data->pd_.matcher.reset();
++		LOG(MtkIsp50, Debug)
++			<< "PD frames: " << data->pd_.paired << " of " << data->pd_.frames
++			<< " statistics with their PD frame";
++	}
 +	data->video_->streamOff();
 +	if (data->ispActive())
 +		dip_.stop();
@@ -9002,6 +10216,7 @@ index 0000000..0f0d68d
 +	Request *request = info->request;
 +	info->captured = true;
 +	info->rawSequence = buffer->metadata().sequence;
++	info->rawTimestamp = buffer->metadata().timestamp;
 +
 +	if (buffer->metadata().status != FrameMetadata::FrameSuccess) {
 +		info->error = true;
@@ -9106,6 +10321,84 @@ index 0000000..0f0d68d
 +	tryComplete(data, info);
 +}
 +
++/* The statistics of the raw frame, also while the ISP works on it */
++void PipelineHandlerMtkIsp50::dispatchStats(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info,
++					    const ipa::mtkisp50::StatsConfig &config, FrameBuffer *pd)
++{
++	if (data->pd_.streaming && config.pd) {
++		data->pd_.frames++;
++		if (pd)
++			data->pd_.paired++;
++		else
++			data->pd_.unpaired++;
++	}
++
++	info->pdBuffer = pd;
++	statsWorker_->invokeMethod(&MtkIsp50StatsWorker::process, ConnectionTypeQueued,
++				   info->id, info->rawBuffer, data->statsMaps_[info->statsBuffer],
++				   config, true, pd);
++}
++
++/*
++ * Frames waiting for their PD frame: those whose PD frame came, or cannot
++ * come any more, go on; with @all every one goes, with or without.
++ */
++void PipelineHandlerMtkIsp50::dispatchPdWaiting(MtkIsp50CameraData *data, bool all)
++{
++	auto &waiting = data->pd_.waiting;
++
++	while (!waiting.empty()) {
++		auto &[id, config] = waiting.front();
++		MtkIsp50Frames::Info *info = data->frames_.find(id);
++		if (!info) {
++			waiting.pop_front();
++			continue;
++		}
++
++		std::vector<FrameBuffer *> release;
++		FrameBuffer *pd = data->pd_.matcher.take(info->rawTimestamp, &release);
++		queuePdBuffers(data, release);
++
++		if (!pd && !all && data->pd_.matcher.mayCome(info->rawTimestamp))
++			break;
++
++		dispatchStats(data, info, config, pd);
++		waiting.pop_front();
++	}
++}
++
++void PipelineHandlerMtkIsp50::queuePdBuffers(MtkIsp50CameraData *data,
++					     const std::vector<FrameBuffer *> &buffers)
++{
++	for (FrameBuffer *buffer : buffers) {
++		if (!data->pd_.streaming || data->stopping_)
++			continue;
++		int ret = data->pd_.video->queueBuffer(buffer);
++		if (ret)
++			LOG(MtkIsp50, Error) << "Failed to queue a PD buffer: " << strerror(-ret);
++	}
++}
++
++/* A PD frame: it waits for the raw frame of the same sensor frame */
++void PipelineHandlerMtkIsp50::pdBufferReady(FrameBuffer *buffer)
++{
++	MtkIsp50CameraData *data = activeData_;
++	if (!data || !data->pd_.streaming || data->stopping_)
++		return;
++
++	const FrameMetadata &metadata = buffer->metadata();
++	if (metadata.status != FrameMetadata::FrameSuccess) {
++		queuePdBuffers(data, { buffer });
++		return;
++	}
++
++	std::vector<FrameBuffer *> release;
++	data->pd_.matcher.push({ buffer, metadata.timestamp, metadata.sequence }, &release);
++	queuePdBuffers(data, release);
++
++	dispatchPdWaiting(data, false);
++}
++
 +void PipelineHandlerMtkIsp50::statsDone(uint32_t frame)
 +{
 +	MtkIsp50CameraData *data = activeData_;
@@ -9118,6 +10411,12 @@ index 0000000..0f0d68d
 +
 +	data->statsDone_[frame] = true;
 +	recycleRaw(data, info);
++
++	/* The PD frame is read: back to the capture device */
++	if (info->pdBuffer) {
++		queuePdBuffers(data, { info->pdBuffer });
++		info->pdBuffer = nullptr;
++	}
 +
 +	data->ipa_->processStats(frame, info->statsBuffer->cookie(),
 +				 data->delayedCtrls_->get(frame));
@@ -9186,6 +10485,12 @@ index 0000000..0f0d68d
 +		LOG(MtkIsp50, Error) << "Failed to restart the ISP: " << strerror(-ret);
 +
 +	/* The driver keeps the parameters of the ISP, nothing to send again */
++}
++
++/* The routing of other users does not have the PD route */
++void PipelineHandlerMtkIsp50::releaseDevice(Camera *camera)
++{
++	cameraData(camera)->restoreRouting();
 +}
 +
 +bool PipelineHandlerMtkIsp50::acquireDevice([[maybe_unused]] Camera *camera)
@@ -9274,6 +10579,8 @@ index 0000000..0f0d68d
 +		data->properties_.set(properties::ScalerCropMaximum, sensorInfo.analogCrop);
 +
 +	data->video_->bufferReady.connect(this, &PipelineHandlerMtkIsp50::rawBufferReady);
++	if (data->pd_.video)
++		data->pd_.video->bufferReady.connect(this, &PipelineHandlerMtkIsp50::pdBufferReady);
 +
 +	std::set<Stream *> streams = { &data->outputStream_, &data->scaledStream_,
 +				       &data->rawStream_ };
@@ -9343,6 +10650,677 @@ index 0000000..0f0d68d
 +}
 +
 +REGISTER_PIPELINE_HANDLER(PipelineHandlerMtkIsp50, "mtkisp50")
++
++} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/mtkisp50/pd.cpp b/src/libcamera/pipeline/mtkisp50/pd.cpp
+new file mode 100644
+index 0000000..c82c0ca
+--- /dev/null
++++ b/src/libcamera/pipeline/mtkisp50/pd.cpp
+@@ -0,0 +1,468 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Phase detection data of the mtkisp50 pipeline
++ */
++
++#include "pd.h"
++
++#include <algorithm>
++#include <cmath>
++#include <numeric>
++
++#include <linux/media-bus-format.h>
++
++namespace libcamera {
++
++using namespace mtkisp50;
++
++namespace {
++
++/*
++ * OV64B40: in the 4624x3472 mode the sensor sends its PD pixels on virtual
++ * channel 1 next to the image, RAW10, 1136 samples per line and 860 lines.
++ * Pattern as described by the GPL sensor driver of the vendor kernel: blocks
++ * of 16 x 16 pixels from (40, 16), 284 x 215 blocks, in each block 8 pairs of
++ * a right and a left pixel, the left one at x + 1. A line holds one of the
++ * four pixel rows with pairs of all blocks of a block row, right and left in
++ * turn.
++ */
++const MtkIsp50PdLayout kLayouts[] = {
++	{
++		.model = "ov64b40",
++		.sensorSize = { 4624, 3472 },
++		.stream = 1,
++		.mbusCode = MEDIA_BUS_FMT_Y10_1X10,
++		.size = { 1136, 860 },
++		.bitDepth = 10,
++		.offset = { 40, 16 },
++		.block = 16,
++		.blocks = { 284, 215 },
++		.rowY = { 18, 22, 26, 30 },
++		.pairX = { { 46, 54 }, { 42, 50 }, { 46, 54 }, { 42, 50 } },
++		.leftOffset = 1,
++	},
++};
++
++/*
++ * Each pattern position along x keeps a slow pattern of its own (it moves
++ * with the shading and the pixel kind, not with the scene) that matches at no
++ * shift and at whole blocks: it is taken out with a running mean over this
++ * many blocks.
++ */
++constexpr unsigned int kTrendBlocks = 9;
++
++/*
++ * Confidence: the depth of the match minimum against the median of the match
++ * curve, relative to the minimum (the noise left at the best match). Full
++ * confidence at this depth.
++ */
++constexpr double kFullDepth = 1.0;
++
++} /* namespace */
++
++const MtkIsp50PdLayout *MtkIsp50PdLayout::find(const std::string &model, const Size &sensorSize)
++{
++	for (const MtkIsp50PdLayout &layout : kLayouts) {
++		if (layout.model == model && layout.sensorSize == sensorSize)
++			return &layout;
++	}
++
++	return nullptr;
++}
++
++bool MtkIsp50PdLayout::known(const std::string &model)
++{
++	return std::any_of(std::begin(kLayouts), std::end(kLayouts),
++			   [&](const MtkIsp50PdLayout &l) { return l.model == model; });
++}
++
++unsigned int MtkIsp50PdLayout::samplesPerLine() const
++{
++	return blocks.width * pairsPerLine() * 2;
++}
++
++MtkIsp50PdStats::MtkIsp50PdStats(const MtkIsp50PdLayout &layout)
++	: layout_(layout)
++{
++	/* The profile positions: the right pixel x of all lines, in order */
++	std::vector<unsigned int> xs;
++	for (const auto &line : layout.pairX)
++		xs.insert(xs.end(), line.begin(), line.end());
++	std::sort(xs.begin(), xs.end());
++	xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
++
++	positions_ = xs.size();
++	pitch_ = positions_ ? static_cast<double>(layout.block) / positions_ : 1.0;
++
++	position_.clear();
++	for (const auto &line : layout.pairX) {
++		std::vector<unsigned int> pos;
++		for (unsigned int x : line)
++			pos.push_back(std::find(xs.begin(), xs.end(), x) - xs.begin());
++		position_.push_back(pos);
++	}
++
++	/* A sample this close to the top counts as saturated */
++	saturation_ = ((1u << layout.bitDepth) - 1) * 1000 / 1023;
++}
++
++void MtkIsp50PdStats::unpackLine(const uint8_t *line, unsigned int samples, uint16_t *out)
++{
++	for (unsigned int i = 0; i + 4 <= samples; i += 4, line += 5) {
++		out[i] = line[0] | ((line[1] & 0x03) << 8);
++		out[i + 1] = (line[1] >> 2) | ((line[2] & 0x0f) << 6);
++		out[i + 2] = (line[2] >> 4) | ((line[3] & 0x3f) << 4);
++		out[i + 3] = (line[3] >> 6) | (line[4] << 2);
++	}
++}
++
++std::vector<Rectangle> MtkIsp50PdStats::windows(const MtkIsp50PdConfig &config) const
++{
++	const Size &s = layout_.sensorSize;
++	auto px = [](uint16_t frac, unsigned int size) {
++		return static_cast<int64_t>(frac) * size / 65536;
++	};
++
++	const int64_t x = px(config.region[0], s.width);
++	const int64_t y = px(config.region[1], s.height);
++	const int64_t w = px(config.region[2], s.width);
++	const int64_t h = px(config.region[3], s.height);
++	const unsigned int nx = std::max(1u, config.gridWidth);
++	const unsigned int ny = std::max(1u, config.gridHeight);
++
++	std::vector<Rectangle> wins;
++	for (unsigned int j = 0; j < ny; j++) {
++		for (unsigned int i = 0; i < nx; i++)
++			wins.emplace_back(x + i * w / nx, y + j * h / ny,
++					  static_cast<unsigned int>(w / nx),
++					  static_cast<unsigned int>(h / ny));
++	}
++
++	return wins;
++}
++
++void MtkIsp50PdStats::profile(const std::vector<uint16_t> &lines, unsigned int bx0,
++			      unsigned int bx1, unsigned int by0, unsigned int by1,
++			      unsigned int blackLevel, Profile *p) const
++{
++	const unsigned int n = (bx1 - bx0) * positions_;
++	const unsigned int perLine = layout_.samplesPerLine();
++	const unsigned int linesPerBlock = layout_.linesPerBlock();
++	const unsigned int pairs = layout_.pairsPerLine();
++
++	std::vector<double> sumL(n, 0.0), sumR(n, 0.0);
++	std::vector<unsigned int> count(n, 0);
++
++	for (unsigned int by = by0; by < by1; by++) {
++		for (unsigned int k = 0; k < linesPerBlock; k++) {
++			const uint16_t *line = &lines[(by * linesPerBlock + k) * perLine];
++			const std::vector<unsigned int> &pos = position_[k];
++
++			for (unsigned int bx = bx0; bx < bx1; bx++) {
++				const uint16_t *s = line + bx * pairs * 2;
++				for (unsigned int q = 0; q < pairs; q++) {
++					const unsigned int right = s[2 * q];
++					const unsigned int left = s[2 * q + 1];
++					const unsigned int i = (bx - bx0) * positions_ + pos[q];
++
++					sumR[i] += right;
++					sumL[i] += left;
++					count[i]++;
++					p->sum += right + left;
++					p->samples += 2;
++					p->saturated += (right >= saturation_) + (left >= saturation_);
++				}
++			}
++		}
++	}
++
++	p->left.resize(n);
++	p->right.resize(n);
++	for (unsigned int i = 0; i < n; i++) {
++		const double c = std::max(count[i], 1u);
++		p->left[i] = std::max(sumL[i] / c - blackLevel, 0.0);
++		p->right[i] = std::max(sumR[i] / c - blackLevel, 0.0);
++	}
++	p->sum -= static_cast<double>(blackLevel) * p->samples;
++}
++
++/* Samples k, k + positions_, ... to their mean, then less their running mean */
++void MtkIsp50PdStats::normalise(std::vector<double> *profile, unsigned int k) const
++{
++	std::vector<double> &p = *profile;
++	std::vector<double> q;
++	for (unsigned int j = k; j < p.size(); j += positions_)
++		q.push_back(p[j]);
++	if (q.empty())
++		return;
++
++	const double mean = std::max(std::accumulate(q.begin(), q.end(), 0.0) / q.size(), 1e-6);
++	for (double &v : q)
++		v /= mean;
++
++	/* Running mean, the ends repeated */
++	const int half = kTrendBlocks / 2;
++	const int m = q.size();
++	std::vector<double> out(m);
++	for (int j = 0; j < m; j++) {
++		double sum = 0.0;
++		for (int t = j - half; t <= j + half; t++)
++			sum += q[std::clamp(t, 0, m - 1)];
++		out[j] = q[j] - sum / kTrendBlocks;
++	}
++
++	for (int j = 0; j < m; j++)
++		p[k + j * positions_] = out[j];
++}
++
++MtkIsp50PdStats::Match MtkIsp50PdStats::match(const Profile &p, unsigned int maxShift)
++{
++	Match m;
++	const unsigned int n = p.left.size();
++
++	if (n < 2 * maxShift + 8)
++		return m;
++
++	m.sad.assign(2 * maxShift + 1, 0.0);
++
++	const unsigned int lo = maxShift;
++	const unsigned int hi = n - maxShift;
++
++	for (unsigned int d = 0; d < m.sad.size(); d++) {
++		double sum = 0.0;
++		const int off = static_cast<int>(d) - static_cast<int>(maxShift);
++		for (unsigned int i = lo; i < hi; i++)
++			sum += std::abs(p.left[i + off] - p.right[i]);
++		m.sad[d] = sum / (hi - lo);
++	}
++
++	double contrast = 0.0;
++	for (unsigned int i = lo; i + 1 < hi; i++)
++		contrast += std::abs(p.right[i + 1] - p.right[i]);
++	m.contrast = contrast / (hi - lo - 1);
++	m.valid = true;
++
++	return m;
++}
++
++void MtkIsp50PdStats::result(const std::vector<double> &sad, double contrast,
++			     double saturation, double level, StatsPdWindow *w) const
++{
++	w->shift = 0.0f;
++	w->confidence = 0.0f;
++	w->curvature = 0.0f;
++	w->contrast = contrast;
++	w->saturation = saturation;
++	w->level = level;
++
++	if (sad.size() < 3)
++		return;
++
++	const int maxShift = (sad.size() - 1) / 2;
++	const unsigned int i = std::min_element(sad.begin(), sad.end()) - sad.begin();
++	double frac = 0.0;
++	double curv = 0.0;
++	if (i > 0 && i + 1 < sad.size()) {
++		const double y0 = sad[i - 1], y1 = sad[i], y2 = sad[i + 1];
++		const double den = y0 - 2 * y1 + y2;
++		if (den > 0.0) {
++			frac = 0.5 * (y0 - y2) / den;
++			curv = den;
++		}
++	}
++
++	std::vector<double> sorted = sad;
++	std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
++	const double median = sorted[sorted.size() / 2];
++	const double depth = (median - sad[i]) / std::max(sad[i], 1e-9);
++
++	double c = 100.0 * std::clamp(depth / kFullDepth, 0.0, 1.0) *
++		   std::max(0.0, 1.0 - 4.0 * saturation);
++	if (curv <= 0.0)
++		c *= 0.25;
++
++	const double d = static_cast<double>(static_cast<int>(i) - maxShift) + frac;
++	w->shift = static_cast<float>(-pitch_ * d - layout_.leftOffset);
++	w->confidence = static_cast<float>(std::round(c));
++	w->curvature = static_cast<float>(curv);
++}
++
++bool MtkIsp50PdStats::compute(const uint8_t *data, size_t length, unsigned int stride,
++			      const MtkIsp50PdConfig &config, StatsBuffer *out)
++{
++	out->valid &= ~StatsValidPd;
++	out->pdGridWidth = 0;
++	out->pdGridHeight = 0;
++
++	const unsigned int perLine = layout_.samplesPerLine();
++	const unsigned int lineBytes = (perLine * layout_.bitDepth + 7) / 8;
++	const unsigned int height = layout_.size.height;
++	if (!positions_ || perLine != layout_.size.width || stride < lineBytes ||
++	    length < static_cast<size_t>(stride) * (height - 1) + lineBytes)
++		return false;
++
++	const std::vector<Rectangle> wins = windows(config);
++	if (wins.empty() || wins.size() > StatsBuffer::kMaxPdWindows)
++		return false;
++
++	/* Blocks of a window, bounded to the pattern */
++	struct Blocks {
++		unsigned int bx0, bx1, by0, by1;
++	};
++	auto blocksOf = [&](const Rectangle &r) {
++		const int64_t b = layout_.block;
++		auto lowBlock = [&](int64_t v, int64_t origin, unsigned int count) {
++			return static_cast<unsigned int>(std::clamp<int64_t>((v - origin) / b, 0, count));
++		};
++		auto highBlock = [&](int64_t v, int64_t origin, unsigned int count) {
++			return static_cast<unsigned int>(std::clamp<int64_t>((v - origin + b - 1) / b, 0, count));
++		};
++		return Blocks{ lowBlock(r.x, layout_.offset.x, layout_.blocks.width),
++			       highBlock(r.x + static_cast<int64_t>(r.width), layout_.offset.x,
++					 layout_.blocks.width),
++			       lowBlock(r.y, layout_.offset.y, layout_.blocks.height),
++			       highBlock(r.y + static_cast<int64_t>(r.height), layout_.offset.y,
++					 layout_.blocks.height) };
++	};
++
++	/* Unpack the lines of the block rows the windows cover */
++	unsigned int byMin = layout_.blocks.height, byMax = 0;
++	for (const Rectangle &r : wins) {
++		const Blocks b = blocksOf(r);
++		byMin = std::min(byMin, b.by0);
++		byMax = std::max(byMax, b.by1);
++	}
++
++	const unsigned int linesPerBlock = layout_.linesPerBlock();
++	lines_.resize(static_cast<size_t>(perLine) * height);
++	for (unsigned int line = byMin * linesPerBlock;
++	     line < std::min(byMax * linesPerBlock, height); line++)
++		unpackLine(data + static_cast<size_t>(line) * stride, perLine,
++			   &lines_[static_cast<size_t>(line) * perLine]);
++
++	const unsigned int maxShift = std::max(1u, config.maxShift);
++	std::vector<double> total(2 * maxShift + 1, 0.0);
++	unsigned int matched = 0;
++	double contrastSum = 0.0, levelSum = 0.0, saturationMax = 0.0;
++
++	for (unsigned int i = 0; i < wins.size(); i++) {
++		const Rectangle &r = wins[i];
++		StatsPdWindow &w = out->pd[i];
++		w = {};
++		w.x = r.x;
++		w.y = r.y;
++		w.width = r.width;
++		w.height = r.height;
++
++		const Blocks b = blocksOf(r);
++		if (b.bx1 <= b.bx0 || b.by1 <= b.by0)
++			continue;
++
++		Profile p;
++		profile(lines_, b.bx0, b.bx1, b.by0, b.by1, config.blackLevel, &p);
++
++		/*
++		 * Each pattern position to its mean (shading, pixel gains),
++		 * then without its running mean along x
++		 */
++		for (unsigned int k = 0; k < positions_; k++) {
++			normalise(&p.left, k);
++			normalise(&p.right, k);
++		}
++
++		const double saturation = p.samples ? static_cast<double>(p.saturated) / p.samples : 0.0;
++		const double level = p.samples ? p.sum / p.samples : 0.0;
++
++		const Match m = match(p, maxShift);
++		if (!m.valid) {
++			w.saturation = saturation;
++			w.level = level;
++			continue;
++		}
++
++		result(m.sad, m.contrast, saturation, level, &w);
++
++		for (unsigned int d = 0; d < total.size(); d++)
++			total[d] += m.sad[d];
++		matched++;
++		contrastSum += m.contrast;
++		levelSum += level;
++		saturationMax = std::max(saturationMax, saturation);
++	}
++
++	/* All windows together: the mean of their match curves */
++	StatsPdWindow &all = out->pdRegion;
++	all = {};
++	if (!wins.empty()) {
++		all.x = wins.front().x;
++		all.y = wins.front().y;
++		all.width = wins.back().x + wins.back().width - all.x;
++		all.height = wins.back().y + wins.back().height - all.y;
++	}
++	if (matched) {
++		for (double &v : total)
++			v /= matched;
++		result(total, contrastSum / matched, saturationMax, levelSum / matched, &all);
++	}
++
++	out->pdGridWidth = std::max(1u, config.gridWidth);
++	out->pdGridHeight = std::max(1u, config.gridHeight);
++	out->valid |= StatsValidPd;
++
++	return true;
++}
++
++void MtkIsp50PdMatcher::push(const Frame &frame, std::vector<FrameBuffer *> *release)
++{
++	waiting_.push_back(frame);
++	newest_ = std::max(newest_, frame.timestamp);
++
++	while (waiting_.size() > maxWaiting_) {
++		release->push_back(waiting_.front().buffer);
++		waiting_.pop_front();
++	}
++}
++
++FrameBuffer *MtkIsp50PdMatcher::take(uint64_t rawTimestamp, std::vector<FrameBuffer *> *release,
++				     Frame *taken)
++{
++	FrameBuffer *match = nullptr;
++
++	while (!waiting_.empty()) {
++		const Frame &f = waiting_.front();
++		const int64_t delta = static_cast<int64_t>(f.timestamp - rawTimestamp);
++
++		if (delta < -static_cast<int64_t>(tolerance_)) {
++			/* Older than the raw frame: its raw frame is gone */
++			release->push_back(f.buffer);
++			waiting_.pop_front();
++			continue;
++		}
++
++		if (delta <= static_cast<int64_t>(tolerance_)) {
++			match = f.buffer;
++			if (taken)
++				*taken = f;
++			waiting_.pop_front();
++		}
++		break;
++	}
++
++	return match;
++}
++
++bool MtkIsp50PdMatcher::mayCome(uint64_t rawTimestamp) const
++{
++	/* A PD frame within the tolerance would be waiting already */
++	return newest_ + tolerance_ < rawTimestamp;
++}
++
++void MtkIsp50PdMatcher::drain(std::vector<FrameBuffer *> *release)
++{
++	for (const Frame &f : waiting_)
++		release->push_back(f.buffer);
++	waiting_.clear();
++	newest_ = 0;
++}
++
++} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/mtkisp50/pd.h b/src/libcamera/pipeline/mtkisp50/pd.h
+new file mode 100644
+index 0000000..2606226
+--- /dev/null
++++ b/src/libcamera/pipeline/mtkisp50/pd.h
+@@ -0,0 +1,191 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Phase detection data of the mtkisp50 pipeline
++ *
++ * Some sensors send their phase detection (PD) pixels on a stream of their
++ * own (a virtual channel next to the image), in one sensor mode only. The
++ * capture side writes it to memory through a second capture device. This
++ * file has what does not need a device: the layout of the PD frame of a
++ * sensor, the computation of the PD statistics of a frame, and the pairing
++ * of PD frames with raw frames.
++ */
++
++#pragma once
++
++#include <array>
++#include <deque>
++#include <stdint.h>
++#include <string>
++#include <vector>
++
++#include <libcamera/geometry.h>
++
++#include "libcamera/internal/mtkisp50/stats.h"
++
++namespace libcamera {
++
++class FrameBuffer;
++
++/*
++ * Where the PD pixels of a sensor are and how its PD frame is built. The
++ * pattern repeats in blocks of block x block pixels; a line of the PD frame
++ * holds one pixel row of all blocks in a row, the samples of a block in the
++ * order of pairX of that row (rows of a block in the order of rowY). Each
++ * pair is a right and a left pixel, the left one leftOffset pixels to the
++ * right of the right one.
++ */
++struct MtkIsp50PdLayout {
++	/* Sensor model and the mode that sends the PD stream */
++	std::string model;
++	Size sensorSize;
++	/* Stream of the sensor source pad, bus code and size of the PD frame */
++	unsigned int stream;
++	uint32_t mbusCode;
++	Size size;
++	/* Bits per sample, MediaTek packing (4 samples in 5 bytes, LSB first) */
++	unsigned int bitDepth;
++
++	/* Pattern in pixels of the sensor mode */
++	Point offset;
++	unsigned int block;
++	Size blocks;
++	/* Per line of a block: y and the x of the right pixel of each pair */
++	std::vector<unsigned int> rowY;
++	std::vector<std::vector<unsigned int>> pairX;
++	int leftOffset;
++
++	/* Layout of a sensor mode, nullptr if the mode sends no PD frame */
++	static const MtkIsp50PdLayout *find(const std::string &model, const Size &sensorSize);
++	/* A sensor model with a PD layout in any mode */
++	static bool known(const std::string &model);
++
++	/* Samples of a PD frame line, lines per block */
++	unsigned int samplesPerLine() const;
++	unsigned int linesPerBlock() const { return rowY.size(); }
++	unsigned int pairsPerLine() const { return pairX.empty() ? 0 : pairX[0].size(); }
++};
++
++/* What the PD statistics of a frame are computed over */
++struct MtkIsp50PdConfig {
++	/* Region in 1/65536 of the sensor output frame, cut in a grid */
++	std::array<uint16_t, 4> region;
++	unsigned int gridWidth;
++	unsigned int gridHeight;
++	/* Search range of the match in profile samples on either side */
++	unsigned int maxShift;
++	/* Black level in raw sample units of the PD frame */
++	unsigned int blackLevel;
++};
++
++/*
++ * PD statistics of one frame. For each window the mean of the right and of
++ * the left pixels at each pattern position along x (over the lines of the
++ * window), less the black level, gives two profiles; each pattern position is
++ * normalised to its mean (lens shading, gains of the pixel kinds) and freed
++ * of its running mean along x (a slow pattern of each position that would
++ * match at no shift). The shift is where the mean absolute difference of the
++ * two profiles is smallest, with a parabola through the minimum and its
++ * neighbours for the fraction. The confidence follows the depth of that
++ * minimum below the median of the curve, relative to the minimum.
++ */
++class MtkIsp50PdStats
++{
++public:
++	MtkIsp50PdStats(const MtkIsp50PdLayout &layout);
++
++	/*
++	 * Compute the statistics of the PD frame in @data (lines of @stride
++	 * bytes) into the PD part of @out and set StatsValidPd. Returns false
++	 * (and leaves StatsValidPd clear) if the frame is too short.
++	 */
++	bool compute(const uint8_t *data, size_t length, unsigned int stride,
++		     const MtkIsp50PdConfig &config, mtkisp50::StatsBuffer *out);
++
++	/* Unpack one line of the PD frame (MediaTek packing) */
++	static void unpackLine(const uint8_t *line, unsigned int samples, uint16_t *out);
++
++	/* The windows of a configuration in pixels of the sensor mode */
++	std::vector<Rectangle> windows(const MtkIsp50PdConfig &config) const;
++
++private:
++	struct Profile {
++		std::vector<double> left;
++		std::vector<double> right;
++		unsigned int saturated = 0;
++		unsigned int samples = 0;
++		double sum = 0.0;
++	};
++
++	struct Match {
++		std::vector<double> sad;
++		double contrast = 0.0;
++		bool valid = false;
++	};
++
++	void profile(const std::vector<uint16_t> &lines, unsigned int bx0, unsigned int bx1,
++		     unsigned int by0, unsigned int by1, unsigned int blackLevel,
++		     Profile *p) const;
++	void normalise(std::vector<double> *profile, unsigned int k) const;
++	static Match match(const Profile &p, unsigned int maxShift);
++	void result(const std::vector<double> &sad, double contrast, double saturation,
++		    double level, mtkisp50::StatsPdWindow *w) const;
++
++	const MtkIsp50PdLayout &layout_;
++	/* Profile samples per block and their distance in pixels */
++	unsigned int positions_;
++	double pitch_;
++	/* Profile position of each pair of each line of a block */
++	std::vector<std::vector<unsigned int>> position_;
++	unsigned int saturation_;
++	/* The unpacked frame, kept between frames */
++	std::vector<uint16_t> lines_;
++};
++
++/*
++ * Pairing of PD frames with raw frames of the same sensor frame. Both capture
++ * devices count their own frames and start at different times: the pairing
++ * goes by timestamp, a PD frame belongs to the raw frame whose timestamp is
++ * within the tolerance. PD frames wait for their raw frame; older ones,
++ * and the oldest when more than maxWaiting wait, go back to the capture
++ * device.
++ */
++class MtkIsp50PdMatcher
++{
++public:
++	struct Frame {
++		FrameBuffer *buffer;
++		uint64_t timestamp;
++		uint32_t sequence;
++	};
++
++	void reset() { waiting_.clear(); }
++	void setTolerance(uint64_t ns) { tolerance_ = ns; }
++	void setMaxWaiting(unsigned int count) { maxWaiting_ = count; }
++
++	/* A PD frame arrived; frames to give back go to @release */
++	void push(const Frame &frame, std::vector<FrameBuffer *> *release);
++
++	/*
++	 * The PD frame of a raw frame, nullptr if none waits. PD frames older
++	 * than the raw frame go to @release.
++	 */
++	FrameBuffer *take(uint64_t rawTimestamp, std::vector<FrameBuffer *> *release,
++			  Frame *taken = nullptr);
++
++	/* A PD frame of this raw frame may still come */
++	bool mayCome(uint64_t rawTimestamp) const;
++
++	/* Give back everything */
++	void drain(std::vector<FrameBuffer *> *release);
++
++	size_t waiting() const { return waiting_.size(); }
++
++private:
++	std::deque<Frame> waiting_;
++	uint64_t tolerance_ = 10000000;
++	unsigned int maxWaiting_ = 2;
++	/* Newest PD timestamp seen */
++	uint64_t newest_ = 0;
++};
 +
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/raw_stats_af.h b/src/libcamera/pipeline/mtkisp50/raw_stats_af.h
@@ -11275,6 +13253,471 @@ index 0000000..5554fee
 +};
 +
 +TEST_REGISTER(MtkIsp50AfTest)
+diff --git a/test/mtkisp50/af_pd.cpp b/test/mtkisp50/af_pd.cpp
+new file mode 100644
+index 0000000..92d2b68
+--- /dev/null
++++ b/test/mtkisp50/af_pd.cpp
+@@ -0,0 +1,459 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * mtkisp50 IPA: autofocus with phase detection
++ *
++ * A simulated sensor and lens: a contrast curve that peaks at the sharp lens
++ * position, and PD statistics whose shift is proportional to the distance of
++ * the lens from it (with a slope other than the tuned one, noise and an
++ * optional offset between the PD zero and the contrast peak).
++ */
++
++#include <cmath>
++#include <cstring>
++#include <iostream>
++#include <map>
++#include <memory>
++#include <string>
++#include <unistd.h>
++
++#include <linux/v4l2-controls.h>
++
++#include <libcamera/base/file.h>
++#include <libcamera/base/memfd.h>
++
++#include <libcamera/control_ids.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "mtkisp50/algorithms/af.h"
++#include "mtkisp50/ipa_context.h"
++
++#include "test.h"
++
++using namespace libcamera;
++using namespace libcamera::ipa::mtkisp50;
++
++namespace {
++
++const char *kTuning = R"(%YAML 1.1
++---
++Af:
++  map: [ 0.1, 468, 10.0, 775 ]
++  default: 0.4
++  range: [ -0.8, 10.5 ]
++  step: 1.25
++  mode: continuous
++  search: climb
++  climbStep: 1.6
++  region: 0.25
++  settleFrames: 2
++  sceneChangeFrames: 20
++  monitorInterval: 2
++  pd:
++    slope: 21.0
++    minConfidence: 50
++    grid: [ 3, 3 ]
++    deadband: 12
++    agreement: 16
++    confirmFrames: 3
++    startFrames: 2
++    waitFrames: 6
++    fineRange: 24
++    fineStep: 8
++)";
++
++/* Lens units per pixel of shift of the simulated module */
++constexpr double kTrueSlope = 25.0;
++
++class Sim
++{
++public:
++	Sim()
++		: ctx_(16)
++	{
++		ControlInfoMap::Map map;
++		map.emplace(&focusId_, ControlInfo(0, 1023, 0));
++		ctx_.lensControls = ControlInfoMap(std::move(map), idMap_);
++		ctx_.sensorInfo.outputSize = Size(4624, 3472);
++	}
++
++	int init()
++	{
++		UniqueFD fd = MemFd::create("mtkisp50-af-pd-tuning", 0);
++		if (!fd.isValid() || write(fd.get(), kTuning, strlen(kTuning)) < 0)
++			return -EIO;
++
++		File file("/proc/self/fd/" + std::to_string(fd.get()));
++		if (!file.open(File::OpenModeFlag::ReadOnly))
++			return -EIO;
++
++		tuning_ = YamlParser::parse(file);
++		if (!tuning_)
++			return -EINVAL;
++
++		return af_.init(ctx_, (*tuning_)["Af"]);
++	}
++
++	void configure(bool available = true)
++	{
++		ctx_.activeState = {};
++		ctx_.activeState.blc.level = 16;
++		IPAConfigInfo config{};
++		config.pdAvailable = available;
++		af_.configure(ctx_, config);
++		frame_ = 0;
++	}
++
++	/* Pseudo random noise in [-1, 1] */
++	double noise()
++	{
++		seed_ = seed_ * 1103515245u + 12345u;
++		return ((seed_ >> 8) & 0xffff) / 32767.5 - 1.0;
++	}
++
++	ControlList frame(const ControlList *request = nullptr)
++	{
++		const uint32_t n = frame_++;
++		IPAFrameContext fc;
++		if (request)
++			af_.queueRequest(ctx_, n, fc, *request);
++
++		auto it = pending_.find(n);
++		if (it != pending_.end()) {
++			effective_ = it->second;
++			pending_.erase(it);
++		}
++
++		DipFrameParams params;
++		af_.prepare(ctx_, n, fc, &params);
++		pdRequested = params.pd;
++
++		stats_.valid = true;
++		stats_.afGridValid = true;
++		stats_.afGridWidth = 16;
++		stats_.afGridHeight = 12;
++		stats_.afCellSize = 16;
++		stats_.afCellSamples = 64;
++		const double d = (effective_ - sharpAt) / 40.0;
++		const double amplitude = dark ? 0.0 : 20.0 + 1000.0 * std::exp(-d * d) *
++							  (1.0 + contrastNoise * noise());
++		const uint32_t base = dark ? 16 : 2000;
++		for (unsigned int y = 0; y < 12; y++)
++			for (unsigned int x = 0; x < 16; x++)
++				stats_.afGrid[y * 16 + x] =
++					static_cast<uint32_t>(64 * (base + ((x + y) & 1 ? amplitude : -amplitude)));
++
++		stats_.pdValid = pd && params.pd;
++		stats_.pdGridWidth = 3;
++		stats_.pdGridHeight = 3;
++		const double shift = (sharpAt + pdBias - effective_) / kTrueSlope + pdNoise * noise();
++		Statistics::PdWindow w{};
++		w.shift = shift;
++		w.confidence = textured && !dark ? 80.0 : 10.0;
++		w.level = dark ? 2.0 : 100.0;
++		for (unsigned int i = 0; i < 9; i++) {
++			stats_.pdWindows[i] = w;
++			if (mixed) {
++				/*
++				 * Two subjects: the far one left (3), a near
++				 * one right (5), each more reliable in turn,
++				 * nothing reliable elsewhere
++				 */
++				stats_.pdWindows[i].confidence = 10.0;
++				if (i == 3)
++					stats_.pdWindows[i].confidence = n % 2 ? 90.0 : 70.0;
++				if (i == 5) {
++					stats_.pdWindows[i].confidence = n % 2 ? 70.0 : 90.0;
++					stats_.pdWindows[i].shift += 150.0 / kTrueSlope;
++				}
++			}
++		}
++		stats_.pdRegion = w;
++		if (mixed)
++			stats_.pdRegion.confidence = 20.0;
++
++		ControlList metadata(controls::controls);
++		ctx_.activeState.agc.converging = false;
++		af_.process(ctx_, n, fc, &stats_, metadata);
++
++		if (ctx_.activeState.af.update) {
++			if (ctx_.activeState.af.lensPosition != lens)
++				path += std::abs(ctx_.activeState.af.lensPosition - lens);
++			lens = ctx_.activeState.af.lensPosition;
++			pending_[n + 2] = lens;
++			ctx_.activeState.af.update = false;
++			moves++;
++		}
++
++		const auto state = metadata.get(controls::AfState);
++		if (state && *state == controls::AfStateScanning && lastState != controls::AfStateScanning)
++			scans++;
++		lastState = state ? *state : -1;
++
++		return metadata;
++	}
++
++	/* Frames until Focused or Failed, -1 if none within the limit */
++	int untilDone(unsigned int limit, unsigned int *frames = nullptr)
++	{
++		for (unsigned int i = 0; i < limit; i++) {
++			ControlList md = frame();
++			auto state = md.get(controls::AfState);
++			if (state && (*state == controls::AfStateFocused ||
++				      *state == controls::AfStateFailed)) {
++				if (frames)
++					*frames = i + 1;
++				return *state;
++			}
++		}
++		return -1;
++	}
++
++	/* The scene and the PD */
++	int32_t sharpAt = 620;
++	double pdBias = 0.0;
++	double pdNoise = 0.05;
++	double contrastNoise = 0.0;
++	bool textured = true;
++	bool pd = true;
++	bool dark = false;
++	bool mixed = false;
++
++	int32_t lens = 0;
++	unsigned int moves = 0;
++	unsigned int scans = 0;
++	int path = 0;
++	int lastState = -1;
++	bool pdRequested = false;
++
++private:
++	ControlId focusId_{ V4L2_CID_FOCUS_ABSOLUTE, "Focus, Absolute", "v4l2",
++			    ControlTypeInteger32, ControlId::Direction::In };
++	ControlIdMap idMap_{ { V4L2_CID_FOCUS_ABSOLUTE, &focusId_ } };
++	IPAContext ctx_;
++	std::unique_ptr<ValueNode> tuning_;
++	algorithms::Af af_;
++	Statistics stats_{};
++	std::map<uint32_t, int32_t> pending_;
++	int32_t effective_ = 0;
++	uint32_t frame_ = 0;
++	uint32_t seed_ = 1;
++};
++
++ControlList window(int x, int y)
++{
++	ControlList c(controls::controls);
++	c.set(controls::AfMetering, controls::AfMeteringWindows);
++	c.set(controls::AfWindows, Span<const Rectangle, 1>({ Rectangle(x, y, 400, 300) }));
++	return c;
++}
++
++} /* namespace */
++
++class MtkIsp50AfPdTest : public Test
++{
++protected:
++	int fail(const std::string &what)
++	{
++		std::cerr << what << std::endl;
++		return TestFail;
++	}
++
++	int run() override
++	{
++		unsigned int frames;
++
++		/* Start: PD moves the lens close, a short fine search ends it */
++		{
++			Sim sim;
++			if (sim.init())
++				return fail("init");
++			sim.configure();
++			/* The path from the default position on */
++			sim.frame();
++			sim.path = 0;
++			if (sim.untilDone(60, &frames) != controls::AfStateFocused ||
++			    std::abs(sim.lens - sim.sharpAt) > 8)
++				return fail("start: lens " + std::to_string(sim.lens));
++			if (frames > 20 || sim.path > (sim.sharpAt - 477) + 100)
++				return fail("start: " + std::to_string(frames) + " frames, path " +
++					    std::to_string(sim.path));
++			if (!sim.pdRequested)
++				return fail("PD statistics not requested");
++
++			/* A quiet scene: no search, the lens stays */
++			const int32_t focused = sim.lens;
++			sim.scans = 0;
++			sim.moves = 0;
++			sim.pdNoise = 0.6;
++			sim.contrastNoise = 0.3;
++			for (unsigned int i = 0; i < 600; i++)
++				sim.frame();
++			if (sim.scans || sim.lens != focused)
++				return fail("quiet scene: " + std::to_string(sim.scans) + " searches, lens " +
++					    std::to_string(sim.lens));
++
++			/* The subject moves: PD refocuses without a full scan */
++			sim.pdNoise = 0.05;
++			sim.contrastNoise = 0.0;
++			sim.sharpAt = 500;
++			sim.path = 0;
++			bool ok = false;
++			for (unsigned int i = 0; i < 40 && !ok; i++) {
++				ControlList md = sim.frame();
++				ok = md.get(controls::AfState) == controls::AfStateFocused &&
++				     std::abs(sim.lens - sim.sharpAt) <= 8;
++			}
++			if (!ok || sim.path > 250)
++				return fail("refocus: lens " + std::to_string(sim.lens) + " path " +
++					    std::to_string(sim.path));
++
++			/* A tap: the PD of the new window decides */
++			sim.sharpAt = 700;
++			sim.path = 0;
++			ControlList tap = window(4000, 3000);
++			sim.frame(&tap);
++			if (sim.untilDone(40, &frames) != controls::AfStateFocused ||
++			    std::abs(sim.lens - sim.sharpAt) > 8 || sim.path > 400)
++				return fail("tap: lens " + std::to_string(sim.lens) + " path " +
++					    std::to_string(sim.path) + " frames " + std::to_string(frames));
++		}
++
++		/* PD zero off the contrast peak: no back and forth afterwards */
++		{
++			Sim sim;
++			if (sim.init())
++				return fail("init");
++			sim.pdBias = 20;
++			sim.configure();
++			if (sim.untilDone(60) != controls::AfStateFocused)
++				return fail("bias: not focused");
++			const int32_t focused = sim.lens;
++			sim.scans = 0;
++			for (unsigned int i = 0; i < 300; i++)
++				sim.frame();
++			if (sim.scans || sim.lens != focused)
++				return fail("bias: " + std::to_string(sim.scans) + " searches after focus");
++		}
++
++		/* PD zero far off the contrast peak: one move to PD, then calm */
++		{
++			Sim sim;
++			if (sim.init())
++				return fail("init");
++			sim.pdBias = 50;
++			sim.configure();
++			if (sim.untilDone(60) != controls::AfStateFocused)
++				return fail("large bias: not focused");
++			for (unsigned int i = 0; i < 60; i++)
++				sim.frame();
++			const int32_t settled = sim.lens;
++			sim.scans = 0;
++			for (unsigned int i = 0; i < 300; i++)
++				sim.frame();
++			if (sim.scans || sim.lens != settled)
++				return fail("large bias: " + std::to_string(sim.scans) + " searches, lens " +
++					    std::to_string(settled) + " -> " + std::to_string(sim.lens));
++		}
++
++		/* Windows at two distances, each more reliable in turn: no hopping */
++		{
++			Sim sim;
++			if (sim.init())
++				return fail("init");
++			sim.mixed = true;
++			sim.configure();
++			sim.frame();
++			sim.path = 0;
++			/* Either subject, but one move towards it */
++			if (sim.untilDone(60, &frames) != controls::AfStateFocused || frames > 25 ||
++			    sim.path > 380 ||
++			    (std::abs(sim.lens - 620) > 30 && std::abs(sim.lens - 770) > 30))
++				return fail("mixed: frames " + std::to_string(frames) + " path " +
++					    std::to_string(sim.path) + " lens " + std::to_string(sim.lens));
++			const int32_t focused = sim.lens;
++			sim.scans = 0;
++			for (unsigned int i = 0; i < 300; i++)
++				sim.frame();
++			if (sim.scans || sim.lens != focused)
++				return fail("mixed: " + std::to_string(sim.scans) + " searches after focus");
++		}
++
++		/* PD not reliable: the contrast search finds the peak */
++		{
++			Sim sim;
++			if (sim.init())
++				return fail("init");
++			sim.textured = false;
++			sim.configure();
++			if (sim.untilDone(200) != controls::AfStateFocused ||
++			    std::abs(sim.lens - sim.sharpAt) > 20)
++				return fail("contrast fallback: lens " + std::to_string(sim.lens));
++		}
++
++		/* PD expected but no PD statistics come */
++		{
++			Sim sim;
++			if (sim.init())
++				return fail("init");
++			sim.pd = false;
++			sim.configure(true);
++			if (sim.untilDone(200) != controls::AfStateFocused ||
++			    std::abs(sim.lens - sim.sharpAt) > 20)
++				return fail("no PD frames: lens " + std::to_string(sim.lens));
++		}
++
++		/* Too dark: waits without searching and without hanging busy */
++		{
++			Sim sim;
++			if (sim.init())
++				return fail("init");
++			sim.dark = true;
++			sim.configure();
++			for (unsigned int i = 0; i < 60; i++)
++				sim.frame();
++			if (sim.scans)
++				return fail("dark: searched");
++			sim.dark = false;
++			if (sim.untilDone(120) != controls::AfStateFocused ||
++			    std::abs(sim.lens - sim.sharpAt) > 20)
++				return fail("after dark: lens " + std::to_string(sim.lens));
++		}
++
++		/* Auto mode: a trigger waits for PD, then moves */
++		{
++			Sim sim;
++			if (sim.init())
++				return fail("init");
++			sim.configure();
++			ControlList c(controls::controls);
++			c.set(controls::AfMode, controls::AfModeAuto);
++			sim.frame(&c);
++			sim.path = 0;
++			c.set(controls::AfTrigger, controls::AfTriggerStart);
++			sim.frame(&c);
++			if (sim.untilDone(60, &frames) != controls::AfStateFocused ||
++			    std::abs(sim.lens - sim.sharpAt) > 8 || frames > 25)
++				return fail("auto trigger: lens " + std::to_string(sim.lens) + " frames " +
++					    std::to_string(frames));
++		}
++
++		/* Without PD in the sensor mode: contrast as before */
++		{
++			Sim sim;
++			if (sim.init())
++				return fail("init");
++			sim.configure(false);
++			sim.frame();
++			if (sim.pdRequested)
++				return fail("PD requested without PD in the mode");
++			if (sim.untilDone(200) != controls::AfStateFocused ||
++			    std::abs(sim.lens - sim.sharpAt) > 20)
++				return fail("no PD mode: lens " + std::to_string(sim.lens));
++		}
++
++		return TestPass;
++	}
++};
++
++TEST_REGISTER(MtkIsp50AfPdTest)
 diff --git a/test/mtkisp50/agc.cpp b/test/mtkisp50/agc.cpp
 new file mode 100644
 index 0000000..b8eac90
@@ -12110,10 +14553,10 @@ index 0000000..42b7cdc
 +TEST_REGISTER(MtkIsp50FramesTest)
 diff --git a/test/mtkisp50/meson.build b/test/mtkisp50/meson.build
 new file mode 100644
-index 0000000..f23719f
+index 0000000..6634a84
 --- /dev/null
 +++ b/test/mtkisp50/meson.build
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,78 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +if 'mtkisp50' not in pipelines
@@ -12151,6 +14594,21 @@ index 0000000..f23719f
 +    'ipa': true,
 +}
 +
++# The autofocus with phase detection
++mtkisp50_tests += {
++    'name': 'mtkisp50-af-pd',
++    'sources': [
++        'af_pd.cpp',
++        '../../src/ipa/mtkisp50/algorithms/af.cpp',
++        '../../src/ipa/mtkisp50/algorithms/af_search.cpp',
++        '../../src/ipa/mtkisp50/ipa_context.cpp',
++    ],
++    'ipa': true,
++}
++
++# The PD statistics and the pairing of PD and raw frames
++mtkisp50_tests += {'name': 'mtkisp50-pd', 'sources': ['pd.cpp']}
++
 +# The frame length of the exposure regulation, with the autofocus
 +mtkisp50_tests += {
 +    'name': 'mtkisp50-agc',
@@ -12177,6 +14635,305 @@ index 0000000..f23719f
 +
 +    test(test['name'], exe, suite : 'mtkisp50')
 +endforeach
+diff --git a/test/mtkisp50/pd.cpp b/test/mtkisp50/pd.cpp
+new file mode 100644
+index 0000000..8100615
+--- /dev/null
++++ b/test/mtkisp50/pd.cpp
+@@ -0,0 +1,293 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * mtkisp50 pipeline: phase detection statistics and the pairing of PD frames
++ * with raw frames
++ *
++ * Synthetic PD frames of the OV64B40 layout: the left pixels see a textured
++ * scene shifted by +s/2, the right ones by -s/2, with different gains, black
++ * level, noise and a slow pattern of each pattern position that both pixel
++ * kinds share. Optionally real PD frames with reference results (a CSV with
++ * the columns file;x;y;w;h;shift;confidence, the frames next to it) from the
++ * environment variable MTKISP50_PD_REFERENCE.
++ */
++
++#include <cmath>
++#include <fstream>
++#include <iostream>
++#include <random>
++#include <sstream>
++#include <string>
++#include <vector>
++
++#include "libcamera/internal/mtkisp50/stats.h"
++
++#include "pd.h"
++#include "test.h"
++
++using namespace libcamera;
++using namespace libcamera::mtkisp50;
++
++namespace {
++
++constexpr unsigned int kStride = 1424;
++
++/* Pack lines of 10 bit samples, MediaTek packing */
++std::vector<uint8_t> pack(const std::vector<uint16_t> &samples, unsigned int width,
++			  unsigned int height)
++{
++	std::vector<uint8_t> out(static_cast<size_t>(kStride) * height, 0);
++	for (unsigned int y = 0; y < height; y++) {
++		const uint16_t *s = &samples[static_cast<size_t>(y) * width];
++		uint8_t *d = &out[static_cast<size_t>(y) * kStride];
++		for (unsigned int i = 0; i + 4 <= width; i += 4, d += 5) {
++			d[0] = s[i] & 0xff;
++			d[1] = (s[i] >> 8) | ((s[i + 1] & 0x3f) << 2);
++			d[2] = (s[i + 1] >> 6) | ((s[i + 2] & 0x0f) << 4);
++			d[3] = (s[i + 2] >> 4) | ((s[i + 3] & 0x03) << 6);
++			d[4] = s[i + 3] >> 2;
++		}
++	}
++	return out;
++}
++
++/*
++ * A PD frame of a scene seen with shift s (pixels). texture false: a flat
++ * scene with noise and the shared slow pattern only.
++ */
++std::vector<uint8_t> synth(const MtkIsp50PdLayout &l, double s, bool texture, unsigned int seed)
++{
++	std::mt19937 rng(seed);
++	std::normal_distribution<double> noise(0.0, 1.5);
++	const unsigned int width = l.size.width, height = l.size.height;
++	std::vector<uint16_t> samples(static_cast<size_t>(width) * height);
++
++	auto scene = [&](double x) {
++		if (!texture)
++			return 300.0;
++		const double v = std::sin(x / 7.0) + std::sin(x / 23.0 + 1.0);
++		return 300.0 + 200.0 * std::tanh(3.0 * v) + 50.0 * std::sin(x / 3.1);
++	};
++
++	const unsigned int pairs = l.pairsPerLine();
++	for (unsigned int line = 0; line < height; line++) {
++		const unsigned int k = line % l.linesPerBlock();
++		for (unsigned int bx = 0; bx < l.blocks.width; bx++) {
++			for (unsigned int q = 0; q < pairs; q++) {
++				const double x = l.pairX[k][q] + bx * static_cast<double>(l.block);
++				/* Slow pattern of the position, both pixel kinds */
++				const double pattern = 30.0 * std::sin(bx / 40.0 + q + 2 * k);
++				const double right = 0.45 * scene(x - s / 2) + pattern + 64 + noise(rng);
++				const double left = 0.55 * scene(x + l.leftOffset + s / 2) + pattern + 64 + noise(rng);
++				const size_t i = static_cast<size_t>(line) * width + bx * pairs * 2 + 2 * q;
++				samples[i] = std::clamp(std::lround(right), 0l, 1023l);
++				samples[i + 1] = std::clamp(std::lround(left), 0l, 1023l);
++			}
++		}
++	}
++
++	return pack(samples, width, height);
++}
++
++/* A region in 1/65536 of the frame that maps back to these pixels */
++std::array<uint16_t, 4> region(const MtkIsp50PdLayout &l, int x, int y, int w, int h)
++{
++	auto frac = [](int64_t v, unsigned int size) {
++		return static_cast<uint16_t>(std::min<int64_t>((v * 65536 + size - 1) / size, 65535));
++	};
++	return { frac(x, l.sensorSize.width), frac(y, l.sensorSize.height),
++		 frac(w, l.sensorSize.width), frac(h, l.sensorSize.height) };
++}
++
++} /* namespace */
++
++class MtkIsp50PdTest : public Test
++{
++protected:
++	int fail(const std::string &what)
++	{
++		std::cerr << what << std::endl;
++		return TestFail;
++	}
++
++	int synthetic()
++	{
++		const MtkIsp50PdLayout *l = MtkIsp50PdLayout::find("ov64b40", Size(4624, 3472));
++		if (!l || MtkIsp50PdLayout::find("ov64b40", Size(2304, 1728)) ||
++		    l->samplesPerLine() != l->size.width)
++			return fail("layout");
++
++		MtkIsp50PdStats pd(*l);
++		auto stats = std::make_unique<StatsBuffer>();
++
++		MtkIsp50PdConfig config{};
++		config.region = region(*l, 1156, 868, 2312, 1736);
++		config.gridWidth = 3;
++		config.gridHeight = 3;
++		config.maxShift = 8;
++		config.blackLevel = 64;
++
++		for (double s : { -20.0, -10.0, -3.0, 0.0, 2.0, 6.5, 16.0 }) {
++			const std::vector<uint8_t> frame = synth(*l, s, true, 1);
++			stats->valid = 0;
++			if (!pd.compute(frame.data(), frame.size(), kStride, config, stats.get()) ||
++			    !(stats->valid & StatsValidPd))
++				return fail("compute");
++
++			const StatsPdWindow &all = stats->pdRegion;
++			std::cout << "shift " << s << ": " << all.shift << " confidence " << all.confidence
++				  << " level " << all.level << std::endl;
++			if (std::abs(all.shift - s) > 1.0 || all.confidence < 60)
++				return fail("shift " + std::to_string(s) + " measured " +
++					    std::to_string(all.shift));
++			for (unsigned int i = 0; i < 9; i++) {
++				if (std::abs(stats->pd[i].shift - s) > 1.5 || stats->pd[i].confidence < 50)
++					return fail("window " + std::to_string(i) + " at shift " +
++						    std::to_string(s) + ": " +
++						    std::to_string(stats->pd[i].shift));
++			}
++			if (std::abs(all.level - 0.5 * 300.0) > 20.0)
++				return fail("level " + std::to_string(all.level));
++		}
++
++		/* Flat scene with the shared pattern: no confidence */
++		const std::vector<uint8_t> flat = synth(*l, 0.0, false, 2);
++		pd.compute(flat.data(), flat.size(), kStride, config, stats.get());
++		std::cout << "flat: " << stats->pdRegion.shift << " confidence "
++			  << stats->pdRegion.confidence << std::endl;
++		if (stats->pdRegion.confidence >= 40)
++			return fail("flat scene with confidence " +
++				    std::to_string(stats->pdRegion.confidence));
++
++		/* Windows of the configuration */
++		const std::vector<Rectangle> wins = pd.windows(config);
++		if (wins.size() != 9 || wins[0] != Rectangle(1156, 868, 770, 578))
++			return fail("windows " + wins[0].toString());
++
++		/* A short frame is refused */
++		if (pd.compute(flat.data(), flat.size() / 2, kStride, config, stats.get()) ||
++		    (stats->valid & StatsValidPd))
++			return fail("short frame accepted");
++
++		return TestPass;
++	}
++
++	int matcher()
++	{
++		FrameBuffer *a = reinterpret_cast<FrameBuffer *>(0x10);
++		FrameBuffer *b = reinterpret_cast<FrameBuffer *>(0x20);
++		FrameBuffer *c = reinterpret_cast<FrameBuffer *>(0x30);
++		constexpr uint64_t ms = 1000000;
++
++		MtkIsp50PdMatcher m;
++		m.setTolerance(12 * ms);
++		std::vector<FrameBuffer *> release;
++
++		/* No PD frame yet: it may come */
++		if (!m.mayCome(1000 * ms) || m.take(1000 * ms, &release))
++			return fail("matcher: empty");
++
++		m.push({ a, 1000 * ms + 3 * ms, 1 }, &release);
++		if (m.take(1000 * ms, &release) != a || !release.empty())
++			return fail("matcher: pair");
++
++		/* PD older than the raw frame goes back, a later one waits */
++		m.push({ b, 1033 * ms, 2 }, &release);
++		m.push({ c, 1066 * ms, 3 }, &release);
++		if (m.take(1067 * ms, &release) != c || release.size() != 1 || release[0] != b)
++			return fail("matcher: stale");
++		release.clear();
++
++		/* The PD frame of a raw frame came already and went: none may come */
++		if (m.mayCome(1066 * ms) || !m.mayCome(1100 * ms))
++			return fail("matcher: may come");
++
++		/* At most two wait */
++		m.push({ a, 1100 * ms, 4 }, &release);
++		m.push({ b, 1133 * ms, 5 }, &release);
++		m.push({ c, 1166 * ms, 6 }, &release);
++		if (release.size() != 1 || release[0] != a || m.waiting() != 2)
++			return fail("matcher: limit");
++		release.clear();
++		m.drain(&release);
++		if (release.size() != 2 || m.waiting())
++			return fail("matcher: drain");
++
++		return TestPass;
++	}
++
++	/* Real PD frames against the results of tests/kamera/pd-versatz.py */
++	int reference()
++	{
++		const char *path = getenv("MTKISP50_PD_REFERENCE");
++		if (!path) {
++			std::cout << "no reference frames (MTKISP50_PD_REFERENCE)" << std::endl;
++			return TestPass;
++		}
++
++		std::ifstream csv(path);
++		if (!csv)
++			return fail("reference not readable");
++		std::string dir(path);
++		dir = dir.substr(0, dir.rfind('/') + 1);
++
++		const MtkIsp50PdLayout *l = MtkIsp50PdLayout::find("ov64b40", Size(4624, 3472));
++		MtkIsp50PdStats pd(*l);
++		auto stats = std::make_unique<StatsBuffer>();
++
++		std::string line, lastFile;
++		std::vector<uint8_t> frame;
++		unsigned int count = 0, bad = 0;
++		std::getline(csv, line);
++		while (std::getline(csv, line)) {
++			std::istringstream in(line);
++			std::string file, v;
++			std::vector<double> f;
++			std::getline(in, file, ';');
++			while (std::getline(in, v, ';'))
++				f.push_back(std::stod(v));
++			if (f.size() < 7)
++				continue;
++
++			if (file != lastFile) {
++				std::ifstream raw(dir + file, std::ios::binary);
++				frame.assign(std::istreambuf_iterator<char>(raw), {});
++				lastFile = file;
++			}
++			const unsigned int stride = frame.size() / l->size.height;
++
++			MtkIsp50PdConfig config{};
++			config.region = region(*l, f[0], f[1], f[2], f[3]);
++			config.gridWidth = 1;
++			config.gridHeight = 1;
++			config.maxShift = f[6];
++			config.blackLevel = 64;
++			if (!pd.compute(frame.data(), frame.size(), stride, config, stats.get()))
++				return fail("reference: compute " + file);
++
++			const StatsPdWindow &w = stats->pd[0];
++			count++;
++			if (std::abs(w.shift - f[4]) > 0.05 || std::abs(w.confidence - f[5]) > 1.0) {
++				bad++;
++				std::cerr << file << " " << f[0] << "," << f[1] << ": shift " << w.shift
++					  << " / " << f[4] << ", confidence " << w.confidence << " / "
++					  << f[5] << std::endl;
++			}
++		}
++
++		std::cout << "reference: " << count << " windows, " << bad << " differ" << std::endl;
++		return count && !bad ? TestPass : TestFail;
++	}
++
++	int run() override
++	{
++		int ret = synthetic();
++		if (ret != TestPass)
++			return ret;
++		ret = matcher();
++		if (ret != TestPass)
++			return ret;
++		return reference();
++	}
++};
++
++TEST_REGISTER(MtkIsp50PdTest)
 diff --git a/test/mtkisp50/raw_stats.cpp b/test/mtkisp50/raw_stats.cpp
 new file mode 100644
 index 0000000..bb16fec
