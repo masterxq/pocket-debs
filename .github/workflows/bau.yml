@@ -7,6 +7,8 @@
 # and the complete APT repository (apt-repo), so a run always carries all packages.
 # Cache entries not used for 7 days are evicted; the weekly scheduled run uses them all. Missing entries are
 # simply rebuilt.
+# A package that is built gets its compiler cache (ccache) from the newest entry ccache-<source>-*, and the run
+# saves the updated cache under a new key, also after a failed build. "neu" builds without both caches.
 name: bau
 
 on:
@@ -85,11 +87,25 @@ jobs:
         with:
           path: ${{ runner.temp }}/ergebnis/${{ matrix.quelle }}
           key: paket-${{ matrix.quelle }}-${{ matrix.schluessel }}
+      - name: ccache restore
+        if: ${{ steps.cache.outputs.cache-hit != 'true' && !inputs.neu }}
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/out/ccache/${{ matrix.quelle }}
+          key: ccache-${{ matrix.quelle }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-${{ matrix.quelle }}-
       - name: build
         if: steps.cache.outputs.cache-hit != 'true'
         env:
           PAKETE_TIMEOUT: '20400'
+          PAKETE_CCACHE_MAX: 1500M
         run: ./bau.sh bau "$Q" --neu
+      - name: ccache save
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/out/ccache/${{ matrix.quelle }}
+          key: ccache-${{ matrix.quelle }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: check
         run: |
           set -eu
@@ -97,8 +113,8 @@ jobs:
           grep -qx "schluessel=$K" "$E/STAND" || { echo "::error::$Q: key in STAND differs from $K"; exit 1; }
           (cd "$E" && sha256sum -c --quiet SHA256SUMS)
           how=built; [ "${{ steps.cache.outputs.cache-hit }}" != true ] || how="from cache"
-          { echo '| source | version | result | build time |'; echo '|---|---|---|---|'
-            echo "| $Q | $(sed -n 's/^fassung=//p' "$E/STAND") | $how | $(sed -n 's/^bauzeit_min=//p' "$E/BUILDINFO") min |"; } >> "$GITHUB_STEP_SUMMARY"
+          { echo '| source | version | result | build time | ccache hits |'; echo '|---|---|---|---|---|'
+            echo "| $Q | $(sed -n 's/^fassung=//p' "$E/STAND") | $how | $(sed -n 's/^bauzeit_min=//p' "$E/BUILDINFO") min | $(sed -n 's/^ccache_treffer=//p' "$E/BUILDINFO") |"; } >> "$GITHUB_STEP_SUMMARY"
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
