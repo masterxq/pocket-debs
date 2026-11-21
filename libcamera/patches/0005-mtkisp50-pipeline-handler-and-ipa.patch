@@ -1,5 +1,5 @@
 From: pocket-debs
-Date: Sat, 21 Nov 2026 05:00:00 +0100
+Date: Sat, 21 Nov 2026 07:00:00 +0100
 Subject: [PATCH] mtkisp50: pipeline handler and IPA for the MediaTek MT6785 ISP
 Description:
  A pipeline handler of its own for the MediaTek MT6785 camera subsystem
@@ -22,11 +22,19 @@ Description:
    camera. Uncalibrated tuning without image quality blocks.
  - Pipeline handler: capture by sensor, seninf and CAMSV into an internal
    raw pool or the raw stream, DIP job by DMABUF (raw, parameters, NV12
-   output), CPU statistics (copy of the software ISP statistics writing
-   the statistics buffer) in a thread of their own. One processed stream
-   (crop of the sensor mode) and one raw stream (MediaTek packed 10-bit)
+   main output, YUYV scaled output), CPU statistics (copy of the software
+   ISP statistics writing the statistics buffer) in a thread of their own.
+   Up to two processed streams and one raw stream (MediaTek packed 10-bit)
    per camera; raw only for sensors the DIP does not take; one camera at
    a time.
+ - Streams: NV12 on the main output (a crop of the sensor mode, as
+   before), YUYV on the scaled output (1/2 to 1/16 of the processed area,
+   for instance 1920x1080 video from 16:9 of the whole large mode). With
+   viewfinder and still capture in one configuration the still is a buffer
+   in a request, without a new configuration of the camera. A job with
+   other outputs than the streaming ones waits until the ISP is idle, then
+   the outputs are switched. Interim for the ISPDIP10 driver: the main
+   node gets the size of the processed area also when it does not stream.
  - Controls: AeEnable, ExposureTimeMode/AnalogueGainMode with
    ExposureTime/AnalogueGain, ExposureValue, AeMeteringMode,
    FrameDurationLimits, AwbEnable, AwbMode, ColourGains, ColourTemperature,
@@ -38,8 +46,10 @@ Description:
  - Requests wait for a raw buffer of the pool; smaller pool next to a raw
    stream and for the full sensor mode, so that the capture device keeps a
    spare frame in the camera memory region.
- - Tests: bookkeeping and order of the ISP queues; CPU statistics against
-   the software ISP statistics frame by frame.
+ - Tests: bookkeeping and order of the ISP queues, scheduling of jobs with
+   different outputs, stream planning (validate cases), autofocus over a
+   new configuration; CPU statistics against the software ISP statistics
+   frame by frame.
  .
  Applies on top of 0001, 0003 and 0004.
 Forwarded: no
@@ -6603,16 +6613,18 @@ index 0000000..3656404
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/frames.cpp b/src/libcamera/pipeline/mtkisp50/frames.cpp
 new file mode 100644
-index 0000000..92b68b9
+index 0000000..6efd5f2
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/frames.cpp
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,341 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Per request bookkeeping of the mtkisp50 pipeline
 + */
 +
 +#include "frames.h"
++
++#include <algorithm>
 +
 +#include <libcamera/base/log.h>
 +
@@ -6643,11 +6655,16 @@ index 0000000..92b68b9
 +	availableParamsBuffers_ = {};
 +	availableStatsBuffers_ = {};
 +	frameInfo_.clear();
++
++	ispOutputs_ = ~0u;
++	ispBusy_ = 0;
++	ispWaiting_.clear();
++	ispHeld_ = false;
 +}
 +
 +MtkIsp50Frames::Info *MtkIsp50Frames::create(unsigned int id, Request *request,
 +					     FrameBuffer *rawBuffer, bool rawFromRequest,
-+					     FrameBuffer *outputBuffer)
++					     FrameBuffer *outputBuffer, FrameBuffer *scaledBuffer)
 +{
 +	if (availableParamsBuffers_.empty()) {
 +		LOG(MtkIsp50, Error) << "Parameters buffer underrun";
@@ -6670,13 +6687,19 @@ index 0000000..92b68b9
 +	info->rawBuffer = rawBuffer;
 +	info->rawFromRequest = rawFromRequest;
 +	info->outputBuffer = outputBuffer;
++	info->scaledBuffer = scaledBuffer;
 +	info->paramsBuffer = availableParamsBuffers_.front();
 +	info->statsBuffer = availableStatsBuffers_.front();
 +	info->rawSequence = 0;
++	info->paramsBytesused = 0;
 +	info->captured = false;
 +	info->ispQueued = false;
++	info->outputQueued = false;
++	info->scaledQueued = false;
++	info->ispBack = false;
 +	info->rawDone = false;
 +	info->outputDone = !outputBuffer;
++	info->scaledDone = !scaledBuffer;
 +	info->paramsDone = false;
 +	info->metadataDone = false;
 +	info->error = false;
@@ -6696,6 +6719,10 @@ index 0000000..92b68b9
 +	availableParamsBuffers_.push(info->paramsBuffer);
 +	availableStatsBuffers_.push(info->statsBuffer);
 +
++	auto it = std::find(ispWaiting_.begin(), ispWaiting_.end(), info);
++	if (it != ispWaiting_.end())
++		ispWaiting_.erase(it);
++
 +	frameInfo_.erase(info->id);
 +}
 +
@@ -6703,7 +6730,7 @@ index 0000000..92b68b9
 +				MtkIsp50IspQueue &queue)
 +{
 +	/* Raw only: no job, the raw frame is done once captured */
-+	if (!info->outputBuffer) {
++	if (!outputsOf(info)) {
 +		info->rawDone = true;
 +		info->paramsDone = true;
 +		return 0;
@@ -6715,6 +6742,7 @@ index 0000000..92b68b9
 +		info->rawDone = true;
 +		info->paramsDone = true;
 +		info->outputDone = true;
++		info->scaledDone = true;
 +		info->error = true;
 +		return ret;
 +	}
@@ -6736,13 +6764,27 @@ index 0000000..92b68b9
 +		info->paramsDone = true;
 +	}
 +
-+	ret = queue.queueOutput(info->outputBuffer);
++	if (info->outputBuffer) {
++		ret = queue.queueOutput(info->outputBuffer);
++		if (!ret)
++			info->outputQueued = true;
++	}
++
++	if (!ret && info->scaledBuffer) {
++		ret = queue.queueScaled(info->scaledBuffer);
++		if (!ret)
++			info->scaledQueued = true;
++	}
++
 +	if (ret) {
 +		/*
-+		 * The raw buffer is queued alone: the caller restarts the ISP,
-+		 * which returns it
++		 * The job is queued in part: the caller restarts the ISP, which
++		 * returns the buffers in it
 +		 */
-+		info->outputDone = true;
++		if (!info->outputQueued)
++			info->outputDone = true;
++		if (!info->scaledQueued)
++			info->scaledDone = true;
 +		info->error = true;
 +		return ret;
 +	}
@@ -6750,10 +6792,91 @@ index 0000000..92b68b9
 +	return 0;
 +}
 +
++unsigned int MtkIsp50Frames::outputsOf(const Info *info)
++{
++	return (info->outputBuffer ? MtkIsp50OutputMain : 0) |
++	       (info->scaledBuffer ? MtkIsp50OutputScaled : 0);
++}
++
++void MtkIsp50Frames::startIsp(unsigned int outputs)
++{
++	ispOutputs_ = outputs;
++	ispBusy_ = 0;
++	ispWaiting_.clear();
++	ispHeld_ = false;
++}
++
++void MtkIsp50Frames::submitIspJob(Info *info, uint32_t paramsBytesused)
++{
++	info->paramsBytesused = paramsBytesused;
++
++	if (!outputsOf(info)) {
++		info->rawDone = true;
++		info->paramsDone = true;
++		return;
++	}
++
++	ispWaiting_.push_back(info);
++}
++
++int MtkIsp50Frames::runIspJobs(MtkIsp50IspQueue &queue, Info **failed)
++{
++	while (!ispHeld_ && !ispWaiting_.empty()) {
++		Info *info = ispWaiting_.front();
++		const unsigned int outputs = outputsOf(info);
++
++		if (outputs != ispOutputs_) {
++			if (ispBusy_)
++				return 0;
++
++			int ret = queue.setOutputs(outputs);
++			if (ret) {
++				/* The job cannot run, nothing of it is queued */
++				ispOutputs_ = ~0u;
++				ispWaiting_.pop_front();
++				info->rawDone = true;
++				info->paramsDone = true;
++				info->outputDone = true;
++				info->scaledDone = true;
++				info->error = true;
++				*failed = info;
++				return ret;
++			}
++
++			ispOutputs_ = outputs;
++		}
++
++		ispWaiting_.pop_front();
++
++		int ret = queueIspJob(info, info->paramsBytesused, queue);
++		if (info->ispQueued)
++			ispBusy_++;
++		if (ret) {
++			*failed = info;
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++bool MtkIsp50Frames::ispJobBack(Info *info)
++{
++	if (!info->ispQueued || info->ispBack || !info->rawDone ||
++	    !info->outputDone || !info->scaledDone)
++		return false;
++
++	info->ispBack = true;
++	if (ispBusy_)
++		ispBusy_--;
++
++	return true;
++}
++
 +bool MtkIsp50Frames::tryComplete(Info *info)
 +{
-+	if (!info->rawDone || !info->outputDone || !info->paramsDone ||
-+	    !info->metadataDone)
++	if (!info->rawDone || !info->outputDone || !info->scaledDone ||
++	    !info->paramsDone || !info->metadataDone)
 +		return false;
 +
 +	remove(info);
@@ -6812,6 +6935,17 @@ index 0000000..92b68b9
 +	return nullptr;
 +}
 +
++MtkIsp50Frames::Info *MtkIsp50Frames::findScaled(const FrameBuffer *buffer)
++{
++	for (auto const &itInfo : frameInfo_) {
++		Info *info = itInfo.second.get();
++		if (info->scaledBuffer == buffer && !info->scaledDone)
++			return info;
++	}
++
++	return nullptr;
++}
++
 +MtkIsp50Frames::Info *MtkIsp50Frames::findParams(const FrameBuffer *buffer)
 +{
 +	for (auto const &itInfo : frameInfo_) {
@@ -6826,10 +6960,10 @@ index 0000000..92b68b9
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/frames.h b/src/libcamera/pipeline/mtkisp50/frames.h
 new file mode 100644
-index 0000000..99f60ce
+index 0000000..b733be1
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/frames.h
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,159 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Per request bookkeeping of the mtkisp50 pipeline
@@ -6837,6 +6971,7 @@ index 0000000..99f60ce
 +
 +#pragma once
 +
++#include <deque>
 +#include <map>
 +#include <memory>
 +#include <queue>
@@ -6848,10 +6983,15 @@ index 0000000..99f60ce
 +class FrameBuffer;
 +class Request;
 +
++/* Processed outputs of the ISP, bits of a mask */
++constexpr unsigned int MtkIsp50OutputMain = 1 << 0;
++constexpr unsigned int MtkIsp50OutputScaled = 1 << 1;
++
 +/*
-+ * Queues of the memory-to-memory ISP. A job runs when a raw and an output
-+ * buffer are queued; a params buffer that is queued before the output buffer
-+ * belongs to the same job.
++ * Queues of the memory-to-memory ISP. A job runs when a raw buffer and a
++ * buffer of every streaming output are queued; a params buffer that is
++ * queued before them belongs to the same job. An output that starts or
++ * stops streaming joins or leaves from the next job on.
 + */
 +class MtkIsp50IspQueue
 +{
@@ -6861,6 +7001,9 @@ index 0000000..99f60ce
 +	virtual int queueRaw(FrameBuffer *buffer) = 0;
 +	virtual int queueParams(FrameBuffer *buffer, uint32_t bytesused) = 0;
 +	virtual int queueOutput(FrameBuffer *buffer) = 0;
++	virtual int queueScaled(FrameBuffer *buffer) = 0;
++	/* Stream exactly the outputs of the mask */
++	virtual int setOutputs(unsigned int outputs) = 0;
 +};
 +
 +class MtkIsp50Frames
@@ -6873,19 +7016,27 @@ index 0000000..99f60ce
 +		/* Raw frame of the capture device, from the pool or the request */
 +		FrameBuffer *rawBuffer;
 +		bool rawFromRequest;
-+		/* Processed output of the request, nullptr for raw only */
++		/* Processed outputs of the request, nullptr if not in it */
 +		FrameBuffer *outputBuffer;
++		FrameBuffer *scaledBuffer;
 +		FrameBuffer *paramsBuffer;
 +		FrameBuffer *statsBuffer;
 +
 +		uint32_t rawSequence;
++		/* Size of the parameters of the ISP job, 0 for none */
++		uint32_t paramsBytesused;
 +
 +		/* Steps done */
 +		bool captured;
 +		/* The raw buffer was queued to the ISP */
 +		bool ispQueued;
++		bool outputQueued;
++		bool scaledQueued;
++		/* All buffers of the ISP job are back */
++		bool ispBack;
 +		bool rawDone;
 +		bool outputDone;
++		bool scaledDone;
 +		bool paramsDone;
 +		bool metadataDone;
 +		bool error;
@@ -6899,17 +7050,45 @@ index 0000000..99f60ce
 +
 +	/* nullptr if no params or statistics buffer is free */
 +	Info *create(unsigned int id, Request *request, FrameBuffer *rawBuffer,
-+		     bool rawFromRequest, FrameBuffer *outputBuffer);
++		     bool rawFromRequest, FrameBuffer *outputBuffer,
++		     FrameBuffer *scaledBuffer = nullptr);
 +	void remove(Info *info);
 +
 +	/*
 +	 * Queue the ISP job of a frame: raw first (the only buffer the ISP
 +	 * may refuse, an imported DMABUF), then params if bytesused > 0, then
-+	 * the output. A frame without output has no job. Returns 0 or the
-+	 * error of the first queue that failed; buffers not queued are marked
-+	 * done.
++	 * the main and the scaled output. A frame without output has no job.
++	 * Returns 0 or the error of the first queue that failed; buffers not
++	 * queued are marked done (the caller cancels the outputs that are not
++	 * queued, and restarts the ISP if the raw buffer is in it).
 +	 */
 +	int queueIspJob(Info *info, uint32_t paramsBytesused, MtkIsp50IspQueue &queue);
++
++	/* Outputs the job of a frame writes */
++	static unsigned int outputsOf(const Info *info);
++
++	/*
++	 * Scheduling of the ISP jobs. Jobs go to the ISP in frame order. A
++	 * job whose outputs differ from the streaming ones waits until the
++	 * jobs in the ISP are back, then the outputs are switched: a job in
++	 * the ISP takes a buffer of every streaming output.
++	 */
++	void startIsp(unsigned int outputs);
++	/* A frame whose parameters are ready; frames without job are done */
++	void submitIspJob(Info *info, uint32_t paramsBytesused);
++	/*
++	 * Queue the waiting jobs that may go. Returns 0, or an error with the
++	 * frame that failed in @failed (call again for the others).
++	 */
++	int runIspJobs(MtkIsp50IspQueue &queue, Info **failed);
++	/* True if the buffers of the job of @info are all back just now */
++	bool ispJobBack(Info *info);
++	/* No jobs go while held (stop and restart of the ISP) */
++	void holdIsp(bool held) { ispHeld_ = held; }
++
++	size_t ispBusy() const { return ispBusy_; }
++	size_t ispWaiting() const { return ispWaiting_.size(); }
++	unsigned int ispOutputs() const { return ispOutputs_; }
 +
 +	/* True if everything of the frame is done; the frame is then removed */
 +	bool tryComplete(Info *info);
@@ -6922,6 +7101,7 @@ index 0000000..99f60ce
 +	/* Frame whose raw buffer is queued to the ISP */
 +	Info *findIspRaw(const FrameBuffer *buffer);
 +	Info *findOutput(const FrameBuffer *buffer);
++	Info *findScaled(const FrameBuffer *buffer);
 +	Info *findParams(const FrameBuffer *buffer);
 +
 +	size_t size() const { return frameInfo_.size(); }
@@ -6933,28 +7113,36 @@ index 0000000..99f60ce
 +	std::queue<FrameBuffer *> availableStatsBuffers_;
 +
 +	std::map<unsigned int, std::unique_ptr<Info>> frameInfo_;
++
++	/* Outputs that stream, all bits set if unknown */
++	unsigned int ispOutputs_ = ~0u;
++	/* Jobs in the ISP, and those waiting for it */
++	unsigned int ispBusy_ = 0;
++	std::deque<Info *> ispWaiting_;
++	bool ispHeld_ = false;
 +};
 +
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/meson.build b/src/libcamera/pipeline/mtkisp50/meson.build
 new file mode 100644
-index 0000000..fbf41ab
+index 0000000..9358d79
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/meson.build
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,8 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +libcamera_internal_sources += files([
 +    'frames.cpp',
 +    'mtkisp50.cpp',
 +    'raw_stats_cpu.cpp',
++    'streams.cpp',
 +])
 diff --git a/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..44ffe59
+index 0000000..0e5f297
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,1713 @@
+@@ -0,0 +1,2008 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the MediaTek MT6785 camera subsystem with the ISP pass 2
@@ -6962,7 +7150,9 @@ index 0000000..44ffe59
 + *
 + * The capture side (sensor -> seninf -> CAMSV, media device "mtk-camsys-mt6785")
 + * writes raw Bayer frames to memory. The DIP (media device "mtk-dip") turns a
-+ * raw frame and a parameter buffer into an NV12 frame. The statistics for the
++ * raw frame and a parameter buffer into an NV12 frame of a crop of it (main
++ * output) and a YUYV frame scaled down from the same crop (scaled output),
++ * each job writing the outputs whose buffers the request has. The statistics for the
 + * IPA come from the CPU (RawStatsCpu) and are handed over in the statistics
 + * buffer layout of mtkisp50/stats.h, which a hardware statistics unit can fill
 + * as well.
@@ -7033,6 +7223,7 @@ index 0000000..44ffe59
 +
 +#include "frames.h"
 +#include "raw_stats_cpu.h"
++#include "streams.h"
 +
 +namespace libcamera {
 +
@@ -7055,9 +7246,11 @@ index 0000000..44ffe59
 +
 +/* Default size of the viewfinder: the smallest sensor mode covering it */
 +constexpr Size kViewfinderMinSize{ 1280, 720 };
-+
-+/* Limits of the DIP (see the DIP interface header) */
-+constexpr Size kIspMinSize{ 128, 64 };
++/* Default size of a video stream */
++constexpr Size kVideoSize{ 1920, 1080 };
++/* Fewer buffers of a large main output next to the scaled one (memory) */
++constexpr unsigned int kLargeOutputFrame = 12 << 20;
++constexpr unsigned int kLargeOutputBufferCount = 2;
 +
 +} /* namespace */
 +
@@ -7090,9 +7283,31 @@ index 0000000..44ffe59
 +		return main_->queueBuffer(buffer);
 +	}
 +
++	int queueScaled(FrameBuffer *buffer) override
++	{
++		return scaled_->queueBuffer(buffer);
++	}
++
++	int setOutputs(unsigned int outputs) override;
++
++	bool hasScaled() const { return scaled_ != nullptr; }
++	V4L2VideoDevice *outputNode(unsigned int output) const
++	{
++		return output == MtkIsp50OutputMain ? main_.get() : scaled_.get();
++	}
++
++	/* Params, the outputs of the mask, then raw; stop in reverse */
++	int start(unsigned int outputs);
++	void stop();
++
 +	std::unique_ptr<V4L2VideoDevice> raw_;
 +	std::unique_ptr<V4L2VideoDevice> params_;
 +	std::unique_ptr<V4L2VideoDevice> main_;
++	/* Optional: drivers before the scaled output do not have it */
++	std::unique_ptr<V4L2VideoDevice> scaled_;
++
++	/* Outputs that stream */
++	unsigned int streaming_ = 0;
 +
 +private:
 +	std::set<V4L2PixelFormat> rawFormats_;
@@ -7114,6 +7329,16 @@ index 0000000..44ffe59
 +	if (ret)
 +		return ret;
 +
++	if (media->getEntityByName("mtk-dip-scaled")) {
++		scaled_ = V4L2VideoDevice::fromEntityName(media, "mtk-dip-scaled");
++		ret = scaled_ ? scaled_->open() : -ENODEV;
++		if (ret) {
++			LOG(MtkIsp50, Warning)
++				<< "Scaled output not usable: " << strerror(-ret);
++			scaled_.reset();
++		}
++	}
++
 +	for (const auto &[format, sizes] : raw_->formats())
 +		rawFormats_.insert(format);
 +
@@ -7134,6 +7359,56 @@ index 0000000..44ffe59
 +	}
 +
 +	return 0;
++}
++
++/*
++ * Switch the streaming outputs. Only between jobs: a job in the ISP takes a
++ * buffer of every streaming output.
++ */
++int MtkIsp50Dip::setOutputs(unsigned int outputs)
++{
++	for (unsigned int output : { MtkIsp50OutputMain, MtkIsp50OutputScaled }) {
++		V4L2VideoDevice *node = outputNode(output);
++		const bool want = outputs & output;
++		const bool on = streaming_ & output;
++
++		if (want == on)
++			continue;
++		if (!node)
++			return -ENODEV;
++
++		if (on) {
++			node->streamOff();
++			streaming_ &= ~output;
++		} else {
++			int ret = node->streamOn();
++			if (ret)
++				return ret;
++			streaming_ |= output;
++		}
++	}
++
++	return 0;
++}
++
++int MtkIsp50Dip::start(unsigned int outputs)
++{
++	int ret = params_->streamOn();
++	if (ret)
++		return ret;
++
++	ret = setOutputs(outputs);
++	if (ret)
++		return ret;
++
++	return raw_->streamOn();
++}
++
++void MtkIsp50Dip::stop()
++{
++	raw_->streamOff();
++	setOutputs(0);
++	params_->streamOff();
 +}
 +
 +/* CPU statistics in a thread of their own */
@@ -7229,8 +7504,13 @@ index 0000000..44ffe59
 +	std::vector<Entity> entities_;
 +	std::unique_ptr<V4L2VideoDevice> video_;
 +
++	/* Main output (NV12, a crop), scaled output (YUYV) and raw frames */
 +	Stream outputStream_;
++	Stream scaledStream_;
 +	Stream rawStream_;
++
++	/* Sensor modes in rising size */
++	std::vector<Size> modes_;
 +
 +	/* The DIP can process the frames of this camera and the IPA runs */
 +	bool ispAvailable_ = false;
@@ -7245,8 +7525,15 @@ index 0000000..44ffe59
 +	Rectangle crop_;
 +	/* The processed area in active pixel array coordinates */
 +	Rectangle scalerCrop_;
-+	bool outputActive_ = false;
++	/* Outputs of the ISP in the configuration (mask) */
++	unsigned int outputs_ = 0;
 +	bool rawActive_ = false;
++	/* runIspJobs() is on the stack */
++	bool ispRunning_ = false;
++	/* stopDevice() runs: nothing new goes to the capture device */
++	bool stopping_ = false;
++
++	bool ispActive() const { return outputs_ != 0; }
 +
 +	/* Streaming */
 +	std::vector<std::unique_ptr<FrameBuffer>> rawBuffers_;
@@ -7279,6 +7566,8 @@ index 0000000..44ffe59
 +
 +	/* Chosen in validate() */
 +	V4L2SubdeviceFormat sensorFormat;
++	/* The processed area in the sensor mode */
++	Rectangle crop;
 +
 +private:
 +	MtkIsp50CameraData *data_;
@@ -7313,7 +7602,12 @@ index 0000000..44ffe59
 +	void queuePendingRequests(MtkIsp50CameraData *data);
 +	void recycleRaw(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info);
 +	void tryComplete(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info);
++	void runIspJobs(MtkIsp50CameraData *data);
++	void ispJobBack(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info);
 +	void restartIsp(MtkIsp50CameraData *data);
++
++	/* A camera of the handler streams (the DIP is in use) */
++	bool streaming() const { return activeData_ != nullptr; }
 +
 +protected:
 +	bool acquireDevice(Camera *camera) override;
@@ -7332,6 +7626,7 @@ index 0000000..44ffe59
 +	void rawBufferReady(FrameBuffer *buffer);
 +	void ispRawBufferReady(FrameBuffer *buffer);
 +	void ispOutputBufferReady(FrameBuffer *buffer);
++	void ispScaledBufferReady(FrameBuffer *buffer);
 +	void ispParamsBufferReady(FrameBuffer *buffer);
 +	void statsDone(uint32_t frame);
 +
@@ -7526,26 +7821,17 @@ index 0000000..44ffe59
 +
 +	PipelineHandlerMtkIsp50 *pipe = this->pipe();
 +
-+	int ret = frames_.queueIspJob(info, bytesused, pipe->dip_);
-+	if (ret) {
-+		LOG(MtkIsp50, Error)
-+			<< "Failed to queue the ISP job of frame " << frame << ": "
-+			<< strerror(-ret);
++	/* The raw buffer stays until the statistics are done */
++	statsDone_[frame] = false;
++	FrameBuffer *raw = info->rawBuffer;
++	mtkisp50::StatsBuffer *out = statsMaps_[info->statsBuffer];
 +
-+		/* The output buffer was not queued */
-+		info->outputBuffer->_d()->cancel();
-+		pipe->completeBuffer(info->request, info->outputBuffer);
-+
-+		/* A raw buffer alone in the ISP would meet the next output */
-+		if (info->ispQueued)
-+			pipe->restartIsp(this);
-+	}
++	frames_.submitIspJob(info, bytesused);
++	pipe->runIspJobs(this);
 +
 +	/* The statistics of the raw frame, also while the ISP works on it */
-+	mtkisp50::StatsBuffer *out = statsMaps_[info->statsBuffer];
-+	statsDone_[frame] = false;
 +	pipe->statsWorker_->invokeMethod(&MtkIsp50StatsWorker::process,
-+					 ConnectionTypeQueued, frame, info->rawBuffer, out,
++					 ConnectionTypeQueued, frame, raw, out,
 +					 config, true);
 +}
 +
@@ -7574,12 +7860,6 @@ index 0000000..44ffe59
 +
 +	status = validateColorSpaces(ColorSpaceFlag::StreamsShareColorSpace);
 +
-+	/* At most one processed and one raw stream */
-+	if (config_.size() > 2) {
-+		config_.resize(2);
-+		status = Adjusted;
-+	}
-+
 +	CameraSensor *sensor = data_->sensor_.get();
 +	PipelineHandlerMtkIsp50 *pipe = data_->pipe();
 +
@@ -7593,70 +7873,46 @@ index 0000000..44ffe59
 +	std::stable_sort(mbusCodes.begin(), mbusCodes.end(), [](unsigned int a, unsigned int b) {
 +		return BayerFormat::fromMbusCode(a).bitDepth > BayerFormat::fromMbusCode(b).bitDepth;
 +	});
-+	if (mbusCodes.empty())
++	if (mbusCodes.empty() || data_->modes_.empty())
 +		return Invalid;
 +
-+	/* Raw streams first, they choose the sensor mode */
-+	StreamConfiguration *rawCfg = nullptr;
-+	StreamConfiguration *outCfg = nullptr;
-+	for (StreamConfiguration &cfg : config_) {
-+		const PixelFormatInfo &info = PixelFormatInfo::info(cfg.pixelFormat);
-+		const bool raw = info.colourEncoding == PixelFormatInfo::ColourEncodingRAW;
-+
-+		if (raw && !rawCfg) {
-+			rawCfg = &cfg;
-+		} else if (!raw && !outCfg && data_->ispAvailable_) {
-+			outCfg = &cfg;
-+		} else if (!rawCfg) {
-+			rawCfg = &cfg;
-+			status = Adjusted;
-+		} else {
-+			/* A second stream of the same kind: drop it */
-+			config_.erase(config_.begin() + (&cfg - &config_[0]));
-+			status = Adjusted;
-+			break;
-+		}
-+	}
-+
-+	Size wanted;
-+	if (rawCfg)
-+		wanted = rawCfg->size;
-+	else if (outCfg)
-+		wanted = outCfg->size;
-+
-+	sensorFormat = sensor->getFormat(mbusCodes, wanted.isNull() ? sensor->resolution() : wanted);
-+	if (sensorFormat.size.isNull())
++	/* Streams to the outputs, sensor mode and processed area */
++	MtkIsp50StreamPlan plan(data_->modes_, data_->ispAvailable_, pipe->dip_.hasScaled());
++	const Status planned = plan.plan(config_);
++	if (planned == Invalid)
 +		return Invalid;
-+
-+	/* A processed stream that the sensor mode does not cover: larger mode */
-+	if (outCfg && rawCfg &&
-+	    (outCfg->size.width > sensorFormat.size.width ||
-+	     outCfg->size.height > sensorFormat.size.height)) {
-+		outCfg->size = sensorFormat.size;
++	if (planned == Adjusted)
 +		status = Adjusted;
++
++	sensorFormat = sensor->getFormat(mbusCodes, plan.mode);
++	if (sensorFormat.size != plan.mode) {
++		LOG(MtkIsp50, Error)
++			<< "Sensor mode " << sensorFormat.size << " instead of " << plan.mode;
++		return Invalid;
 +	}
 +
 +	BayerFormat bayer = BayerFormat::fromMbusCode(sensorFormat.code);
 +	if (bayer.bitDepth == 10)
 +		bayer.packing = BayerFormat::Packing::MTISP;
 +
-+	if (rawCfg) {
-+		const PixelFormat rawFormat = PipelineHandlerMtkIsp50::rawFormatOf(bayer);
-+		if (rawCfg->pixelFormat != rawFormat || rawCfg->size != sensorFormat.size) {
-+			rawCfg->pixelFormat = rawFormat;
++	V4L2DeviceFormat rawFormat;
++	rawFormat.fourcc = PipelineHandlerMtkIsp50::rawPixelFormat(bayer);
++	rawFormat.size = sensorFormat.size;
++	int ret = data_->video_->tryFormat(&rawFormat);
++	if (ret)
++		return Invalid;
++
++	if (plan.raw >= 0) {
++		StreamConfiguration *rawCfg = &config_[plan.raw];
++		const PixelFormat format = PipelineHandlerMtkIsp50::rawFormatOf(bayer);
++		if (rawCfg->pixelFormat != format || rawCfg->size != sensorFormat.size) {
++			rawCfg->pixelFormat = format;
 +			rawCfg->size = sensorFormat.size;
 +			status = Adjusted;
 +		}
 +
-+		V4L2DeviceFormat format;
-+		format.fourcc = PipelineHandlerMtkIsp50::rawPixelFormat(bayer);
-+		format.size = sensorFormat.size;
-+		int ret = data_->video_->tryFormat(&format);
-+		if (ret)
-+			return Invalid;
-+
-+		rawCfg->stride = format.planes[0].bpl;
-+		rawCfg->frameSize = format.planes[0].size;
++		rawCfg->stride = rawFormat.planes[0].bpl;
++		rawCfg->frameSize = rawFormat.planes[0].size;
 +		if (rawCfg->colorSpace != ColorSpace::Raw) {
 +			rawCfg->colorSpace = ColorSpace::Raw;
 +			status = Adjusted;
@@ -7666,44 +7922,86 @@ index 0000000..44ffe59
 +		rawCfg->setStream(const_cast<Stream *>(&data_->rawStream_));
 +	}
 +
-+	if (outCfg) {
-+		if (outCfg->pixelFormat != formats::NV12) {
-+			outCfg->pixelFormat = formats::NV12;
-+			status = Adjusted;
-+		}
++	crop = plan.crop;
 +
-+		/* A crop of the sensor mode, no scaling */
-+		Size size = outCfg->size.isNull() ? sensorFormat.size : outCfg->size;
-+		size.boundTo(sensorFormat.size);
-+		size.expandTo(kIspMinSize);
-+		size.alignDownTo(2, 2);
++	if (plan.main >= 0) {
++		StreamConfiguration *outCfg = &config_[plan.main];
 +
 +		V4L2DeviceFormat format;
 +		format.fourcc = V4L2PixelFormat(V4L2_PIX_FMT_NV12);
-+		format.size = size;
-+		int ret = pipe->dip_.main_->tryFormat(&format);
++		format.size = outCfg->size;
++		ret = pipe->dip_.main_->tryFormat(&format);
 +		if (ret)
 +			return Invalid;
 +
 +		if (format.size != outCfg->size) {
++			/* A size the planning does not know as impossible */
 +			outCfg->size = format.size;
++			crop = Rectangle(static_cast<int>(((sensorFormat.size.width - format.size.width) / 2) & ~3u),
++					 static_cast<int>(((sensorFormat.size.height - format.size.height) / 2) & ~1u),
++					 format.size);
 +			status = Adjusted;
 +		}
 +
 +		outCfg->stride = format.planes[0].bpl;
 +		outCfg->frameSize = format.planes[0].size;
-+		/* BT.601 full range */
-+		if (outCfg->colorSpace != ColorSpace::Sycc) {
-+			outCfg->colorSpace = ColorSpace::Sycc;
-+			status = Adjusted;
-+		}
 +		if (!outCfg->bufferCount)
-+			outCfg->bufferCount = kOutputBufferCount;
++			outCfg->bufferCount = plan.scaled >= 0 && outCfg->frameSize > kLargeOutputFrame
++						      ? kLargeOutputBufferCount
++						      : kOutputBufferCount;
 +		outCfg->setStream(const_cast<Stream *>(&data_->outputStream_));
 +	}
 +
-+	if (!rawCfg && !outCfg)
-+		return Invalid;
++	if (plan.scaled >= 0) {
++		StreamConfiguration *scaledCfg = &config_[plan.scaled];
++
++		Size size = MtkIsp50StreamPlan::fitScaled(crop.size(), scaledCfg->size);
++		unsigned int stride = utils::alignUp(size.width * 2, 16);
++
++		/*
++		 * The driver rounds the width down to one its tile computation
++		 * serves for the processed area of the raw node. While no
++		 * camera of the handler streams, the area is set for the check
++		 * (configure() sets it again); a busy node keeps the size.
++		 */
++		if (!pipe->streaming()) {
++			V4L2DeviceFormat ispRaw = rawFormat;
++			Rectangle area = crop;
++			V4L2DeviceFormat format;
++			format.fourcc = V4L2PixelFormat(V4L2_PIX_FMT_YUYV);
++			format.size = size;
++
++			if (!pipe->dip_.raw_->setFormat(&ispRaw) &&
++			    !pipe->dip_.raw_->setSelection(V4L2_SEL_TGT_CROP, &area) &&
++			    area == crop && !pipe->dip_.scaled_->tryFormat(&format)) {
++				size = format.size;
++				stride = format.planes[0].bpl;
++			}
++		}
++
++		if (size != scaledCfg->size) {
++			scaledCfg->size = size;
++			status = Adjusted;
++		}
++
++		scaledCfg->stride = stride;
++		scaledCfg->frameSize = stride * size.height;
++		if (!scaledCfg->bufferCount)
++			scaledCfg->bufferCount = kOutputBufferCount;
++		scaledCfg->setStream(const_cast<Stream *>(&data_->scaledStream_));
++	}
++
++	/* BT.601 full range on both processed outputs */
++	for (int index : { plan.main, plan.scaled }) {
++		if (index < 0)
++			continue;
++
++		StreamConfiguration &cfg = config_[index];
++		if (cfg.colorSpace != ColorSpace::Sycc) {
++			cfg.colorSpace = ColorSpace::Sycc;
++			status = Adjusted;
++		}
++	}
 +
 +	return status;
 +}
@@ -7748,14 +8046,7 @@ index 0000000..44ffe59
 +	if (roles.empty())
 +		return config;
 +
-+	/* Sensor modes in rising size */
-+	std::vector<Size> modes;
-+	for (unsigned int code : sensor->mbusCodes()) {
-+		for (const Size &size : sensor->sizes(code))
-+			modes.push_back(size);
-+	}
-+	std::sort(modes.begin(), modes.end());
-+	modes.erase(std::unique(modes.begin(), modes.end()), modes.end());
++	const std::vector<Size> &modes = data->modes_;
 +	if (modes.empty())
 +		return nullptr;
 +
@@ -7768,18 +8059,45 @@ index 0000000..44ffe59
 +		}
 +	}
 +
-+	bool haveOutput = false;
++	const bool scaledAvailable = data->ispAvailable_ && dip_.hasScaled();
++	const unsigned int maxProcessed = !data->ispAvailable_ ? 0 : scaledAvailable ? 2 : 1;
++
++	unsigned int processed = 0;
 +	bool haveRaw = false;
++	bool haveStill = false;
++	bool haveVideo = false;
++	for (const StreamRole role : roles) {
++		const bool raw = role == StreamRole::Raw || !data->ispAvailable_;
++		if (raw) {
++			if (haveRaw) {
++				LOG(MtkIsp50, Error) << "Only one raw stream is supported";
++				return nullptr;
++			}
++			haveRaw = true;
++			continue;
++		}
++
++		if (++processed > maxProcessed) {
++			LOG(MtkIsp50, Error)
++				<< "At most " << maxProcessed << " processed streams are supported";
++			return nullptr;
++		}
++		haveStill |= role == StreamRole::StillCapture;
++		haveVideo |= role == StreamRole::VideoRecording;
++	}
++
++	/*
++	 * Defaults. One processed stream: still and viewfinder on the main
++	 * output (a crop of the sensor mode as before), video on the scaled
++	 * output (16:9 of the whole width of the larger mode). Two: the still
++	 * or the video on the main output, the other one scaled from the same
++	 * area.
++	 */
++	const Size halfLargest(modes.back().width / 2, modes.back().height / 2);
++	const Size scaledMax = MtkIsp50StreamPlan::fitScaled(modes.back(), {});
 +
 +	for (const StreamRole role : roles) {
 +		const bool raw = role == StreamRole::Raw || !data->ispAvailable_;
-+
-+		if ((raw && haveRaw) || (!raw && haveOutput)) {
-+			LOG(MtkIsp50, Error)
-+				<< "Only one processed and one raw stream are supported";
-+			return nullptr;
-+		}
-+
 +		std::map<PixelFormat, std::vector<SizeRange>> formats;
 +		StreamConfiguration cfg;
 +
@@ -7802,16 +8120,46 @@ index 0000000..44ffe59
 +			cfg.pixelFormat = rawFormatOf(bayer);
 +			cfg.size = role == StreamRole::Raw || role == StreamRole::StillCapture
 +					   ? modes.back() : viewfinder;
-+			cfg.bufferCount = kRawBufferCount;
-+			haveRaw = true;
-+		} else {
-+			formats[formats::NV12] = { SizeRange(kIspMinSize, modes.back()) };
++			/* Two processed streams of the large mode leave less memory */
++			cfg.bufferCount = processed == 2 ? kLargeOutputBufferCount : kRawBufferCount;
++			config->addConfiguration(cfg);
++			continue;
++		}
 +
-+			cfg = StreamConfiguration(StreamFormats(formats));
-+			cfg.pixelFormat = formats::NV12;
-+			cfg.size = role == StreamRole::StillCapture ? modes.back() : viewfinder;
-+			cfg.bufferCount = kOutputBufferCount;
-+			haveOutput = true;
++		formats[formats::NV12] = { SizeRange(MtkIsp50StreamPlan::kIspMinSize, modes.back()) };
++		if (scaledAvailable)
++			formats[formats::YUYV] = { SizeRange(MtkIsp50StreamPlan::kScaledMinSize,
++							     scaledMax) };
++		cfg = StreamConfiguration(StreamFormats(formats));
++		cfg.pixelFormat = formats::NV12;
++		cfg.bufferCount = kOutputBufferCount;
++
++		switch (role) {
++		case StreamRole::StillCapture:
++			cfg.size = modes.back();
++			if (processed == 2)
++				cfg.bufferCount = kLargeOutputBufferCount;
++			break;
++
++		case StreamRole::VideoRecording:
++			cfg.size = kVideoSize;
++			if (scaledAvailable && processed == 1)
++				cfg.pixelFormat = formats::YUYV;
++			break;
++
++		default:
++			if (haveStill && processed == 2) {
++				/* Half of the still, the largest scaled size */
++				cfg.pixelFormat = formats::YUYV;
++				cfg.size = viewfinder;
++				cfg.size.boundTo(halfLargest);
++			} else if (haveVideo && processed == 2) {
++				cfg.pixelFormat = formats::YUYV;
++				cfg.size = Size(kVideoSize.width / 2, kVideoSize.height / 2);
++			} else {
++				cfg.size = viewfinder;
++			}
++			break;
 +		}
 +
 +		config->addConfiguration(cfg);
@@ -7876,13 +8224,17 @@ index 0000000..44ffe59
 +	}
 +	data->rawFormat_ = rawFormat;
 +
-+	data->outputActive_ = false;
++	data->outputs_ = 0;
 +	data->rawActive_ = false;
 +	StreamConfiguration *outCfg = nullptr;
++	StreamConfiguration *scaledCfg = nullptr;
 +	for (StreamConfiguration &cfg : *config) {
 +		if (cfg.stream() == &data->outputStream_) {
 +			outCfg = &cfg;
-+			data->outputActive_ = true;
++			data->outputs_ |= MtkIsp50OutputMain;
++		} else if (cfg.stream() == &data->scaledStream_) {
++			scaledCfg = &cfg;
++			data->outputs_ |= MtkIsp50OutputScaled;
 +		} else if (cfg.stream() == &data->rawStream_) {
 +			data->rawActive_ = true;
 +		}
@@ -7896,7 +8248,7 @@ index 0000000..44ffe59
 +	/* Statistics over the processed area, or the whole frame */
 +	data->crop_ = Rectangle(rawFormat.size);
 +
-+	if (outCfg) {
++	if (data->ispActive()) {
 +		/* Raw input of the DIP, line length as written by the CAMSV */
 +		V4L2DeviceFormat ispRaw = rawFormat;
 +		ret = dip_.raw_->setFormat(&ispRaw);
@@ -7911,16 +8263,8 @@ index 0000000..44ffe59
 +			return -EINVAL;
 +		}
 +
-+		/*
-+		 * Centred crop with the output size. Even coordinates keep the
-+		 * Bayer phase, a multiple of 4 pixels horizontally also starts
-+		 * on a group of the packed format.
-+		 */
-+		Rectangle crop;
-+		crop.width = outCfg->size.width;
-+		crop.height = outCfg->size.height;
-+		crop.x = ((rawFormat.size.width - crop.width) / 2) & ~3;
-+		crop.y = ((rawFormat.size.height - crop.height) / 2) & ~1;
++		/* The processed area chosen in validate() */
++		const Rectangle &crop = config->crop;
 +
 +		Rectangle applied = crop;
 +		ret = dip_.raw_->setSelection(V4L2_SEL_TGT_CROP, &applied);
@@ -7933,18 +8277,54 @@ index 0000000..44ffe59
 +		}
 +		data->crop_ = applied;
 +
-+		V4L2DeviceFormat main;
-+		main.fourcc = V4L2PixelFormat(V4L2_PIX_FMT_NV12);
-+		main.size = outCfg->size;
-+		ret = dip_.main_->setFormat(&main);
-+		if (ret)
-+			return ret;
++		if (outCfg) {
++			V4L2DeviceFormat main;
++			main.fourcc = V4L2PixelFormat(V4L2_PIX_FMT_NV12);
++			main.size = outCfg->size;
++			ret = dip_.main_->setFormat(&main);
++			if (ret)
++				return ret;
 +
-+		if (main.size != outCfg->size || main.planes[0].bpl != outCfg->stride) {
-+			LOG(MtkIsp50, Error)
-+				<< "ISP output " << main << " does not match "
-+				<< outCfg->toString() << " stride " << outCfg->stride;
-+			return -EINVAL;
++			if (main.size != outCfg->size || main.size != applied.size() ||
++			    main.planes[0].bpl != outCfg->stride) {
++				LOG(MtkIsp50, Error)
++					<< "ISP output " << main << " does not match "
++					<< outCfg->toString() << " stride " << outCfg->stride;
++				return -EINVAL;
++			}
++		} else {
++			/*
++			 * Interim: the DIP driver (ISPDIP10) checks the line
++			 * length of the main output against the processed area
++			 * also for jobs without the main output and fails them
++			 * (-EINVAL in the tile geometry check). The main node,
++			 * which does not stream, gets the size of the area.
++			 */
++			V4L2DeviceFormat main;
++			main.fourcc = V4L2PixelFormat(V4L2_PIX_FMT_NV12);
++			main.size = applied.size();
++			if (dip_.main_->setFormat(&main) || main.size != applied.size())
++				LOG(MtkIsp50, Warning)
++					<< "Main output not set to the processed area " << applied;
++		}
++
++		if (scaledCfg) {
++			V4L2DeviceFormat scaled;
++			scaled.fourcc = V4L2PixelFormat(V4L2_PIX_FMT_YUYV);
++			scaled.size = scaledCfg->size;
++			scaled.planes[0].bpl = scaledCfg->stride;
++			scaled.planesCount = 1;
++			ret = dip_.scaled_->setFormat(&scaled);
++			if (ret)
++				return ret;
++
++			if (scaled.size != scaledCfg->size ||
++			    scaled.planes[0].bpl != scaledCfg->stride) {
++				LOG(MtkIsp50, Error)
++					<< "ISP scaled output " << scaled << " does not match "
++					<< scaledCfg->toString() << " stride " << scaledCfg->stride;
++				return -EINVAL;
++			}
 +		}
 +
 +		V4L2DeviceFormat params;
@@ -8002,6 +8382,11 @@ index 0000000..44ffe59
 +	ipaConfig.useCase = ipa::mtkisp50::UseCase::Preview;
 +	if (outCfg && outCfg->size == data->sensor_->resolution())
 +		ipaConfig.useCase = ipa::mtkisp50::UseCase::Still;
++
++	LOG(MtkIsp50, Debug)
++		<< "Sensor " << data->sensorFormat_ << ", processed area " << data->crop_
++		<< (outCfg ? ", main " + outCfg->toString() : "")
++		<< (scaledCfg ? ", scaled " + scaledCfg->toString() : "");
 +	ipaConfig.paramsBufferSize = MTK_DIP_PARAMS_MAX_SIZE;
 +	ipaConfig.statsSource = static_cast<uint32_t>(mtkisp50::StatsSource::Cpu);
 +
@@ -8024,6 +8409,8 @@ index 0000000..44ffe59
 +
 +	if (stream == &data->outputStream_)
 +		return dip_.main_->exportBuffers(count, buffers);
++	if (stream == &data->scaledStream_ && dip_.scaled_)
++		return dip_.scaled_->exportBuffers(count, buffers);
 +	if (stream == &data->rawStream_)
 +		return data->video_->exportBuffers(count, buffers);
 +
@@ -8039,13 +8426,16 @@ index 0000000..44ffe59
 +	 * The camera memory region holds all raw and output buffers and a
 +	 * spare raw frame of the capture device, without which the capture
 +	 * device keeps the last queued buffer until the next one comes. Large
-+	 * raw frames get a smaller internal pool, and a raw stream brings its
-+	 * own buffers: requests wait for a pool buffer if needed.
++	 * raw frames next to a large main output get a smaller internal pool,
++	 * and a raw stream brings its own buffers: requests wait for a pool
++	 * buffer if needed.
 +	 */
++	const bool largeMain = (data->outputs_ & MtkIsp50OutputMain) &&
++			       data->outputStream_.configuration().frameSize > kLargeOutputFrame;
 +	unsigned int pool = kRawBufferCount;
 +	if (data->rawActive_)
 +		pool = 2;
-+	else if (data->rawFormat_.planes[0].size > kLargeRawFrame)
++	else if (data->rawFormat_.planes[0].size > kLargeRawFrame && largeMain)
 +		pool = 3;
 +
 +	unsigned int rawSlots = pool;
@@ -8062,13 +8452,20 @@ index 0000000..44ffe59
 +	for (std::unique_ptr<FrameBuffer> &buffer : data->rawBuffers_)
 +		data->availableRawBuffers_.push(buffer.get());
 +
-+	if (data->outputActive_) {
++	if (data->ispActive()) {
 +		ret = dip_.raw_->importBuffers(rawSlots);
 +		if (ret < 0)
 +			return ret;
-+		ret = dip_.main_->importBuffers(data->outputStream_.configuration().bufferCount);
-+		if (ret < 0)
-+			return ret;
++		if (data->outputs_ & MtkIsp50OutputMain) {
++			ret = dip_.main_->importBuffers(data->outputStream_.configuration().bufferCount);
++			if (ret < 0)
++				return ret;
++		}
++		if (data->outputs_ & MtkIsp50OutputScaled) {
++			ret = dip_.scaled_->importBuffers(data->scaledStream_.configuration().bufferCount);
++			if (ret < 0)
++				return ret;
++		}
 +		ret = dip_.params_->allocateBuffers(kParamsBufferCount, &data->paramsBuffers_);
 +		if (ret < 0)
 +			return ret;
@@ -8153,9 +8550,12 @@ index 0000000..44ffe59
 +	data->statsMaps_.clear();
 +	data->statsBuffers_.clear();
 +
-+	if (data->outputActive_) {
++	if (data->ispActive()) {
 +		dip_.params_->releaseBuffers();
-+		dip_.main_->releaseBuffers();
++		if (data->outputs_ & MtkIsp50OutputMain)
++			dip_.main_->releaseBuffers();
++		if (data->outputs_ & MtkIsp50OutputScaled)
++			dip_.scaled_->releaseBuffers();
 +		dip_.raw_->releaseBuffers();
 +	}
 +	data->paramsBuffers_.clear();
@@ -8213,16 +8613,13 @@ index 0000000..44ffe59
 +
 +	activeData_ = data;
 +
-+	if (data->outputActive_) {
-+		ret = dip_.params_->streamOn();
-+		if (!ret)
-+			ret = dip_.main_->streamOn();
-+		if (!ret)
-+			ret = dip_.raw_->streamOn();
++	if (data->ispActive()) {
++		ret = dip_.start(data->outputs_);
 +		if (ret) {
 +			LOG(MtkIsp50, Error) << "Failed to start the ISP: " << strerror(-ret);
 +			goto error;
 +		}
++		data->frames_.startIsp(data->outputs_);
 +	}
 +
 +	ret = data->video_->streamOn();
@@ -8241,9 +8638,7 @@ index 0000000..44ffe59
 +	return 0;
 +
 +error:
-+	dip_.raw_->streamOff();
-+	dip_.main_->streamOff();
-+	dip_.params_->streamOff();
++	dip_.stop();
 +	if (data->ipa_)
 +		data->ipa_->stop();
 +	activeData_ = nullptr;
@@ -8256,12 +8651,11 @@ index 0000000..44ffe59
 +	MtkIsp50CameraData *data = cameraData(camera);
 +
 +	/* Returned buffers come back cancelled and complete their requests */
++	data->stopping_ = true;
++	data->frames_.holdIsp(true);
 +	data->video_->streamOff();
-+	if (data->outputActive_) {
-+		dip_.raw_->streamOff();
-+		dip_.main_->streamOff();
-+		dip_.params_->streamOff();
-+	}
++	if (data->ispActive())
++		dip_.stop();
 +
 +	/* Wait for the statistics still running */
 +	statsWorker_->invokeMethod(&MtkIsp50StatsWorker::clear, ConnectionTypeBlocking);
@@ -8284,6 +8678,11 @@ index 0000000..44ffe59
 +			completeBuffer(request, info->outputBuffer);
 +		}
 +
++		if (info->scaledBuffer && !info->scaledDone) {
++			info->scaledBuffer->_d()->cancel();
++			completeBuffer(request, info->scaledBuffer);
++		}
++
 +		if (info->rawBuffer && info->rawFromRequest) {
 +			info->rawBuffer->_d()->cancel();
 +			completeBuffer(request, info->rawBuffer);
@@ -8294,6 +8693,7 @@ index 0000000..44ffe59
 +	}
 +
 +	activeData_ = nullptr;
++	data->stopping_ = false;
 +	freeBuffers(camera);
 +}
 +
@@ -8314,11 +8714,13 @@ index 0000000..44ffe59
 + */
 +void PipelineHandlerMtkIsp50::queuePendingRequests(MtkIsp50CameraData *data)
 +{
-+	while (!data->pendingRequests_.empty()) {
++	while (!data->stopping_ && !data->pendingRequests_.empty()) {
 +		Request *request = data->pendingRequests_.front();
 +
-+		FrameBuffer *output = data->outputActive_ ? request->findBuffer(&data->outputStream_)
-+							  : nullptr;
++		FrameBuffer *output = data->outputs_ & MtkIsp50OutputMain
++					      ? request->findBuffer(&data->outputStream_) : nullptr;
++		FrameBuffer *scaled = data->outputs_ & MtkIsp50OutputScaled
++					      ? request->findBuffer(&data->scaledStream_) : nullptr;
 +		FrameBuffer *raw = data->rawActive_ ? request->findBuffer(&data->rawStream_) : nullptr;
 +		const bool rawFromRequest = raw != nullptr;
 +
@@ -8329,7 +8731,8 @@ index 0000000..44ffe59
 +		}
 +
 +		MtkIsp50Frames::Info *info =
-+			data->frames_.create(request->sequence(), request, raw, rawFromRequest, output);
++			data->frames_.create(request->sequence(), request, raw, rawFromRequest, output,
++					     scaled);
 +		if (!info)
 +			return;
 +
@@ -8416,6 +8819,11 @@ index 0000000..44ffe59
 +			completeBuffer(request, info->outputBuffer);
 +			info->outputDone = true;
 +		}
++		if (info->scaledBuffer && !info->scaledDone) {
++			info->scaledBuffer->_d()->cancel();
++			completeBuffer(request, info->scaledBuffer);
++			info->scaledDone = true;
++		}
 +		tryComplete(data, info);
 +		return;
 +	}
@@ -8448,6 +8856,7 @@ index 0000000..44ffe59
 +		return;
 +
 +	info->rawDone = true;
++	ispJobBack(data, info);
 +	tryComplete(data, info);
 +}
 +
@@ -8466,6 +8875,26 @@ index 0000000..44ffe59
 +
 +	info->outputDone = true;
 +	completeBuffer(info->request, buffer);
++	ispJobBack(data, info);
++	tryComplete(data, info);
++}
++
++void PipelineHandlerMtkIsp50::ispScaledBufferReady(FrameBuffer *buffer)
++{
++	MtkIsp50CameraData *data = activeData_;
++	if (!data)
++		return;
++
++	MtkIsp50Frames::Info *info = data->frames_.findScaled(buffer);
++	if (!info)
++		return;
++
++	if (buffer->metadata().status != FrameMetadata::FrameSuccess)
++		info->error = true;
++
++	info->scaledDone = true;
++	completeBuffer(info->request, buffer);
++	ispJobBack(data, info);
 +	tryComplete(data, info);
 +}
 +
@@ -8503,20 +8932,62 @@ index 0000000..44ffe59
 +}
 +
 +/*
++ * Queue the ISP jobs that may go. A job that fails gives back the outputs
++ * not queued; a raw buffer alone in the ISP would meet the outputs of the
++ * next job, so the ISP restarts and returns the buffers queued.
++ */
++void PipelineHandlerMtkIsp50::runIspJobs(MtkIsp50CameraData *data)
++{
++	if (data->ispRunning_)
++		return;
++	data->ispRunning_ = true;
++
++	MtkIsp50Frames::Info *failed = nullptr;
++	int ret;
++	while ((ret = data->frames_.runIspJobs(dip_, &failed))) {
++		Request *request = failed->request;
++
++		LOG(MtkIsp50, Error)
++			<< "Failed to queue the ISP job of frame " << failed->id << ": "
++			<< strerror(-ret);
++
++		if (failed->outputBuffer && !failed->outputQueued) {
++			failed->outputBuffer->_d()->cancel();
++			completeBuffer(request, failed->outputBuffer);
++		}
++		if (failed->scaledBuffer && !failed->scaledQueued) {
++			failed->scaledBuffer->_d()->cancel();
++			completeBuffer(request, failed->scaledBuffer);
++		}
++
++		if (failed->ispQueued)
++			restartIsp(data);
++
++		tryComplete(data, failed);
++	}
++
++	data->ispRunning_ = false;
++}
++
++/* The buffers of an ISP job are back: the next jobs may go */
++void PipelineHandlerMtkIsp50::ispJobBack(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info)
++{
++	if (data->frames_.ispJobBack(info))
++		runIspJobs(data);
++}
++
++/*
 + * Stop and start the ISP queues: the buffers in them come back cancelled.
 + * Used when a job could only be queued in part.
 + */
 +void PipelineHandlerMtkIsp50::restartIsp([[maybe_unused]] MtkIsp50CameraData *data)
 +{
-+	dip_.raw_->streamOff();
-+	dip_.main_->streamOff();
-+	dip_.params_->streamOff();
++	const unsigned int outputs = dip_.streaming_;
 +
-+	int ret = dip_.params_->streamOn();
-+	if (!ret)
-+		ret = dip_.main_->streamOn();
-+	if (!ret)
-+		ret = dip_.raw_->streamOn();
++	data->frames_.holdIsp(true);
++	dip_.stop();
++	int ret = dip_.start(outputs);
++	data->frames_.holdIsp(false);
 +	if (ret)
 +		LOG(MtkIsp50, Error) << "Failed to restart the ISP: " << strerror(-ret);
 +
@@ -8591,6 +9062,15 @@ index 0000000..44ffe59
 +	}
 +	data->ispAvailable_ = ispFormat && data->ipa_;
 +
++	/* Sensor modes in rising size */
++	for (unsigned int code : data->sensor_->mbusCodes()) {
++		for (const Size &size : data->sensor_->sizes(code))
++			data->modes_.push_back(size);
++	}
++	std::sort(data->modes_.begin(), data->modes_.end());
++	data->modes_.erase(std::unique(data->modes_.begin(), data->modes_.end()),
++			   data->modes_.end());
++
 +	if (data->ipa_)
 +		data->controlInfo_ = data->ipaControls_;
 +
@@ -8601,7 +9081,8 @@ index 0000000..44ffe59
 +
 +	data->video_->bufferReady.connect(this, &PipelineHandlerMtkIsp50::rawBufferReady);
 +
-+	std::set<Stream *> streams = { &data->outputStream_, &data->rawStream_ };
++	std::set<Stream *> streams = { &data->outputStream_, &data->scaledStream_,
++				       &data->rawStream_ };
 +	const std::string &id = data->sensor_->id();
 +	std::shared_ptr<Camera> camera =
 +		Camera::create(std::move(data), id, streams);
@@ -8646,6 +9127,8 @@ index 0000000..44ffe59
 +
 +	dip_.raw_->bufferReady.connect(this, &PipelineHandlerMtkIsp50::ispRawBufferReady);
 +	dip_.main_->bufferReady.connect(this, &PipelineHandlerMtkIsp50::ispOutputBufferReady);
++	if (dip_.scaled_)
++		dip_.scaled_->bufferReady.connect(this, &PipelineHandlerMtkIsp50::ispScaledBufferReady);
 +	dip_.params_->bufferReady.connect(this, &PipelineHandlerMtkIsp50::ispParamsBufferReady);
 +
 +	statsWorker_ = std::make_unique<MtkIsp50StatsWorker>();
@@ -9952,6 +10435,385 @@ index 0000000..c54b38b
 +};
 +
 +} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/mtkisp50/streams.cpp b/src/libcamera/pipeline/mtkisp50/streams.cpp
+new file mode 100644
+index 0000000..8d1aeef
+--- /dev/null
++++ b/src/libcamera/pipeline/mtkisp50/streams.cpp
+@@ -0,0 +1,283 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Stream assignment of the mtkisp50 pipeline
++ */
++
++#include "streams.h"
++
++#include <algorithm>
++#include <array>
++#include <stdint.h>
++#include <utility>
++
++#include <libcamera/formats.h>
++
++#include "libcamera/internal/formats.h"
++
++namespace libcamera {
++
++MtkIsp50StreamPlan::MtkIsp50StreamPlan(const std::vector<Size> &modes, bool ispAvailable,
++				       bool scaledAvailable)
++	: modes_(modes), ispAvailable_(ispAvailable), scaledAvailable_(scaledAvailable)
++{
++}
++
++/*
++ * Widths of the processed area the tile computation cannot serve, with or
++ * without the edge enhancement (see the DIP interface header); the driver
++ * rounds them down.
++ */
++unsigned int MtkIsp50StreamPlan::ispWidth(unsigned int width)
++{
++	static constexpr std::array<std::pair<unsigned int, unsigned int>, 7> kBands{ {
++		{ 690, 728 },
++		{ 1322, 1366 },
++		{ 1960, 2004 },
++		{ 2598, 2642 },
++		{ 3236, 3280 },
++		{ 3874, 3918 },
++		{ 4512, 4556 },
++	} };
++
++	for (const auto &[low, high] : kBands) {
++		if (width >= low && width <= high)
++			return low - 2;
++	}
++
++	return width;
++}
++
++/* An aspect ratio within 1 % of the mode takes the whole mode on that axis */
++Rectangle MtkIsp50StreamPlan::areaFor(const Size &mode, const Size &size)
++{
++	uint64_t width = mode.width;
++	uint64_t height = mode.height;
++
++	if (!size.isNull()) {
++		if (static_cast<uint64_t>(size.width) * mode.height >=
++		    static_cast<uint64_t>(size.height) * mode.width)
++			height = static_cast<uint64_t>(mode.width) * size.height / size.width;
++		else
++			width = static_cast<uint64_t>(mode.height) * size.width / size.height;
++
++		if (mode.height - height <= mode.height / 100)
++			height = mode.height;
++		if (mode.width - width <= mode.width / 100)
++			width = mode.width;
++	}
++
++	Size area(ispWidth(static_cast<unsigned int>(width) & ~1u),
++		  static_cast<unsigned int>(height) & ~1u);
++	area.expandTo(kIspMinSize);
++	area.boundTo(mode);
++
++	return Rectangle(static_cast<int>(((mode.width - area.width) / 2) & ~3u),
++			 static_cast<int>(((mode.height - area.height) / 2) & ~1u),
++			 area);
++}
++
++Size MtkIsp50StreamPlan::fitScaled(const Size &area, const Size &wanted)
++{
++	auto even = [](uint64_t v) { return v & ~static_cast<uint64_t>(1); };
++
++	const uint64_t minW = std::max<uint64_t>(kScaledMinSize.width,
++						 even((area.width + kScaleMaxDown - 1) / kScaleMaxDown + 1));
++	const uint64_t minH = std::max<uint64_t>(kScaledMinSize.height,
++						 even((area.height + kScaleMaxDown - 1) / kScaleMaxDown + 1));
++	const uint64_t maxW = std::max<uint64_t>(even(area.width / 2), minW);
++	const uint64_t maxH = std::max<uint64_t>(even(area.height / 2), minH);
++
++	if (wanted.isNull())
++		return Size(maxW, maxH);
++
++	uint64_t w = wanted.width;
++	uint64_t h = wanted.height;
++
++	/* The aspect ratio of the area, within 1 % or two lines */
++	const uint64_t hForW = w * area.height / area.width;
++	const uint64_t diff = hForW > h ? hForW - h : h - hForW;
++	if (diff > std::max<uint64_t>(2, h / 100)) {
++		if (w * area.height > h * area.width)
++			w = h * area.width / area.height;
++		else
++			h = hForW;
++	}
++
++	/* Down to the largest size the scaler gives, keeping the ratio */
++	if (w > maxW) {
++		h = h * maxW / w;
++		w = maxW;
++	}
++	if (h > maxH) {
++		w = w * maxH / h;
++		h = maxH;
++	}
++
++	w = std::clamp(even(w), minW, maxW);
++	h = std::clamp(even(h), minH, maxH);
++
++	return Size(static_cast<unsigned int>(w), static_cast<unsigned int>(h));
++}
++
++Size MtkIsp50StreamPlan::modeFor(const Size &size) const
++{
++	for (const Size &m : modes_) {
++		if (m.width >= size.width && m.height >= size.height)
++			return m;
++	}
++
++	return modes_.back();
++}
++
++CameraConfiguration::Status MtkIsp50StreamPlan::plan(std::vector<StreamConfiguration> &configs)
++{
++	CameraConfiguration::Status status = CameraConfiguration::Valid;
++
++	raw = main = scaled = -1;
++	mode = {};
++	crop = {};
++
++	if (configs.empty() || modes_.empty())
++		return CameraConfiguration::Invalid;
++
++	auto isRaw = [](const StreamConfiguration &cfg) {
++		return PixelFormatInfo::info(cfg.pixelFormat).colourEncoding ==
++		       PixelFormatInfo::ColourEncodingRAW;
++	};
++
++	/*
++	 * Raw streams first, then the processed ones; without the ISP the
++	 * first processed stream becomes the raw one if there is none.
++	 */
++	const unsigned int maxProcessed = !ispAvailable_ ? 0 : scaledAvailable_ ? 2 : 1;
++	int rawIndex = -1;
++	std::vector<unsigned int> processed;
++
++	for (unsigned int i = 0; i < configs.size(); i++) {
++		if (isRaw(configs[i]) && rawIndex < 0)
++			rawIndex = i;
++	}
++	for (unsigned int i = 0; i < configs.size(); i++) {
++		if (static_cast<int>(i) == rawIndex || isRaw(configs[i]))
++			continue;
++		if (processed.size() < maxProcessed)
++			processed.push_back(i);
++		else if (!ispAvailable_ && rawIndex < 0)
++			rawIndex = i;
++	}
++
++	std::vector<StreamConfiguration> kept;
++	auto keep = [&](unsigned int index) {
++		kept.push_back(configs[index]);
++		return static_cast<int>(kept.size() - 1);
++	};
++
++	/* Keep the order of the application */
++	std::vector<int> newIndex(configs.size(), -1);
++	for (unsigned int i = 0; i < configs.size(); i++) {
++		if (static_cast<int>(i) == rawIndex ||
++		    std::find(processed.begin(), processed.end(), i) != processed.end())
++			newIndex[i] = keep(i);
++	}
++
++	if (kept.size() != configs.size())
++		status = CameraConfiguration::Adjusted;
++
++	/* Processed streams to the outputs */
++	int mainIndex = -1;
++	int scaledIndex = -1;
++	if (processed.size() == 1) {
++		if (scaledAvailable_ && configs[processed[0]].pixelFormat == formats::YUYV)
++			scaledIndex = processed[0];
++		else
++			mainIndex = processed[0];
++	} else if (processed.size() == 2) {
++		const StreamConfiguration &a = configs[processed[0]];
++		const StreamConfiguration &b = configs[processed[1]];
++		const bool yuyvA = a.pixelFormat == formats::YUYV;
++		const bool yuyvB = b.pixelFormat == formats::YUYV;
++
++		bool aMain;
++		if (yuyvA != yuyvB)
++			aMain = yuyvB;
++		else
++			aMain = static_cast<uint64_t>(a.size.width) * a.size.height >=
++				static_cast<uint64_t>(b.size.width) * b.size.height;
++
++		mainIndex = aMain ? processed[0] : processed[1];
++		scaledIndex = aMain ? processed[1] : processed[0];
++	}
++
++	configs = std::move(kept);
++	raw = rawIndex >= 0 ? newIndex[rawIndex] : -1;
++	main = mainIndex >= 0 ? newIndex[mainIndex] : -1;
++	scaled = scaledIndex >= 0 ? newIndex[scaledIndex] : -1;
++
++	if (raw < 0 && main < 0 && scaled < 0)
++		return CameraConfiguration::Invalid;
++
++	/* The raw stream, else the main output, else the scaled one: the mode */
++	Size need;
++	if (raw >= 0) {
++		need = configs[raw].size;
++	} else if (main >= 0) {
++		need = configs[main].size;
++	} else {
++		const Size &size = configs[scaled].size;
++		if (!size.isNull())
++			need = Size(size.width * 2, size.height * 2);
++	}
++	mode = need.isNull() ? modes_.back() : modeFor(need);
++
++	if (raw >= 0 && configs[raw].size != mode) {
++		configs[raw].size = mode;
++		status = CameraConfiguration::Adjusted;
++	}
++
++	/* The processed area: a centred crop of the mode */
++	if (main >= 0) {
++		StreamConfiguration &cfg = configs[main];
++		Size size = cfg.size.isNull() ? mode : cfg.size;
++		size.boundTo(mode);
++		size.expandTo(kIspMinSize);
++		size.alignDownTo(2, 2);
++		size.width = ispWidth(size.width);
++
++		if (size != cfg.size) {
++			cfg.size = size;
++			status = CameraConfiguration::Adjusted;
++		}
++		if (cfg.pixelFormat != formats::NV12) {
++			cfg.pixelFormat = formats::NV12;
++			status = CameraConfiguration::Adjusted;
++		}
++
++		/*
++		 * Even coordinates keep the Bayer phase, a multiple of 4 pixels
++		 * horizontally also starts on a group of the packed format.
++		 */
++		crop = Rectangle(static_cast<int>(((mode.width - size.width) / 2) & ~3u),
++				 static_cast<int>(((mode.height - size.height) / 2) & ~1u),
++				 size);
++	} else if (scaled >= 0) {
++		crop = areaFor(mode, configs[scaled].size);
++	}
++
++	if (scaled >= 0) {
++		StreamConfiguration &cfg = configs[scaled];
++		Size size = fitScaled(crop.size(), cfg.size);
++
++		if (size != cfg.size) {
++			cfg.size = size;
++			status = CameraConfiguration::Adjusted;
++		}
++		if (cfg.pixelFormat != formats::YUYV) {
++			cfg.pixelFormat = formats::YUYV;
++			status = CameraConfiguration::Adjusted;
++		}
++	}
++
++	return status;
++}
++
++} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/mtkisp50/streams.h b/src/libcamera/pipeline/mtkisp50/streams.h
+new file mode 100644
+index 0000000..7bf2a50
+--- /dev/null
++++ b/src/libcamera/pipeline/mtkisp50/streams.h
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Stream assignment of the mtkisp50 pipeline: which stream goes to which
++ * output of the ISP, the sensor mode and the processed area
++ */
++
++#pragma once
++
++#include <vector>
++
++#include <libcamera/camera.h>
++#include <libcamera/geometry.h>
++#include <libcamera/stream.h>
++
++#include "frames.h"
++
++namespace libcamera {
++
++/*
++ * The DIP writes up to two processed outputs from one raw frame and one
++ * processed area (a crop of the sensor mode):
++ *  - main: NV12, the size of the processed area (no scaling);
++ *  - scaled: YUYV, 1/2 down to 1/16 of the processed area on each axis.
++ * A raw stream gives the frames of the capture device.
++ *
++ * With one processed stream, YUYV goes to the scaled output and any other
++ * format to the main output as NV12. With two, a YUYV stream next to one of
++ * another format goes to the scaled output, otherwise the larger one goes to
++ * the main output and the smaller one to the scaled output. The scaled
++ * stream keeps the aspect ratio of the processed area.
++ */
++class MtkIsp50StreamPlan
++{
++public:
++	/* Limits of the DIP */
++	static constexpr Size kIspMinSize{ 128, 64 };
++	static constexpr Size kScaledMinSize{ 32, 16 };
++	static constexpr unsigned int kScaleMaxDown = 16;
++
++	/*
++	 * Sensor modes in rising size; without the ISP every stream is raw,
++	 * without the scaled output there is one processed stream
++	 */
++	MtkIsp50StreamPlan(const std::vector<Size> &modes, bool ispAvailable,
++			   bool scaledAvailable = true);
++
++	/*
++	 * Assign the streams to the outputs, choose the sensor mode and the
++	 * processed area, bound the sizes and set the formats of the
++	 * processed streams. Streams beyond one raw and two processed ones
++	 * are dropped. The raw stream gets the size of the mode, its format
++	 * is left to the caller.
++	 */
++	CameraConfiguration::Status plan(std::vector<StreamConfiguration> &configs);
++
++	/* Results: indices into the configurations, -1 for none */
++	int raw = -1;
++	int main = -1;
++	int scaled = -1;
++	Size mode;
++	Rectangle crop;
++
++	unsigned int outputs() const
++	{
++		return (main >= 0 ? MtkIsp50OutputMain : 0) |
++		       (scaled >= 0 ? MtkIsp50OutputScaled : 0);
++	}
++
++	/* A width of the processed area the tile computation serves */
++	static unsigned int ispWidth(unsigned int width);
++	/* The largest centred area of the mode with the aspect ratio of @size */
++	static Rectangle areaFor(const Size &mode, const Size &size);
++	/* The scaled size for @wanted from @area: limits, aspect ratio, even */
++	static Size fitScaled(const Size &area, const Size &wanted);
++	/* The smallest mode covering @size, or the largest mode */
++	Size modeFor(const Size &size) const;
++
++private:
++	std::vector<Size> modes_;
++	bool ispAvailable_;
++	bool scaledAvailable_;
++};
++
++} /* namespace libcamera */
 diff --git a/test/meson.build b/test/meson.build
 index 86dcc9c..b19c26f 100644
 --- a/test/meson.build
@@ -9964,12 +10826,267 @@ index 86dcc9c..b19c26f 100644
  subdir('process')
  subdir('py')
  subdir('serialization')
+diff --git a/test/mtkisp50/af.cpp b/test/mtkisp50/af.cpp
+new file mode 100644
+index 0000000..5554fee
+--- /dev/null
++++ b/test/mtkisp50/af.cpp
+@@ -0,0 +1,249 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * mtkisp50 IPA: autofocus state over a new configuration of the camera
++ */
++
++#include <cmath>
++#include <cstring>
++#include <iostream>
++#include <map>
++#include <memory>
++#include <string>
++#include <unistd.h>
++
++#include <linux/v4l2-controls.h>
++
++#include <libcamera/base/file.h>
++#include <libcamera/base/memfd.h>
++
++#include <libcamera/control_ids.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "mtkisp50/algorithms/af.h"
++#include "mtkisp50/ipa_context.h"
++
++#include "test.h"
++
++using namespace libcamera;
++using namespace libcamera::ipa::mtkisp50;
++
++namespace {
++
++/* Lens 468 at 0.1 dpt to 775 at 10 dpt; search over the whole range */
++const char *kTuning = R"(%YAML 1.1
++---
++Af:
++  map: [ 0.1, 468, 10.0, 775 ]
++  default: 0.4
++  range: [ -0.8, 10.5 ]
++  step: 1.25
++  mode: auto
++  settleFrames: 2
++)";
++
++/* The scene is sharpest at this lens position */
++constexpr int32_t kSharpAt = 620;
++
++/*
++ * The autofocus between a simulated sensor and lens: statistics every
++ * frame, a focus grid whose contrast peaks at kSharpAt, the lens taking a
++ * new position two frames after the command.
++ */
++class Sim
++{
++public:
++	Sim()
++		: ctx_(16)
++	{
++		ControlInfoMap::Map map;
++		map.emplace(&focusId_, ControlInfo(0, 1023, 0));
++		ctx_.lensControls = ControlInfoMap(std::move(map), idMap_);
++		ctx_.sensorInfo.outputSize = Size(2304, 1728);
++	}
++
++	int init()
++	{
++		UniqueFD fd = MemFd::create("mtkisp50-af-tuning", 0);
++		if (!fd.isValid() || write(fd.get(), kTuning, strlen(kTuning)) < 0)
++			return -EIO;
++
++		File file("/proc/self/fd/" + std::to_string(fd.get()));
++		if (!file.open(File::OpenModeFlag::ReadOnly))
++			return -EIO;
++
++		tuning_ = YamlParser::parse(file);
++		if (!tuning_)
++			return -EINVAL;
++
++		return af_.init(ctx_, (*tuning_)["Af"]);
++	}
++
++	/* A new configuration: the IPA starts with a new active state */
++	void configure()
++	{
++		ctx_.activeState = {};
++		ctx_.activeState.blc.level = 16;
++		IPAConfigInfo config{};
++		af_.configure(ctx_, config);
++		frame_ = 0;
++	}
++
++	ControlList frame(const ControlList *request = nullptr)
++	{
++		const uint32_t n = frame_++;
++		IPAFrameContext fc;
++		if (request)
++			af_.queueRequest(ctx_, n, fc, *request);
++
++		auto it = pending_.find(n);
++		if (it != pending_.end()) {
++			effective_ = it->second;
++			pending_.erase(it);
++		}
++
++		DipFrameParams params;
++		af_.prepare(ctx_, n, fc, &params);
++
++		stats_.valid = true;
++		stats_.afGridValid = true;
++		stats_.afGridWidth = 16;
++		stats_.afGridHeight = 12;
++		stats_.afCellSize = 16;
++		stats_.afCellSamples = 64;
++		const double d = (effective_ - kSharpAt) / 40.0;
++		const double amplitude = 20.0 + 1000.0 * std::exp(-d * d);
++		for (unsigned int y = 0; y < 12; y++)
++			for (unsigned int x = 0; x < 16; x++)
++				stats_.afGrid[y * 16 + x] =
++					static_cast<uint32_t>(64 * (2000 + ((x + y) & 1 ? amplitude : -amplitude)));
++
++		ControlList metadata(controls::controls);
++		ctx_.activeState.agc.converging = false;
++		af_.process(ctx_, n, fc, &stats_, metadata);
++
++		if (ctx_.activeState.af.update) {
++			lens = ctx_.activeState.af.lensPosition;
++			pending_[n + 2] = lens;
++			ctx_.activeState.af.update = false;
++			moves++;
++		}
++
++		return metadata;
++	}
++
++	/* Frames until the state is one of Focused or Failed, -1 if none */
++	int untilDone(unsigned int limit)
++	{
++		for (unsigned int i = 0; i < limit; i++) {
++			ControlList md = frame();
++			auto state = md.get(controls::AfState);
++			if (state && (*state == controls::AfStateFocused ||
++				      *state == controls::AfStateFailed))
++				return *state;
++		}
++		return -1;
++	}
++
++	IPAContext &ctx() { return ctx_; }
++
++	int32_t lens = 0;
++	unsigned int moves = 0;
++
++private:
++	ControlId focusId_{ V4L2_CID_FOCUS_ABSOLUTE, "Focus, Absolute", "v4l2",
++			    ControlTypeInteger32, ControlId::Direction::In };
++	ControlIdMap idMap_{ { V4L2_CID_FOCUS_ABSOLUTE, &focusId_ } };
++	IPAContext ctx_;
++	std::unique_ptr<ValueNode> tuning_;
++	algorithms::Af af_;
++	Statistics stats_{};
++	std::map<uint32_t, int32_t> pending_;
++	int32_t effective_ = 0;
++	uint32_t frame_ = 0;
++};
++
++ControlList trigger()
++{
++	ControlList c(controls::controls);
++	c.set(controls::AfMode, controls::AfModeAuto);
++	c.set(controls::AfTrigger, controls::AfTriggerStart);
++	return c;
++}
++
++} /* namespace */
++
++class MtkIsp50AfTest : public Test
++{
++protected:
++	int fail(const std::string &what)
++	{
++		std::cerr << what << std::endl;
++		return TestFail;
++	}
++
++	int run() override
++	{
++		/* Scan to the sharp position, then run on for many frames */
++		Sim sim;
++		if (sim.init())
++			return fail("init");
++
++		sim.configure();
++		sim.frame();
++		ControlList start = trigger();
++		sim.frame(&start);
++		if (sim.untilDone(200) != controls::AfStateFocused ||
++		    std::abs(sim.lens - kSharpAt) > 20)
++			return fail("first scan: lens " + std::to_string(sim.lens));
++
++		const int32_t focused = sim.lens;
++		for (unsigned int i = 0; i < 300; i++)
++			sim.frame();
++
++		/* New configuration (a mode change): lens and state stay */
++		sim.moves = 0;
++		sim.configure();
++		if (sim.ctx().activeState.af.lensPosition != focused ||
++		    !sim.ctx().activeState.af.update)
++			return fail("lens not kept over the configuration");
++
++		ControlList md = sim.frame();
++		if (md.get(controls::AfState) != controls::AfStateFocused)
++			return fail("state not kept over the configuration");
++
++		for (unsigned int i = 0; i < 30; i++)
++			sim.frame();
++		if (sim.lens != focused || sim.moves != 1)
++			return fail("lens moved after the configuration: " +
++				    std::to_string(sim.moves) + " moves");
++
++		/*
++		 * Frame numbers start again: a scan of the new session
++		 * measures (the frame counters of the old one would hold it).
++		 */
++		ControlList again = trigger();
++		sim.frame(&again);
++		const unsigned int before = sim.moves;
++		if (sim.untilDone(200) != controls::AfStateFocused || sim.moves == before ||
++		    std::abs(sim.lens - kSharpAt) > 20)
++			return fail("scan after the configuration");
++
++		/* Manual position over a configuration */
++		ControlList manual(controls::controls);
++		manual.set(controls::AfMode, controls::AfModeManual);
++		manual.set(controls::LensPosition, 5.0f);
++		sim.frame(&manual);
++		sim.frame();
++		const int32_t manualLens = sim.lens;
++		sim.configure();
++		md = sim.frame();
++		if (sim.ctx().activeState.af.lensPosition != manualLens ||
++		    md.get(controls::AfMode) != controls::AfModeManual)
++			return fail("manual position not kept");
++
++		return TestPass;
++	}
++};
++
++TEST_REGISTER(MtkIsp50AfTest)
 diff --git a/test/mtkisp50/frames.cpp b/test/mtkisp50/frames.cpp
 new file mode 100644
-index 0000000..bc32f15
+index 0000000..42b7cdc
 --- /dev/null
 +++ b/test/mtkisp50/frames.cpp
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,431 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * mtkisp50 pipeline: per request bookkeeping and the order of the ISP queues
@@ -10012,6 +11129,18 @@ index 0000000..bc32f15
 +		return failOutput ? -EINVAL : 0;
 +	}
 +
++	int queueScaled(FrameBuffer *buffer) override
++	{
++		log.push_back("scaled:" + name(buffer));
++		return failScaled ? -EINVAL : 0;
++	}
++
++	int setOutputs(unsigned int outputs) override
++	{
++		log.push_back("outputs:" + std::to_string(outputs));
++		return failOutputs ? -EPIPE : 0;
++	}
++
 +	std::string name(const FrameBuffer *buffer) const
 +	{
 +		return std::to_string(buffer->cookie());
@@ -10021,6 +11150,8 @@ index 0000000..bc32f15
 +	bool failRaw = false;
 +	bool failParams = false;
 +	bool failOutput = false;
++	bool failScaled = false;
++	bool failOutputs = false;
 +};
 +
 +std::vector<std::unique_ptr<FrameBuffer>> makeBuffers(unsigned int count, unsigned int first)
@@ -10209,6 +11340,179 @@ index 0000000..bc32f15
 +				return fail("clear");
 +		}
 +
++		return testScheduling();
++	}
++
++	/* Back from the ISP: the buffers of the job, as the handler sees them */
++	static void back(MtkIsp50Frames &frames, MtkIsp50Frames::Info *info)
++	{
++		info->rawDone = true;
++		info->outputDone = true;
++		info->scaledDone = true;
++		info->paramsDone = true;
++		frames.ispJobBack(info);
++		info->metadataDone = true;
++		frames.tryComplete(info);
++	}
++
++	/* Jobs with different outputs: switching only between jobs */
++	int testScheduling()
++	{
++		auto params = makeBuffers(8, 100);
++		auto stats = makeBuffers(8, 200);
++		auto raw = makeBuffers(4, 300);
++		auto main = makeBuffers(2, 400);
++		auto scaled = makeBuffers(4, 500);
++		constexpr unsigned int both = MtkIsp50OutputMain | MtkIsp50OutputScaled;
++
++		MtkIsp50Frames frames;
++		frames.init(params, stats);
++		frames.startIsp(both);
++		MtkIsp50Frames::Info *failed = nullptr;
++
++		/* Viewfinder, viewfinder + still, viewfinder: still waits for the ISP */
++		{
++			RecordingQueue queue;
++			auto *a = frames.create(0, nullptr, raw[0].get(), false, nullptr, scaled[0].get());
++			auto *b = frames.create(1, nullptr, raw[1].get(), false, main[0].get(),
++						scaled[1].get());
++			auto *c = frames.create(2, nullptr, raw[2].get(), false, nullptr, scaled[2].get());
++
++			if (MtkIsp50Frames::outputsOf(a) != MtkIsp50OutputScaled ||
++			    MtkIsp50Frames::outputsOf(b) != both)
++				return fail("outputs of the frames");
++
++			frames.submitIspJob(a, 64);
++			frames.submitIspJob(b, 64);
++			frames.submitIspJob(c, 0);
++			if (frames.runIspJobs(queue, &failed))
++				return fail("scheduling failed");
++
++			/* a switches the main output off, b waits for a */
++			if (!logIs(queue, { "outputs:2", "raw:300", "params:100:64", "scaled:500" }) ||
++			    frames.ispBusy() != 1 || frames.ispWaiting() != 2 ||
++			    frames.ispOutputs() != MtkIsp50OutputScaled)
++				return fail("first job");
++
++			/* Part of a back is not enough */
++			a->rawDone = true;
++			if (frames.ispJobBack(a) || frames.ispBusy() != 1)
++				return fail("job back with the output in the ISP");
++
++			queue.log.clear();
++			back(frames, a);
++			if (frames.ispBusy() || frames.runIspJobs(queue, &failed))
++				return fail("job not back");
++
++			/* b switches main on; c waits for b */
++			if (!logIs(queue, { "outputs:3", "raw:301", "params:101:64", "output:400",
++					    "scaled:501" }) ||
++			    frames.ispBusy() != 1 || frames.ispWaiting() != 1)
++				return fail("still job");
++
++			queue.log.clear();
++			back(frames, b);
++			if (frames.runIspJobs(queue, &failed) ||
++			    !logIs(queue, { "outputs:2", "raw:302", "scaled:502" }))
++				return fail("viewfinder after the still");
++
++			/* Same outputs: no switch, no wait */
++			auto *d = frames.create(3, nullptr, raw[3].get(), false, nullptr, scaled[3].get());
++			queue.log.clear();
++			frames.submitIspJob(d, 0);
++			if (frames.runIspJobs(queue, &failed) ||
++			    !logIs(queue, { "raw:303", "scaled:503" }) || frames.ispBusy() != 2)
++				return fail("jobs with the same outputs");
++
++			back(frames, c);
++			back(frames, d);
++			if (frames.ispBusy() || frames.size())
++				return fail("frames left");
++		}
++
++		/* Held (stop, restart): nothing goes */
++		{
++			RecordingQueue queue;
++			auto *a = frames.create(10, nullptr, raw[0].get(), false, main[0].get(),
++						scaled[0].get());
++			frames.holdIsp(true);
++			frames.submitIspJob(a, 0);
++			if (frames.runIspJobs(queue, &failed) || !queue.log.empty())
++				return fail("job queued while held");
++
++			frames.holdIsp(false);
++			if (frames.runIspJobs(queue, &failed) ||
++			    !logIs(queue, { "outputs:3", "raw:300", "output:400", "scaled:500" }))
++				return fail("job not queued after the hold");
++			back(frames, a);
++		}
++
++		/* Outputs refused: the frame fails alone, the next one tries again */
++		{
++			RecordingQueue queue;
++			queue.failOutputs = true;
++			auto *a = frames.create(20, nullptr, raw[0].get(), false, nullptr, scaled[0].get());
++			auto *b = frames.create(21, nullptr, raw[1].get(), false, nullptr, scaled[1].get());
++			frames.submitIspJob(a, 0);
++			frames.submitIspJob(b, 0);
++
++			if (frames.runIspJobs(queue, &failed) != -EPIPE || failed != a ||
++			    !a->error || a->ispQueued || !a->rawDone || !a->scaledDone ||
++			    frames.ispWaiting() != 1)
++				return fail("refused outputs");
++
++			queue.failOutputs = false;
++			queue.log.clear();
++			if (frames.runIspJobs(queue, &failed) ||
++			    !logIs(queue, { "outputs:2", "raw:301", "scaled:501" }))
++				return fail("next job after refused outputs");
++
++			a->metadataDone = true;
++			if (!frames.tryComplete(a))
++				return fail("failed frame not completed");
++			back(frames, b);
++		}
++
++		/* Scaled refused: main is in the ISP, the restart returns it */
++		{
++			RecordingQueue queue;
++			queue.failScaled = true;
++			auto *a = frames.create(30, nullptr, raw[0].get(), false, main[0].get(),
++						scaled[0].get());
++			frames.submitIspJob(a, 0);
++			if (frames.runIspJobs(queue, &failed) != -EINVAL || failed != a ||
++			    !a->ispQueued || !a->outputQueued || a->scaledQueued ||
++			    a->outputDone || !a->scaledDone || frames.ispBusy() != 1)
++				return fail("refused scaled buffer");
++
++			if (frames.findOutput(main[0].get()) != a || frames.findScaled(scaled[0].get()))
++				return fail("lookup after refused scaled buffer");
++
++			back(frames, a);
++			if (frames.ispBusy() || frames.size())
++				return fail("frame after restart");
++		}
++
++		/* A waiting frame removed (stop) leaves the queue */
++		{
++			RecordingQueue queue;
++			auto *a = frames.create(40, nullptr, raw[0].get(), false, main[0].get(), nullptr);
++			auto *b = frames.create(41, nullptr, raw[1].get(), false, nullptr, scaled[1].get());
++			frames.submitIspJob(a, 0);
++			frames.submitIspJob(b, 0);
++			frames.runIspJobs(queue, &failed);
++			if (frames.ispWaiting() != 1)
++				return fail("frame not waiting");
++
++			frames.remove(b);
++			if (frames.ispWaiting())
++				return fail("removed frame still waiting");
++
++			frames.clear();
++			if (frames.ispBusy() || frames.ispWaiting())
++				return fail("clear of the scheduling");
++		}
++
 +		return TestPass;
 +	}
 +};
@@ -10216,10 +11520,10 @@ index 0000000..bc32f15
 +TEST_REGISTER(MtkIsp50FramesTest)
 diff --git a/test/mtkisp50/meson.build b/test/mtkisp50/meson.build
 new file mode 100644
-index 0000000..ed03f3f
+index 0000000..c28fd98
 --- /dev/null
 +++ b/test/mtkisp50/meson.build
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,50 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +if 'mtkisp50' not in pipelines
@@ -10234,6 +11538,7 @@ index 0000000..ed03f3f
 +
 +mtkisp50_tests = [
 +    {'name': 'mtkisp50-frames', 'sources': ['frames.cpp']},
++    {'name': 'mtkisp50-streams', 'sources': ['streams.cpp']},
 +]
 +
 +# Comparison with the statistics of the software ISP
@@ -10244,11 +11549,28 @@ index 0000000..ed03f3f
 +    }
 +endif
 +
++# The autofocus of the IPA over a new configuration
++mtkisp50_tests += {
++    'name': 'mtkisp50-af',
++    'sources': [
++        'af.cpp',
++        '../../src/ipa/mtkisp50/algorithms/af.cpp',
++        '../../src/ipa/mtkisp50/algorithms/af_search.cpp',
++        '../../src/ipa/mtkisp50/ipa_context.cpp',
++    ],
++    'ipa': true,
++}
++
 +foreach test : mtkisp50_tests
 +    exe = executable(test['name'], test['sources'],
-+                     dependencies : libcamera_private,
++                     dependencies : test.get('ipa', false)
++                                    ? [libcamera_private, libipa_dep]
++                                    : libcamera_private,
 +                     link_with : test_libraries,
-+                     include_directories : mtkisp50_includes)
++                     include_directories : test.get('ipa', false)
++                                           ? [mtkisp50_includes,
++                                              include_directories('../../src/ipa/mtkisp50')]
++                                           : mtkisp50_includes)
 +
 +    test(test['name'], exe, suite : 'mtkisp50')
 +endforeach
@@ -10630,3 +11952,263 @@ index 0000000..bb16fec
 +};
 +
 +TEST_REGISTER(MtkIsp50RawStatsTest)
+diff --git a/test/mtkisp50/streams.cpp b/test/mtkisp50/streams.cpp
+new file mode 100644
+index 0000000..a811b90
+--- /dev/null
++++ b/test/mtkisp50/streams.cpp
+@@ -0,0 +1,254 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * mtkisp50 pipeline: assignment of the streams to the outputs of the ISP
++ */
++
++#include <iostream>
++#include <string>
++#include <vector>
++
++#include <libcamera/formats.h>
++#include <libcamera/stream.h>
++
++#include "streams.h"
++
++#include "test.h"
++
++using namespace libcamera;
++
++namespace {
++
++/* The modes of the main camera: 4x4 and 2x2 binned, both the whole field */
++const std::vector<Size> kModes = { { 2304, 1728 }, { 4624, 3472 } };
++
++StreamConfiguration stream(PixelFormat format, Size size)
++{
++	StreamConfiguration cfg;
++	cfg.pixelFormat = format;
++	cfg.size = size;
++	return cfg;
++}
++
++} /* namespace */
++
++class MtkIsp50StreamsTest : public Test
++{
++protected:
++	int fail(const std::string &what, const std::vector<StreamConfiguration> &configs)
++	{
++		std::cerr << what << ":";
++		for (const StreamConfiguration &cfg : configs)
++			std::cerr << " " << cfg.toString();
++		std::cerr << std::endl;
++		return TestFail;
++	}
++
++	int run() override
++	{
++		const PixelFormat raw10 = formats::SBGGR10_MTISP;
++		using Status = CameraConfiguration::Status;
++
++		/* Viewfinder alone: NV12 crop of the small mode, as before */
++		{
++			std::vector<StreamConfiguration> c = { stream(formats::XRGB8888, { 2304, 1728 }) };
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Adjusted || plan.main != 0 || plan.scaled != -1 ||
++			    c[0].pixelFormat != formats::NV12 || c[0].size != Size(2304, 1728) ||
++			    plan.mode != Size(2304, 1728) || plan.crop != Rectangle(0, 0, 2304, 1728))
++				return fail("viewfinder alone", c);
++		}
++
++		/* NV12 1920x1080 alone: crop of the small mode, valid */
++		{
++			std::vector<StreamConfiguration> c = { stream(formats::NV12, { 1920, 1080 }) };
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Valid || plan.mode != Size(2304, 1728) ||
++			    plan.crop != Rectangle(192, 324, 1920, 1080))
++				return fail("NV12 1920x1080", c);
++		}
++
++		/* Video: YUYV 1920x1080 scaled from 16:9 of the whole large mode */
++		{
++			std::vector<StreamConfiguration> c = { stream(formats::YUYV, { 1920, 1080 }) };
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Valid || plan.scaled != 0 || plan.main != -1 ||
++			    plan.mode != Size(4624, 3472) ||
++			    plan.crop != Rectangle(0, 436, 4624, 2600) ||
++			    c[0].size != Size(1920, 1080) || plan.outputs() != MtkIsp50OutputScaled)
++				return fail("video", c);
++		}
++
++		/* Small YUYV: the small mode is enough */
++		{
++			std::vector<StreamConfiguration> c = { stream(formats::YUYV, { 640, 480 }) };
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Valid || plan.mode != Size(2304, 1728) ||
++			    plan.crop != Rectangle(0, 0, 2304, 1728))
++				return fail("small YUYV", c);
++		}
++
++		/* YUYV larger than half the large mode: bounded with its ratio */
++		{
++			std::vector<StreamConfiguration> c = { stream(formats::YUYV, { 4000, 3000 }) };
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Adjusted || plan.mode != Size(4624, 3472) ||
++			    c[0].size != Size(2312, 1734))
++				return fail("large YUYV", c);
++		}
++
++		/* Viewfinder + still: still main, viewfinder scaled, same area */
++		{
++			std::vector<StreamConfiguration> c = {
++				stream(formats::YUYV, { 2304, 1728 }),
++				stream(formats::NV12, { 4624, 3472 }),
++			};
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Valid || plan.main != 1 || plan.scaled != 0 ||
++			    plan.mode != Size(4624, 3472) ||
++			    plan.crop != Rectangle(0, 0, 4624, 3472) ||
++			    plan.outputs() != (MtkIsp50OutputMain | MtkIsp50OutputScaled))
++				return fail("viewfinder + still", c);
++		}
++
++		/* Two of the same format: the larger one is the main output */
++		{
++			std::vector<StreamConfiguration> c = {
++				stream(formats::NV12, { 2304, 1728 }),
++				stream(formats::NV12, { 4624, 3472 }),
++			};
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Adjusted || plan.main != 1 || plan.scaled != 0 ||
++			    c[0].pixelFormat != formats::YUYV || c[0].size != Size(2304, 1728))
++				return fail("two NV12", c);
++		}
++
++		/* Viewfinder 4:3 next to a 16:9 video: ratio and limit of the area */
++		{
++			std::vector<StreamConfiguration> c = {
++				stream(formats::YUYV, { 1280, 960 }),
++				stream(formats::NV12, { 1920, 1080 }),
++			};
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Adjusted || plan.mode != Size(2304, 1728) ||
++			    c[0].size != Size(960, 540) || c[1].size != Size(1920, 1080))
++				return fail("viewfinder + video", c);
++		}
++
++		/* Scaled larger than half the main output: bounded */
++		{
++			std::vector<StreamConfiguration> c = {
++				stream(formats::NV12, { 2304, 1728 }),
++				stream(formats::YUYV, { 2304, 1728 }),
++			};
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Adjusted || plan.main != 0 ||
++			    c[1].size != Size(1152, 864))
++				return fail("scaled too large", c);
++		}
++
++		/* Smaller than 1/16: up to the limit */
++		{
++			std::vector<StreamConfiguration> c = {
++				stream(formats::NV12, { 4624, 3472 }),
++				stream(formats::YUYV, { 160, 120 }),
++			};
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Adjusted || c[1].size != Size(290, 218))
++				return fail("scaled too small", c);
++		}
++
++		/* Raw + viewfinder + still: all three, raw chooses the mode */
++		{
++			std::vector<StreamConfiguration> c = {
++				stream(formats::YUYV, { 2304, 1728 }),
++				stream(formats::NV12, { 4624, 3472 }),
++				stream(raw10, { 4624, 3472 }),
++			};
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Valid || plan.raw != 2 || plan.main != 1 ||
++			    plan.scaled != 0)
++				return fail("raw + viewfinder + still", c);
++		}
++
++		/* Raw of the small mode bounds the main output */
++		{
++			std::vector<StreamConfiguration> c = {
++				stream(formats::NV12, { 4624, 3472 }),
++				stream(raw10, { 2304, 1728 }),
++			};
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Adjusted || plan.mode != Size(2304, 1728) ||
++			    c[0].size != Size(2304, 1728))
++				return fail("raw bounds main", c);
++		}
++
++		/* A third processed stream and a second raw one are dropped */
++		{
++			std::vector<StreamConfiguration> c = {
++				stream(formats::NV12, { 4624, 3472 }),
++				stream(raw10, { 4624, 3472 }),
++				stream(formats::YUYV, { 1920, 1080 }),
++				stream(formats::NV12, { 640, 480 }),
++				stream(raw10, { 2304, 1728 }),
++			};
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Adjusted || c.size() != 3 || plan.main != 0 ||
++			    plan.raw != 1 || plan.scaled != 2 || c[1].size != Size(4624, 3472))
++				return fail("too many streams", c);
++		}
++
++		/* Without the scaled output: one processed stream, NV12 */
++		{
++			std::vector<StreamConfiguration> c = {
++				stream(formats::YUYV, { 1920, 1080 }),
++				stream(formats::NV12, { 4624, 3472 }),
++			};
++			MtkIsp50StreamPlan plan(kModes, true, false);
++			if (plan.plan(c) != Status::Adjusted || c.size() != 1 || plan.main != 0 ||
++			    plan.scaled != -1 || c[0].pixelFormat != formats::NV12 ||
++			    c[0].size != Size(1920, 1080))
++				return fail("no scaled output", c);
++		}
++
++		/* Without the ISP: the first stream becomes raw */
++		{
++			std::vector<StreamConfiguration> c = {
++				stream(formats::NV12, { 1920, 1080 }),
++				stream(formats::YUYV, { 640, 480 }),
++			};
++			MtkIsp50StreamPlan plan(kModes, false);
++			if (plan.plan(c) != Status::Adjusted || c.size() != 1 || plan.raw != 0 ||
++			    plan.outputs() || plan.mode != Size(2304, 1728))
++				return fail("no ISP", c);
++		}
++
++		/* Widths of the processed area the tiles cannot serve */
++		if (MtkIsp50StreamPlan::ispWidth(4540) != 4510 ||
++		    MtkIsp50StreamPlan::ispWidth(1920) != 1920 ||
++		    MtkIsp50StreamPlan::ispWidth(690) != 688) {
++			std::cerr << "band widths" << std::endl;
++			return TestFail;
++		}
++
++		/* NV12 in a band: rounded down */
++		{
++			std::vector<StreamConfiguration> c = { stream(formats::NV12, { 4540, 3000 }) };
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Adjusted || c[0].size != Size(4510, 3000) ||
++			    plan.crop.x % 4)
++				return fail("main in a band", c);
++		}
++
++		/* Nothing asked */
++		{
++			std::vector<StreamConfiguration> c;
++			MtkIsp50StreamPlan plan(kModes, true);
++			if (plan.plan(c) != Status::Invalid)
++				return fail("empty", c);
++		}
++
++		return TestPass;
++	}
++};
++
++TEST_REGISTER(MtkIsp50StreamsTest)
