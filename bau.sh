@@ -19,6 +19,8 @@
 #   ./bau.sh schluessel <quelle>                  Eingabeschluessel und seine Bestandteile (ohne Docker)
 #
 # alle = Pakete mit STATUS=aktiv, image = Pakete mit IMAGE_AN=1 (die ein Rootfs-Bau installiert).
+# ART=upstream in paket.conf: Quelle ohne Debian-Paketierung (fester Upstream-Commit, debian/ in diesem Repo,
+# Rust-Kisten aus Cargo.lock), siehe upstream_holen.
 # Ausgaben unter $PAKETE_OUT (Standard: out/ in diesem Repo): dl/ (Debian-Quellen), bau/<quelle>/<fassung>/,
 # repo/ (reprepro, Suite wie in pakete.conf, arm64 + source; repo/stand/<quelle> = Fassung und Schluessel), nachziehen/.
 # Umgebung: PAKETE_OUT, PAKETE_ERGEBNIS (Ordner: Ergebnis jedes Baus zusaetzlich nach <ordner>/<quelle>/, fuer einlegen),
@@ -61,9 +63,16 @@ lade_conf() {   # lade_conf <quelle>: Variablen aus <quelle>/paket.conf
 	local q=$1
 	[ -f "$R/$q/paket.conf" ] || fehler "unbekanntes Paket $q ($R/$q/paket.conf fehlt)"
 	QUELLE= DEBIAN= DSC_SHA256= REVISION= OPTIONEN=nocheck PROFILE= BAUART=source,any IMAGE= IMAGE_AN=0 STATUS=aktiv DATEIEN_KOPF= CHANGELOG= PRUEFEN= FEHLT_ERLAUBT=
+	ART=debian UPSTREAM_URL= UPSTREAM_TAR_SHA256= CARGO_VENDOR=0
 	. "$R/$q/paket.conf"
 	[ "$QUELLE" = "$q" ] || fehler "$q/paket.conf: QUELLE=$QUELLE passt nicht zum Ordner"
 	[ -n "$REVISION" ] || fehler "$q/paket.conf: REVISION fehlt"
+	case $ART in
+		debian) ;;
+		upstream) [ -n "$UPSTREAM_URL" ] && [ -n "$UPSTREAM_TAR_SHA256" ] && [ -d "$R/$q/debian" ] \
+			|| fehler "$q/paket.conf: ART=upstream braucht UPSTREAM_URL, UPSTREAM_TAR_SHA256 und $q/debian/" ;;
+		*) fehler "$q/paket.conf: ART=$ART unbekannt (debian oder upstream)" ;;
+	esac
 	OHNE_EPOCHE=${DEBIAN#*:}
 	FASSUNG=$DEBIAN+$VERSION_TAG$REVISION
 	FASSUNG_DATEI=${FASSUNG#*:}
@@ -102,6 +111,7 @@ for h,infos in d["fileinfo"].items():
     if any(i["name"]==n for i in infos): print("https://snapshot.debian.org/file/"+h); break' "$1"
 }
 quelle_holen() {
+	[ "$ART" = debian ] || { upstream_holen; return; }
 	D=$O/dl/$QUELLE/$OHNE_EPOCHE
 	mkdir -p "$D"
 	local dsc=${QUELLE}_$OHNE_EPOCHE.dsc
@@ -120,9 +130,55 @@ quelle_holen() {
 	done
 }
 
+# ---------------- Upstream-Quelle ohne Debian-Paketierung (ART=upstream) ----------------
+# Fester Commit als Archiv (UPSTREAM_URL), geprueft ueber die Pruefsumme des entpackten tar (UPSTREAM_TAR_SHA256:
+# der Inhalt aus git archive ist fest, die gzip-Kompression des Anbieters nicht zugesichert). Mit CARGO_VENDOR=1
+# jede Kiste aus dem Cargo.lock des Archivs von crates.io, geprueft gegen die Pruefsumme in Cargo.lock (andere Quellen
+# als crates.io: Fehler). quelle-upstream.sh baut daraus im Repo-Container ohne Netz das Debian-Quellpaket
+# (orig.tar.gz = Archiv, orig-vendor.tar.xz = vendor/ mit allen Kisten, debian/ aus <quelle>/debian); danach geht
+# der Bau weiter wie bei einem Debian-Quellpaket. DEBIAN in paket.conf ist die Fassung aus <quelle>/debian/changelog.
+upstream_holen() {
+	local U=$O/dl/$QUELLE/upstream K=$O/dl/$QUELLE/crates a top n v c f
+	D=$O/dl/$QUELLE/$OHNE_EPOCHE
+	mkdir -p "$U" "$K"
+	a=$U/$(basename "$UPSTREAM_URL")
+	if ! [ -f "$a" ] || [ "$(gzip -dc "$a" 2>/dev/null | sha256sum | cut -d' ' -f1)" != "$UPSTREAM_TAR_SHA256" ]; then
+		find "$U" -mindepth 1 -delete
+		echo "lade $UPSTREAM_URL"
+		hole "$UPSTREAM_URL" "$a" || fehler "$UPSTREAM_URL nicht ladbar"
+		[ "$(gzip -dc "$a" | sha256sum | cut -d' ' -f1)" = "$UPSTREAM_TAR_SHA256" ] \
+			|| fehler "Pruefsumme des entpackten Upstream-Archivs passt nicht zu UPSTREAM_TAR_SHA256"
+	fi
+	: > "$K/liste"
+	if [ "$CARGO_VENDOR" = 1 ]; then
+		top=$(tar -tzf "$a" | awk -F/ 'NR == 1 {print $1}')
+		tar -xzOf "$a" "$top/Cargo.lock" > "$K/Cargo.lock" || fehler "Cargo.lock fehlt im Upstream-Archiv"
+		if grep '^source = ' "$K/Cargo.lock" | grep -qv '^source = "registry+https://github.com/rust-lang/crates.io-index"$'; then
+			fehler "Cargo.lock nennt Quellen ausser crates.io: nicht unterstuetzt"
+		fi
+		awk '/^\[\[package\]\]/ {if (n != "" && c != "") print n, v, c; n = v = c = ""}
+			/^name = / {gsub(/"/, "", $3); n = $3} /^version = / {gsub(/"/, "", $3); v = $3}
+			/^checksum = / {gsub(/"/, "", $3); c = $3} END {if (n != "" && c != "") print n, v, c}' "$K/Cargo.lock" > "$K/liste"
+		echo "$(wc -l < "$K/liste") Kisten aus Cargo.lock"
+		while read -r n v c; do
+			f=$K/$n-$v.crate
+			echo "$c  $f" | sha256sum -c --status 2>/dev/null && continue
+			rm -f "$f"
+			hole "https://static.crates.io/crates/$n/$n-$v.crate" "$f" || fehler "Kiste $n $v nicht ladbar"
+			echo "$c  $f" | sha256sum -c --status || fehler "Pruefsumme der Kiste $n $v passt nicht zu Cargo.lock"
+		done < "$K/liste"
+	fi
+	rm -rf "$D"; mkdir -p "$D"
+	docker run --rm --network none -e QUELLE -e DEBIAN -e CARGO_VENDOR="$CARGO_VENDOR" -e HUID="$(id -u)" -e HGID="$(id -g)" \
+		-v "$R/quelle-upstream.sh:/quelle-upstream.sh:ro" -v "$R/$QUELLE:/rezept:ro" -v "$U:/upstream:ro" \
+		-v "$K:/crates:ro" -v "$D:/out" "$REPOIMG" sh /quelle-upstream.sh || fehler "$QUELLE: Quellpaket nicht gebaut"
+}
+
 # ---------------- Eingabeschluessel ----------------
 # Alles, was das Ergebnis bestimmt: Suite/Spiegel/Snapshot, Rezept (pakete.conf, Dockerfile, bau-innen.sh), paket.conf
-# (Debian-Fassung, .dsc-Pruefsumme, Revision, Profile), Patches, zusaetzliche Dateien. Haengt nur von Dateien im Repo
+# (Debian-Fassung, .dsc-Pruefsumme, Revision, Profile), Patches, zusaetzliche Dateien; bei ART=upstream dazu
+# quelle-upstream.sh und <quelle>/debian/ (Upstream-Archiv und Kisten stehen ueber ihre Pruefsummen in paket.conf und
+# im Archiv fest). Haengt nur von Dateien im Repo
 # ab (kein Docker noetig), deshalb auf jedem Rechner und in der CI derselbe Schluessel.
 # Nicht enthalten: bau.sh (Aufrufschicht), der Stand des Bau-Images und der Bauabhaengigkeiten im Spiegel zum
 # Bauzeitpunkt (fest nur mit SNAPSHOT); nach einem neuen Bau-Image mit --neu bauen.
@@ -131,6 +187,7 @@ schluessel_teile() {
 	echo "suite=$SUITE snapshot=${SNAPSHOT:--} spiegel=$MIRROR"
 	(cd "$R" && sha256sum pakete.conf Dockerfile bau-innen.sh "$QUELLE/paket.conf" && { find "$QUELLE/patches" "$QUELLE/debian-patches" -maxdepth 1 -type f -name '*.patch' 2>/dev/null || true; } | LC_ALL=C sort | xargs -r sha256sum)
 	dateien | while read -r f; do echo "$(sha256sum < "$R/$QUELLE/dateien/$f" | cut -d' ' -f1)  $f"; done
+	[ "$ART" = debian ] || (cd "$R" && { echo quelle-upstream.sh; find "$QUELLE/debian" -type f; } | LC_ALL=C sort | xargs sha256sum)
 }
 schluessel() { schluessel_teile | sha256sum | cut -c1-16; }
 
@@ -318,7 +375,8 @@ pruefen() {
 	printf '%-14s %-22s %-22s %s\n' QUELLE "UNSERE BASIS" "DEBIAN $SUITE" STAND
 	while read -r q v; do
 		lade_conf "$q"
-		if [ "$v" = - ]; then s="nicht in $SUITE"
+		if [ "$ART" = upstream ]; then s="Upstream-Quelle, eigene Paketierung"
+		elif [ "$v" = - ]; then s="nicht in $SUITE"
 		elif [ "$v" = "$DEBIAN" ]; then s=aktuell
 		elif dpkg --compare-versions "$v" gt "$DEBIAN"; then s="NEUER: ./bau.sh nachziehen $q"; rc=3
 		else s="aelter in Debian"; fi
@@ -335,6 +393,7 @@ nachziehen() {   # nachziehen <quelle> [<fassung>] [--suite <s>] [--uebernehmen]
 		shift
 	done
 	lade_conf "$q"
+	[ "$ART" = debian ] || fehler "$q: ART=$ART, nachziehen gilt nur fuer Debian-Quellpakete (neuer Commit: paket.conf und debian/changelog von Hand)"
 	images
 	[ -n "$ziel" ] || ziel=$(debian_fassung "$s" "$q" | awk '{print $2}')
 	[ -n "$ziel" ] && [ "$ziel" != - ] || fehler "$q nicht in Debian $s"

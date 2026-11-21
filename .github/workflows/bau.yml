@@ -1,7 +1,8 @@
 # Builds the packages natively on the GitHub arm64 runner, only those whose inputs changed.
 #
 # Change detection: ./bau.sh schluessel <source> hashes everything that determines a package (suite, mirror,
-# snapshot, pakete.conf, Dockerfile, bau-innen.sh, <source>/paket.conf, <source>/patches/*.patch, <source>/dateien/).
+# snapshot, pakete.conf, Dockerfile, bau-innen.sh, <source>/paket.conf, <source>/patches/*.patch, <source>/dateien/;
+# for sources without a Debian package also quelle-upstream.sh and <source>/debian/).
 # Each package's build result is kept in the Actions cache under paket-<source>-<key>. A package whose key is in
 # the cache is restored instead of built; every run still uploads one artifact per package (<source>_<version>)
 # and the complete APT repository (apt-repo), so a run always carries all packages.
