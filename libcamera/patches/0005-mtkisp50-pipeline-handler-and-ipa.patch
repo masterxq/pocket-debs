@@ -33,13 +33,19 @@ Description:
    viewfinder and still capture in one configuration the still is a buffer
    in a request, without a new configuration of the camera. A job with
    other outputs than the streaming ones waits until the ISP is idle, then
-   the outputs are switched. Interim for the ISPDIP10 driver: the main
-   node gets the size of the processed area also when it does not stream.
+   the outputs are switched.
  - Controls: AeEnable, ExposureTimeMode/AnalogueGainMode with
    ExposureTime/AnalogueGain, ExposureValue, AeMeteringMode,
-   FrameDurationLimits, AwbEnable, AwbMode, ColourGains, ColourTemperature,
-   AfMode/AfTrigger/AfWindows/AfPause, LensPosition, ScalerCrop and
-   ScalerCropMaximum; AeState also for small steps at the limits.
+   FrameDurationLimits (also as a control of the start), AwbEnable,
+   AwbMode, ColourGains, ColourTemperature, AfMode/AfTrigger/AfWindows/
+   AfPause, LensPosition, ScalerCrop and ScalerCropMaximum;
+   AeState also for small steps at the limits;
+   FrameDuration in the metadata.
+ - Frame length: the exposure lengthens the frame (VBLANK) up to a tuned
+   factor, within the frame durations of the application; the reported
+   limits are the ones the regulation reaches in the mode. A scene too
+   dark for the focus measure does not hold the frame length while the
+   continuous autofocus waits.
  - Mode changes (preview to photo and back) keep exposure (with the frame
    length), white balance, lens position and focus state; no new search
    after the return. Optional zone metering after the lens shading.
@@ -48,7 +54,7 @@ Description:
    spare frame in the camera memory region.
  - Tests: bookkeeping and order of the ISP queues, scheduling of jobs with
    different outputs, stream planning (validate cases), autofocus over a
-   new configuration; CPU statistics against the software ISP statistics
+   new configuration, frame length of the exposure regulation; CPU statistics against the software ISP statistics
    frame by frame.
  .
  Applies on top of 0001, 0003 and 0004.
@@ -729,10 +735,10 @@ index 0000000..d3a5751
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/af.cpp b/src/ipa/mtkisp50/algorithms/af.cpp
 new file mode 100644
-index 0000000..955d628
+index 0000000..05773c1
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/af.cpp
-@@ -0,0 +1,754 @@
+@@ -0,0 +1,761 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast detect autofocus for the software ISP
@@ -985,6 +991,7 @@ index 0000000..955d628
 +			phase_ = Phase::Idle;
 +		}
 +
++		dark_ = false;
 +		context.activeState.af.busy = phase_ == Phase::Wait;
 +		levelIndex_ = 0;
 +		waitCount_ = 0;
@@ -1015,6 +1022,7 @@ index 0000000..955d628
 +	state_ = controls::AfStateIdle;
 +	phase_ = mode_ == controls::AfModeContinuous ? Phase::Wait : Phase::Idle;
 +	levelIndex_ = 0;
++	dark_ = false;
 +	context.activeState.af.busy = phase_ == Phase::Wait;
 +	waitCount_ = 0;
 +	steadyCount_ = 0;
@@ -1049,6 +1057,7 @@ index 0000000..955d628
 +{
 +	AfSearch::Config config;
 +
++	dark_ = false;
 +	config.min = toCode(rangeMin_);
 +	config.max = toCode(rangeMax_);
 +	config.climb = climb_;
@@ -1339,10 +1348,11 @@ index 0000000..955d628
 +
 +	lastPrepared_ = std::max(lastPrepared_, frame);
 +
-+	const bool busy = phase_ == Phase::Wait || phase_ == Phase::Scan;
-+	context.activeState.af.busy = busy;
-+	params->afStatsInterval = busy ? 1 : phase_ == Phase::Monitor ? monitorInterval_ : 0;
-+	params->afEveryFrame = busy;
++	/* The focus grid in every frame while waiting or scanning */
++	const bool measuring = phase_ == Phase::Wait || phase_ == Phase::Scan;
++	context.activeState.af.busy = phase_ == Phase::Scan || (phase_ == Phase::Wait && !dark_);
++	params->afStatsInterval = measuring ? 1 : phase_ == Phase::Monitor ? monitorInterval_ : 0;
++	params->afEveryFrame = measuring;
 +
 +	if (meteringWindows_ && !afWindow_.isNull() && sensorSize_.width && sensorSize_.height) {
 +		auto frac = [](int64_t v, unsigned int size) {
@@ -1423,8 +1433,11 @@ index 0000000..955d628
 +		if (m.sharpness < 0.0) {
 +			steadyCount_ = 0;
 +			waitCount_ = 0;
++			dark_ = true;
++			context.activeState.af.busy = false;
 +			break;
 +		}
++		dark_ = false;
 +
 +		/*
 +		 * No separate wait for the exposure: while it moves much the
@@ -1489,10 +1502,10 @@ index 0000000..955d628
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/af.h b/src/ipa/mtkisp50/algorithms/af.h
 new file mode 100644
-index 0000000..ded8135
+index 0000000..4a9cdee
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/af.h
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,129 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast detect autofocus for the software ISP
@@ -1599,6 +1612,12 @@ index 0000000..ded8135
 +	Rectangle afWindow_;
 +	unsigned int waitCount_ = 0;
 +	unsigned int exposureWait_ = 0;
++	/*
++	 * Waiting on a scene too dark to measure: nothing to hurry for, the
++	 * exposure may lengthen the frame (else it may never get bright
++	 * enough to measure)
++	 */
++	bool dark_ = false;
 +	static constexpr unsigned int kLevelHistory = 4;
 +	std::array<double, kLevelHistory> levelHistory_{};
 +	unsigned int levelIndex_ = 0;
@@ -2002,10 +2021,10 @@ index 0000000..d279ea8
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/agc.cpp b/src/ipa/mtkisp50/algorithms/agc.cpp
 new file mode 100644
-index 0000000..41db736
+index 0000000..00b468f
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/agc.cpp
-@@ -0,0 +1,997 @@
+@@ -0,0 +1,1084 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024, Red Hat Inc.
@@ -2285,21 +2304,23 @@ index 0000000..41db736
 +	agc.exposureMaxExtended = agc.exposureMax;
 +	agc.extensionGain = agc.againMax;
 +	agc.vblankEnabled = false;
-+	agc.vblankDefault = 0;
++	agc.frame = {};
++	agc.frame.defaultLines = static_cast<int32_t>(context.sensorInfo.minFrameLength);
++	agc.frame.exposureMax = agc.exposureMax;
 +
 +	const auto it = configInfo.sensorControls.find(V4L2_CID_VBLANK);
 +	if (maxExposureFactor_ > 1.0 && it != configInfo.sensorControls.end()) {
 +		const int32_t vblankDef = it->second.def().get<int32_t>();
 +		const int32_t vblankMax = it->second.max().get<int32_t>();
-+		/* One line of headroom for VBLANK steps of two lines. */
-+		const int64_t limit = static_cast<int64_t>(agc.exposureMax) +
-+				      vblankMax - vblankDef - 1;
++		agc.frame.vblankDefault = vblankDef;
++
++		const int32_t limit = agc.frame.exposureWithin(agc.frame.defaultLines +
++							       vblankMax - vblankDef);
 +		const int64_t wanted = agc.exposureMax * maxExposureFactor_;
 +
-+		agc.exposureMaxExtended = std::min(wanted, limit);
++		agc.exposureMaxExtended = static_cast<int32_t>(std::min<int64_t>(wanted, limit));
 +		if (agc.exposureMaxExtended > agc.exposureMax) {
 +			agc.vblankEnabled = true;
-+			agc.vblankDefault = vblankDef;
 +			if (extensionGain_)
 +				agc.extensionGain = std::clamp(*extensionGain_ * agc.againMin,
 +							       agc.againMin, agc.againMax);
@@ -2308,20 +2329,27 @@ index 0000000..41db736
 +		}
 +	}
 +
-+	/* Ranges of the manual controls in this sensor mode */
-+	const int32_t minUs = static_cast<int32_t>(utils::Duration(agc.lineDuration * agc.exposureMin).get<std::micro>());
-+	const int32_t maxUs = static_cast<int32_t>(utils::Duration(agc.lineDuration * agc.exposureMaxExtended).get<std::micro>());
++	/* The frame durations of the application carry over a configuration */
++	updateFrameLimits(context);
++
++	/*
++	 * Ranges in this sensor mode: the exposure up to the extended frame
++	 * length, the frame duration from the default frame length to the
++	 * one of the longest exposure (without extension the default).
++	 */
++	const utils::Duration line = agc.lineDuration;
++	const int32_t minUs = static_cast<int32_t>(utils::Duration(line * agc.exposureMin).get<std::micro>());
++	const int32_t maxUs = static_cast<int32_t>(utils::Duration(line * agc.exposureMaxExtended).get<std::micro>());
 +	context.ctrlMap[&controls::ExposureTime] = ControlInfo(minUs, maxUs, std::clamp(10000, minUs, maxUs));
 +	context.ctrlMap[&controls::AnalogueGain] =
 +		ControlInfo(static_cast<float>(agc.againMin), static_cast<float>(agc.againMax), 1.0f);
-+	const IPACameraSensorInfo &info = context.sensorInfo;
-+	if (info.pixelRate) {
-+		const int64_t lineNs = static_cast<int64_t>(info.minLineLength) * 1000000000LL / info.pixelRate;
-+		const int64_t minFrame = lineNs * info.minFrameLength / 1000;
-+		const int64_t maxFrame = lineNs * (static_cast<int64_t>(info.minFrameLength) +
-+						   agc.exposureMaxExtended - agc.exposureMax) / 1000;
++	if (agc.frame.defaultLines > 0 && line > utils::Duration(0)) {
++		const int64_t minFrame = static_cast<int64_t>(
++			utils::Duration(line * agc.frame.defaultLines).get<std::micro>());
++		const int64_t maxFrame = static_cast<int64_t>(
++			utils::Duration(line * agc.frame.linesFor(agc.exposureMaxExtended)).get<std::micro>());
 +		context.ctrlMap[&controls::FrameDurationLimits] =
-+			ControlInfo(minFrame, std::max(minFrame, maxFrame), Span<const int64_t, 2>{ { minFrame, maxFrame } });
++			ControlInfo(minFrame, maxFrame, Span<const int64_t, 2>{ { minFrame, maxFrame } });
 +	}
 +
 +	LOG(IPAMtkIsp50Exposure, Info)
@@ -2497,21 +2525,71 @@ index 0000000..41db736
 +			     at(LensShading::B) });
 +}
 +
-+/* Longest exposure in lines: the frame length limit, FrameDurationLimits */
-+int32_t Agc::exposureLimit(const IPAContext &context) const
++/*
++ * Limits from the frame durations of the application (FrameDurationLimits):
++ * the longest exposure whose frame fits into the longest frame duration,
++ * within the frame length extension, and the shortest frame length (only
++ * with VBLANK control, not beyond the longest frame).
++ */
++void Agc::updateFrameLimits(IPAContext &context) const
 +{
 +	const auto &agc = context.configuration.agc;
-+	int32_t limit = agc.exposureMaxExtended;
++	auto &state = context.activeState.agc;
 +
-+	if (maxFrameDuration_ && agc.lineDuration > utils::Duration(0)) {
-+		/* Lines of the frame beyond the default frame length */
-+		const int32_t frameLines = static_cast<int32_t>(*maxFrameDuration_ / agc.lineDuration);
-+		const int32_t defaultLines = static_cast<int32_t>(context.sensorInfo.minFrameLength);
-+		const int32_t extra = std::max(frameLines - defaultLines, 0);
-+		limit = std::min(limit, agc.exposureMax + extra);
++	state.exposureLimit = agc.exposureMaxExtended;
++	state.minFrameLines = 0;
++	if (agc.lineDuration <= utils::Duration(0))
++		return;
++
++	int32_t maxLines = agc.frame.linesFor(agc.exposureMaxExtended);
++	if (maxFrameDuration_) {
++		const double lines = *maxFrameDuration_ / agc.lineDuration;
++		maxLines = std::min<int32_t>(maxLines, static_cast<int32_t>(std::floor(lines)));
++		state.exposureLimit = std::clamp(agc.frame.exposureWithin(maxLines),
++						 agc.exposureMin, agc.exposureMaxExtended);
 +	}
 +
-+	return std::max(limit, agc.exposureMin);
++	if (minFrameDuration_ && agc.vblankEnabled) {
++		const double wanted = std::ceil(*minFrameDuration_ / agc.lineDuration);
++		const int32_t lines = std::min<int32_t>(static_cast<int32_t>(wanted), maxLines);
++		/* VBLANK steps; down, so that the frame stays within the longest */
++		const int32_t extra = (lines - agc.frame.defaultLines) /
++				      FrameLength::kVblankStep * FrameLength::kVblankStep;
++		if (extra > 0)
++			state.minFrameLines = agc.frame.defaultLines + extra;
++	}
++}
++
++/*
++ * Longest exposure for the regulation: the limit of the frame durations, and
++ * no further frame length extension while the autofocus searches.
++ */
++int32_t Agc::exposureLimit(const IPAContext &context, int32_t exposure) const
++{
++	const auto &agc = context.configuration.agc;
++	int32_t limit = std::max(context.activeState.agc.exposureLimit, agc.exposureMin);
++
++	if (afFrameRate_ && context.activeState.af.busy)
++		limit = std::min(limit, std::max(agc.exposureMax, exposure));
++
++	return limit;
++}
++
++/*
++ * An exposure beyond the limit (a shorter longest frame duration of the
++ * application) goes over to the analogue gain, as far as it reaches.
++ */
++void Agc::fitExposure(const IPAContext &context, int32_t &exposure, double &again,
++		      int32_t limit) const
++{
++	const auto &agc = context.configuration.agc;
++
++	if (exposure <= limit || limit <= 0)
++		return;
++
++	if (!manualGain_ && again > 0.0)
++		again = std::min(again * exposure / limit, agc.againMax);
++	exposure = limit;
 +}
 +
 +/*
@@ -2530,7 +2608,8 @@ index 0000000..41db736
 +		context.activeState.agc.digitalGain = 1.0;
 +
 +	frameContext.sensor.exposure = std::clamp(frameContext.sensor.exposure, agc.exposureMin,
-+						  exposureLimit(context));
++						  std::max(context.activeState.agc.exposureLimit,
++							   agc.exposureMin));
 +	frameContext.sensor.gain = std::clamp(frameContext.sensor.gain, agc.againMin, agc.againMax);
 +
 +	context.activeState.agc.exposure = frameContext.sensor.exposure;
@@ -2551,6 +2630,11 @@ index 0000000..41db736
 +	/* ExposureValue: the target in stops, the error is in half stops */
 +	if (exposureTarget_)
 +		error += 2.0 * exposureValue_;
++
++	/* A limit that came down since the exposure of this frame */
++	if (!manualExposure_)
++		fitExposure(context, frameContext.sensor.exposure, frameContext.sensor.gain,
++			    exposureLimit(context, frameContext.sensor.exposure));
 +
 +	regulate(context, frameContext, error);
 +	applyManual(context, frameContext);
@@ -2584,10 +2668,7 @@ index 0000000..41db736
 +	double &again = frameContext.sensor.gain;
 +	double &digitalGain = context.activeState.agc.digitalGain;
 +	double rest = factor;
-+	/* No further frame length extension while the autofocus searches */
-+	const int32_t exposureLimit = afFrameRate_ && context.activeState.af.busy
-+					      ? std::max(agc.exposureMax, exposure)
-+					      : agc.exposureMaxExtended;
++	const int32_t expLimit = exposureLimit(context, exposure);
 +
 +	auto moveExposure = [&](int32_t limit) {
 +		if (rest == 1.0 || exposure <= 0)
@@ -2617,7 +2698,7 @@ index 0000000..41db736
 +			moveExposure(agc.exposureMax);
 +		if (again < agc.extensionGain)
 +			moveGain(again, agc.extensionGain);
-+		moveExposure(exposureLimit);
++		moveExposure(expLimit);
 +		moveGain(again, agc.againMax);
 +		if (maxDigitalGain_ > 1.0)
 +			moveGain(digitalGain, maxDigitalGain_);
@@ -2631,7 +2712,7 @@ index 0000000..41db736
 +		moveGain(again, agc.againMin);
 +	}
 +
-+	exposure = std::clamp(exposure, agc.exposureMin, exposureLimit);
++	exposure = std::clamp(exposure, agc.exposureMin, expLimit);
 +	again = std::clamp(again, agc.againMin, agc.againMax);
 +
 +	context.activeState.agc.exposure = exposure;
@@ -2661,9 +2742,9 @@ index 0000000..41db736
 +		again = gain;
 +		exposure = next;
 +	} else if (!context.activeState.af.busy && again > agc.extensionGain &&
-+		   exposure >= agc.exposureMax && exposure < agc.exposureMaxExtended) {
++		   exposure >= agc.exposureMax && exposure < context.activeState.agc.exposureLimit) {
 +		const int32_t next = std::min<int32_t>(std::lround(exposure * again / agc.extensionGain),
-+						       agc.exposureMaxExtended);
++						       context.activeState.agc.exposureLimit);
 +		again = std::max(again * exposure / next, agc.againMin);
 +		exposure = next;
 +	} else {
@@ -2687,9 +2768,7 @@ index 0000000..41db736
 +		return;
 +
 +	const float factor = static_cast<float>(stepFactor(error));
-+	const int32_t exposureLimit = afFrameRate_ && context.activeState.af.busy
-+					      ? std::max(agc.exposureMax, exposure)
-+					      : agc.exposureMaxExtended;
++	const int32_t expLimit = exposureLimit(context, exposure);
 +
 +	if (exposureSpeed_) {
 +		regulateCascade(context, frameContext, factor);
@@ -2714,7 +2793,7 @@ index 0000000..41db736
 +		return;
 +	}
 +	if (factor > 1.0f && maxDigitalGain_ > 1.0 &&
-+	    exposure >= exposureLimit && again >= agc.againMax) {
++	    exposure >= expLimit && again >= agc.againMax) {
 +		digitalGain = std::min(digitalGain * factor, maxDigitalGain_);
 +		LOG(IPAMtkIsp50Exposure, Debug)
 +			<< "error " << error << " factor " << factor
@@ -2754,8 +2833,8 @@ index 0000000..41db736
 +			exposureUp(agc.exposureMax);
 +		else if (again < agc.extensionGain)
 +			gainUp(agc.extensionGain);
-+		else if (exposure < exposureLimit)
-+			exposureUp(exposureLimit);
++		else if (exposure < expLimit)
++			exposureUp(expLimit);
 +		else
 +			gainUp(agc.againMax);
 +	} else {
@@ -2769,7 +2848,7 @@ index 0000000..41db736
 +			exposureDown(agc.exposureMin);
 +	}
 +
-+	exposure = std::clamp(exposure, agc.exposureMin, exposureLimit);
++	exposure = std::clamp(exposure, agc.exposureMin, expLimit);
 +	again = std::clamp(again, agc.againMin, agc.againMax);
 +
 +	context.activeState.agc.exposure = exposure;
@@ -2840,12 +2919,28 @@ index 0000000..41db736
 +	}
 +
 +	if (const auto &v = controls.get(controls::FrameDurationLimits)) {
-+		/* The longest frame duration limits the exposure (microseconds) */
++		/*
++		 * The longest frame duration limits the exposure, the shortest
++		 * one lengthens the frame (microseconds, 0 for none). The
++		 * exposure of the moment comes down to the new limit at once
++		 * (for the start of a stream).
++		 */
++		const int64_t minUs = (*v)[0];
 +		const int64_t maxUs = (*v)[1];
 +		if (maxUs > 0)
 +			maxFrameDuration_ = std::chrono::microseconds(maxUs);
 +		else
 +			maxFrameDuration_.reset();
++		if (minUs > 0)
++			minFrameDuration_ = std::chrono::microseconds(minUs);
++		else
++			minFrameDuration_.reset();
++
++		updateFrameLimits(context);
++		auto &state = context.activeState.agc;
++		if (state.valid && !manualExposure_)
++			fitExposure(context, state.exposure, state.again,
++				    std::max(state.exposureLimit, agc.exposureMin));
 +	}
 +}
 +
@@ -2858,6 +2953,17 @@ index 0000000..41db736
 +	utils::Duration exposureTime =
 +		context.configuration.agc.lineDuration * frameContext.sensor.exposure;
 +	metadata.set(controls::ExposureTime, exposureTime.get<std::micro>());
++	{
++		/* The frame length that goes with the exposure of this frame */
++		const auto &agc = context.configuration.agc;
++		const int32_t lines = agc.vblankEnabled
++					      ? agc.frame.linesFor(frameContext.sensor.exposure,
++								   context.activeState.agc.minFrameLines)
++					      : agc.frame.defaultLines;
++		if (lines > 0)
++			metadata.set(controls::FrameDuration,
++				     static_cast<int64_t>(utils::Duration(agc.lineDuration * lines).get<std::micro>()));
++	}
 +	metadata.set(controls::AnalogueGain, frameContext.sensor.gain);
 +	metadata.set(controls::DigitalGain, static_cast<float>(frameContext.digitalGain));
 +	/* State of the regulation that led to the values of this frame */
@@ -3005,10 +3111,10 @@ index 0000000..41db736
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/agc.h b/src/ipa/mtkisp50/algorithms/agc.h
 new file mode 100644
-index 0000000..092d461
+index 0000000..b961f6b
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/agc.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,104 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024, Red Hat Inc.
@@ -3061,7 +3167,10 @@ index 0000000..092d461
 +	double zoneMean(const IPAContext &context, const Statistics *stats) const;
 +	RGB<double> shadingGain(const IPAContext &context, double x, double y) const;
 +	void applyManual(IPAContext &context, IPAFrameContext &frameContext);
-+	int32_t exposureLimit(const IPAContext &context) const;
++	void updateFrameLimits(IPAContext &context) const;
++	int32_t exposureLimit(const IPAContext &context, int32_t exposure) const;
++	void fitExposure(const IPAContext &context, int32_t &exposure, double &again,
++			 int32_t limit) const;
 +
 +	/* Metering zones in each direction for zone metering */
 +	static constexpr unsigned int kMeteringZones = 5;
@@ -3103,6 +3212,7 @@ index 0000000..092d461
 +	std::optional<double> gainValue_;
 +	double exposureValue_ = 0.0;
 +	controls::AeMeteringModeEnum meteringMode_ = controls::MeteringCentreWeighted;
++	std::optional<utils::Duration> minFrameDuration_;
 +	std::optional<utils::Duration> maxFrameDuration_;
 +};
 +
@@ -5488,6 +5598,78 @@ index 0000000..0cce600
 +} /* namespace ipa::mtkisp50 */
 +
 +} /* namespace libcamera */
+diff --git a/src/ipa/mtkisp50/frame_length.h b/src/ipa/mtkisp50/frame_length.h
+new file mode 100644
+index 0000000..1ae3483
+--- /dev/null
++++ b/src/ipa/mtkisp50/frame_length.h
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Frame length of the sensor for an exposure
++ *
++ * An exposure beyond the limit of the default frame length needs a longer
++ * frame: VBLANK grows with the exposure, by one line of headroom and in steps
++ * of two lines (the driver rounds VBLANK and the exposure to steps of two
++ * lines, upwards). The same arithmetic gives the VBLANK to write, the frame
++ * duration to report and the longest exposure within a frame duration limit.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <stdint.h>
++
++namespace libcamera {
++
++namespace ipa::mtkisp50 {
++
++struct FrameLength {
++	static constexpr int32_t kVblankStep = 2;
++
++	/* Frame length at the default VBLANK, in lines */
++	int32_t defaultLines = 0;
++	/* Longest exposure at the default frame length, in lines */
++	int32_t exposureMax = 0;
++	int32_t vblankDefault = 0;
++
++	/* Lines beyond the default frame length that an exposure needs */
++	int32_t extraFor(int32_t exposure) const
++	{
++		if (exposure <= exposureMax)
++			return 0;
++		const int32_t extra = exposure - exposureMax + 1;
++		return (extra + kVblankStep - 1) / kVblankStep * kVblankStep;
++	}
++
++	/* Frame length for an exposure, at least minLines */
++	int32_t linesFor(int32_t exposure, int32_t minLines = 0) const
++	{
++		return std::max(defaultLines + extraFor(exposure), minLines);
++	}
++
++	int32_t vblankFor(int32_t exposure, int32_t minLines = 0) const
++	{
++		return vblankDefault + linesFor(exposure, minLines) - defaultLines;
++	}
++
++	/*
++	 * Longest exposure whose frame fits into the given number of lines;
++	 * the limit of the default frame length when the frame can't grow by
++	 * a step.
++	 */
++	int32_t exposureWithin(int32_t lines) const
++	{
++		if (lines - defaultLines < kVblankStep)
++			return exposureMax;
++		const int32_t extra = (lines - defaultLines) / kVblankStep * kVblankStep;
++		return exposureMax + extra - kVblankStep;
++	}
++};
++
++} /* namespace ipa::mtkisp50 */
++
++} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/ipa_context.cpp b/src/ipa/mtkisp50/ipa_context.cpp
 new file mode 100644
 index 0000000..9958d5f
@@ -5598,10 +5780,10 @@ index 0000000..9958d5f
 +} /* namespace libcamera::ipa::mtkisp50 */
 diff --git a/src/ipa/mtkisp50/ipa_context.h b/src/ipa/mtkisp50/ipa_context.h
 new file mode 100644
-index 0000000..3f30dbe
+index 0000000..64a08a0
 --- /dev/null
 +++ b/src/ipa/mtkisp50/ipa_context.h
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,149 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024-2026 Red Hat, Inc.
@@ -5625,6 +5807,7 @@ index 0000000..3f30dbe
 +#include "core_ipa_interface.h"
 +
 +#include "dip_params.h"
++#include "frame_length.h"
 +
 +namespace libcamera {
 +
@@ -5645,7 +5828,8 @@ index 0000000..3f30dbe
 +		int32_t exposureMaxExtended;
 +		double extensionGain;
 +		bool vblankEnabled;
-+		int32_t vblankDefault;
++		/* Frame length for an exposure (VBLANK when vblankEnabled) */
++		FrameLength frame;
 +	} agc;
 +	struct {
 +		std::optional<uint8_t> level;
@@ -5668,6 +5852,14 @@ index 0000000..3f30dbe
 +		bool converging;
 +		/* The last step was small (AeState converged) */
 +		bool settled;
++		/*
++		 * Longest exposure the regulation may use: the frame length
++		 * extension within the longest frame duration of the
++		 * application (FrameDurationLimits)
++		 */
++		int32_t exposureLimit;
++		/* Shortest frame length of the application, 0 for none */
++		int32_t minFrameLines;
 +	} agc;
 +
 +	struct {
@@ -5818,10 +6010,10 @@ index 0000000..e38120a
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/mtkisp50.cpp b/src/ipa/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..b3ccf28
+index 0000000..409598b
 --- /dev/null
 +++ b/src/ipa/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,596 @@
+@@ -0,0 +1,612 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2023, Linaro Ltd
@@ -6103,10 +6295,19 @@ index 0000000..b3ccf28
 +	int32_t exposure = agc.lineDuration > 0s
 +				   ? static_cast<int32_t>(std::lround(carried_.exposureTime / agc.lineDuration))
 +				   : state.agc.exposure;
-+	/* Up to the longest exposure with a longer frame, as the Agc does */
-+	const int32_t exposureMax = agc.vblankEnabled ? agc.exposureMaxExtended : agc.exposureMax;
-+	state.agc.exposure = std::clamp(exposure, agc.exposureMin, exposureMax);
-+	state.agc.again = std::clamp(carried_.again, agc.againMin, agc.againMax);
++	/*
++	 * Up to the longest exposure of the regulation in this mode (frame
++	 * length extension and frame durations of the application); the rest
++	 * goes over to the gain.
++	 */
++	const int32_t limit = std::max(state.agc.exposureLimit, agc.exposureMin);
++	double again = carried_.again;
++	if (exposure > limit) {
++		again *= static_cast<double>(exposure) / limit;
++		exposure = limit;
++	}
++	state.agc.exposure = std::max(exposure, agc.exposureMin);
++	state.agc.again = std::clamp(again, agc.againMin, agc.againMax);
 +	state.agc.digitalGain = carried_.digitalGain;
 +	state.agc.valid = true;
 +	state.awb.gains = carried_.awbGains;
@@ -6203,8 +6404,18 @@ index 0000000..b3ccf28
 +	return 0;
 +}
 +
-+void IPAMtkIsp50::start([[maybe_unused]] const ControlList &controls, StartResult *result)
++void IPAMtkIsp50::start(const ControlList &controls, StartResult *result)
 +{
++	/*
++	 * The controls of the start act as those of a first request (frame
++	 * durations, modes); they stay for the following frames.
++	 */
++	if (!controls.empty()) {
++		IPAFrameContext startContext{};
++		for (const auto &algo : algorithms())
++			algo->queueRequest(context_, 0, startContext, controls);
++	}
++
 +	settledCount_ = 0;
 +	lastGains_ = RGB<float>({ 0.0, 0.0, 0.0 });
 +	encoder_.reset();
@@ -6220,12 +6431,10 @@ index 0000000..b3ccf28
 +	const IPAActiveState &state = context_.activeState;
 +	result->sensorControls.set(V4L2_CID_EXPOSURE, state.agc.exposure);
 +	const auto &agc = context_.configuration.agc;
-+	if (agc.vblankEnabled) {
-+		/* Frame length for the exposure, one line of headroom, as processStats() */
-+		const int32_t extra = state.agc.exposure - agc.exposureMax;
++	if (agc.vblankEnabled)
 +		result->sensorControls.set(V4L2_CID_VBLANK,
-+					   agc.vblankDefault + (extra > 0 ? extra + 1 : 0));
-+	}
++					   agc.frame.vblankFor(state.agc.exposure,
++							       state.agc.minFrameLines));
 +	result->sensorControls.set(V4L2_CID_ANALOGUE_GAIN,
 +				   static_cast<int32_t>(camHelper_ ? camHelper_->gainCode(state.agc.again)
 +								   : state.agc.again));
@@ -6375,12 +6584,11 @@ index 0000000..b3ccf28
 +		  static_cast<int32_t>(camHelper_ ? camHelper_->gainCode(againNew) : againNew));
 +
 +	const auto &agc = context_.configuration.agc;
-+	if (agc.vblankEnabled) {
-+		/* Raise the frame length with the exposure, one line headroom. */
-+		int32_t extra = frameContext.sensor.exposure - agc.exposureMax;
++	if (agc.vblankEnabled)
++		/* Raise the frame length with the exposure */
 +		ctrls.set(V4L2_CID_VBLANK,
-+			  agc.vblankDefault + (extra > 0 ? extra + 1 : 0));
-+	}
++			  agc.frame.vblankFor(frameContext.sensor.exposure,
++					      context_.activeState.agc.minFrameLines));
 +
 +	ControlList lensCtrls(context_.lensControls);
 +	if (context_.activeState.af.update) {
@@ -7139,10 +7347,10 @@ index 0000000..9358d79
 +])
 diff --git a/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..0e5f297
+index 0000000..0f0d68d
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,2008 @@
+@@ -0,0 +1,1994 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the MediaTek MT6785 camera subsystem with the ISP pass 2
@@ -8292,20 +8500,6 @@ index 0000000..0e5f297
 +					<< outCfg->toString() << " stride " << outCfg->stride;
 +				return -EINVAL;
 +			}
-+		} else {
-+			/*
-+			 * Interim: the DIP driver (ISPDIP10) checks the line
-+			 * length of the main output against the processed area
-+			 * also for jobs without the main output and fails them
-+			 * (-EINVAL in the tile geometry check). The main node,
-+			 * which does not stream, gets the size of the area.
-+			 */
-+			V4L2DeviceFormat main;
-+			main.fourcc = V4L2PixelFormat(V4L2_PIX_FMT_NV12);
-+			main.size = applied.size();
-+			if (dip_.main_->setFormat(&main) || main.size != applied.size())
-+				LOG(MtkIsp50, Warning)
-+					<< "Main output not set to the processed area " << applied;
 +		}
 +
 +		if (scaledCfg) {
@@ -11081,6 +11275,402 @@ index 0000000..5554fee
 +};
 +
 +TEST_REGISTER(MtkIsp50AfTest)
+diff --git a/test/mtkisp50/agc.cpp b/test/mtkisp50/agc.cpp
+new file mode 100644
+index 0000000..b8eac90
+--- /dev/null
++++ b/test/mtkisp50/agc.cpp
+@@ -0,0 +1,390 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * mtkisp50 IPA: frame length of the exposure regulation
++ */
++
++#include <cmath>
++#include <cstring>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <unistd.h>
++
++#include <linux/v4l2-controls.h>
++
++#include <libcamera/base/file.h>
++#include <libcamera/base/memfd.h>
++
++#include <libcamera/control_ids.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "mtkisp50/algorithms/af.h"
++#include "mtkisp50/algorithms/agc.h"
++#include "mtkisp50/frame_length.h"
++#include "mtkisp50/ipa_context.h"
++
++#include "test.h"
++
++using namespace std::literals::chrono_literals;
++using namespace libcamera;
++using namespace libcamera::ipa::mtkisp50;
++
++namespace {
++
++/*
++ * Regulation as tuned for the main camera (zone metering, speed, frame length
++ * extension by a factor of two from a gain of 8, the frame rate kept while
++ * the autofocus searches); the autofocus continuous.
++ */
++const char *kTuning = R"(%YAML 1.1
++---
++Agc:
++  maxExposureFactor: 2.0
++  extensionGain: 8.0
++  exposureTarget: 0.18
++  exposureSpeed: 0.6
++  metering: zones
++  colourGains: false
++  afFrameRate: true
++Af:
++  map: [ 0.1, 468, 10.0, 775 ]
++  default: 0.4
++  range: [ -0.8, 10.5 ]
++  step: 1.25
++  settleFrames: 2
++)";
++
++/* A sensor mode: lines, line duration, VBLANK range (step 2) */
++struct Mode {
++	int32_t defaultLines;
++	int32_t exposureMax;
++	utils::Duration line;
++	int32_t vblankDefault;
++	int32_t vblankMax;
++};
++
++/* Full resolution mode: 4102 lines of 8.124 us, 33.3 ms */
++const Mode kFull = { 4102, 4070, 8124.0ns, 4102 - 3472, 0xffffe8 - 3472 };
++/* Binned mode: 6000 lines of 5.555 us, 33.3 ms */
++const Mode kBinned = { 6000, 5968, 5555.0ns, 6000 - 1728, 0xffffe8 - 1728 };
++
++constexpr int32_t kBlack = 16;
++
++/*
++ * Exposure regulation and autofocus between a simulated sensor without
++ * delays and a dark scene: the image level above the black level is
++ * brightness * exposure lines * analogue gain (8 bit scale), the focus grid
++ * has a small contrast at that level.
++ */
++class Sim
++{
++public:
++	Sim()
++		: ctx_(16), stats_(std::make_unique<Statistics>())
++	{
++	}
++
++	int init()
++	{
++		UniqueFD fd = MemFd::create("mtkisp50-agc-tuning", 0);
++		if (!fd.isValid() || write(fd.get(), kTuning, strlen(kTuning)) < 0)
++			return -EIO;
++
++		File file("/proc/self/fd/" + std::to_string(fd.get()));
++		if (!file.open(File::OpenModeFlag::ReadOnly))
++			return -EIO;
++
++		tuning_ = YamlParser::parse(file);
++		if (!tuning_)
++			return -EINVAL;
++
++		ControlInfoMap::Map map;
++		map.emplace(&focusId_, ControlInfo(0, 1023, 0));
++		ctx_.lensControls = ControlInfoMap(std::move(map), lensIdMap_);
++
++		int ret = agc_.init(ctx_, (*tuning_)["Agc"]);
++		if (ret)
++			return ret;
++		return af_.init(ctx_, (*tuning_)["Af"]);
++	}
++
++	/* A new configuration in a mode, as IPAMtkIsp50::configure() */
++	int configure(const Mode &mode)
++	{
++		mode_ = mode;
++		ctx_.configuration = {};
++		ctx_.activeState = {};
++		ctx_.activeState.blc.level = kBlack;
++		ctx_.activeState.agc.digitalGain = 1.0;
++		ctx_.activeState.awb.gains = RGB<float>({ 1.0f, 1.0f, 1.0f });
++		ctx_.sensorInfo.minFrameLength = mode.defaultLines;
++		ctx_.sensorInfo.outputSize = Size(2304, 1728);
++
++		auto &agc = ctx_.configuration.agc;
++		agc.lineDuration = mode.line;
++		agc.exposureMin = 16;
++		agc.exposureMax = mode.exposureMax;
++		agc.againMin = 1.0;
++		agc.againMax = 15.5;
++		agc.again10 = 1.0;
++		agc.againMinStep = 0.02;
++
++		ControlInfoMap::Map map;
++		map.emplace(&vblankId_, ControlInfo(mode.vblankDefault, mode.vblankMax, mode.vblankDefault));
++		IPAConfigInfo config{};
++		config.sensorControls = ControlInfoMap(std::move(map), sensorIdMap_);
++
++		int ret = agc_.configure(ctx_, config);
++		if (ret)
++			return ret;
++		ret = af_.configure(ctx_, config);
++		if (ret)
++			return ret;
++
++		exposure_ = mode.exposureMax / 2;
++		gain_ = 1.0;
++		frame_ = 0;
++		return 0;
++	}
++
++	ControlList frame(const ControlList *request = nullptr)
++	{
++		const uint32_t n = frame_++;
++		IPAFrameContext fc{};
++		if (request) {
++			agc_.queueRequest(ctx_, n, fc, *request);
++			af_.queueRequest(ctx_, n, fc, *request);
++		}
++
++		DipFrameParams params{};
++		agc_.prepare(ctx_, n, fc, &params);
++		af_.prepare(ctx_, n, fc, &params);
++
++		/* The sensor applies what it was given */
++		fc.sensor.exposure = exposure_;
++		fc.sensor.gain = gain_;
++		frameLines = ctx_.configuration.agc.vblankEnabled
++				     ? mode_.defaultLines + vblank_ - mode_.vblankDefault
++				     : mode_.defaultLines;
++
++		const double level = std::min(brightness * exposure_ * gain_, 255.0 - kBlack);
++		Statistics &s = *stats_;
++		s.valid = true;
++		for (unsigned int i = 0; i < Statistics::kZones * Statistics::kZones; i++) {
++			const uint64_t v = static_cast<uint64_t>((kBlack + level) * 100);
++			s.zoneSum[i] = RGB<uint64_t>({ v, v, v });
++			s.zoneCount[i] = 100;
++		}
++		s.afGridValid = true;
++		s.afGridWidth = 16;
++		s.afGridHeight = 12;
++		s.afCellSize = 16;
++		s.afCellSamples = 64;
++		for (unsigned int y = 0; y < 12; y++)
++			for (unsigned int x = 0; x < 16; x++)
++				s.afGrid[y * 16 + x] = static_cast<uint32_t>(
++					64 * (kBlack + level * ((x + y) & 1 ? 1.1 : 0.9)));
++
++		ControlList metadata(controls::controls);
++		agc_.process(ctx_, n, fc, stats_.get(), metadata);
++		af_.process(ctx_, n, fc, stats_.get(), metadata);
++		ctx_.activeState.af.update = false;
++
++		/* Controls for the next frame, as IPAMtkIsp50::processStats() */
++		exposure_ = fc.sensor.exposure;
++		gain_ = fc.sensor.gain;
++		const auto &agc = ctx_.configuration.agc;
++		if (agc.vblankEnabled) {
++			vblank_ = agc.frame.vblankFor(exposure_, ctx_.activeState.agc.minFrameLines);
++			/* The driver: steps of two lines from the default up */
++			vblank_ = mode_.vblankDefault +
++				  (vblank_ - mode_.vblankDefault + 1) / 2 * 2;
++		}
++
++		return metadata;
++	}
++
++	IPAContext &ctx() { return ctx_; }
++	int32_t exposure() const { return exposure_; }
++	double gain() const { return gain_; }
++
++	double brightness = 0.0;
++	/* Frame length of the last frame, in lines */
++	int32_t frameLines = 0;
++
++private:
++	ControlId vblankId_{ V4L2_CID_VBLANK, "Vertical Blanking", "v4l2",
++			     ControlTypeInteger32, ControlId::Direction::In };
++	ControlIdMap sensorIdMap_{ { V4L2_CID_VBLANK, &vblankId_ } };
++	ControlId focusId_{ V4L2_CID_FOCUS_ABSOLUTE, "Focus, Absolute", "v4l2",
++			    ControlTypeInteger32, ControlId::Direction::In };
++	ControlIdMap lensIdMap_{ { V4L2_CID_FOCUS_ABSOLUTE, &focusId_ } };
++	IPAContext ctx_;
++	std::unique_ptr<ValueNode> tuning_;
++	algorithms::Agc agc_;
++	algorithms::Af af_;
++	std::unique_ptr<Statistics> stats_;
++	Mode mode_{};
++	int32_t exposure_ = 0;
++	double gain_ = 1.0;
++	int32_t vblank_ = 0;
++	uint32_t frame_ = 0;
++};
++
++ControlList limits(int64_t minUs, int64_t maxUs)
++{
++	ControlList c(controls::controls);
++	c.set(controls::FrameDurationLimits, Span<const int64_t, 2>({ minUs, maxUs }));
++	return c;
++}
++
++int64_t micros(utils::Duration d)
++{
++	return static_cast<int64_t>(d.get<std::micro>());
++}
++
++} /* namespace */
++
++class MtkIsp50AgcTest : public Test
++{
++protected:
++	int fail(const std::string &what)
++	{
++		std::cerr << what << std::endl;
++		return TestFail;
++	}
++
++	/* Frame length arithmetic against the rounding of the driver */
++	int testFrameLength()
++	{
++		FrameLength f;
++		f.defaultLines = 4102;
++		f.exposureMax = 4070;
++		f.vblankDefault = 630;
++
++		for (int32_t e = 16; e <= 9000; e += 2) {
++			const int32_t lines = f.linesFor(e);
++			/* The sensor needs 31 lines beyond the exposure */
++			if (lines < std::max(e + 31, f.defaultLines) ||
++			    (lines - f.defaultLines) % FrameLength::kVblankStep ||
++			    f.vblankFor(e) - f.vblankDefault != lines - f.defaultLines)
++				return fail("frame length for exposure " + std::to_string(e));
++		}
++
++		for (int32_t lines = f.defaultLines - 10; lines <= 9000; lines++) {
++			const int32_t e = f.exposureWithin(lines);
++			if (f.linesFor(e) > std::max(lines, f.defaultLines) || e % 2)
++				return fail("exposure within " + std::to_string(lines) + " lines");
++			/* The longest one: two lines more need a longer frame */
++			if (lines >= f.defaultLines && f.linesFor(e + 2) <= lines)
++				return fail("exposure within " + std::to_string(lines) +
++					    " lines not the longest");
++		}
++
++		if (f.linesFor(100, 5000) != 5000 || f.linesFor(6000, 5000) != f.linesFor(6000))
++			return fail("shortest frame length");
++
++		return TestPass;
++	}
++
++	/*
++	 * Dark scene: the image at the longest exposure of the default frame
++	 * length and the highest gain is too dark for the focus measure.
++	 */
++	int testDark(const Mode &mode, const char *name)
++	{
++		Sim sim;
++		if (sim.init() || sim.configure(mode))
++			return fail(std::string(name) + ": init");
++		sim.brightness = 0.8 / (mode.exposureMax * 15.5);
++
++		const auto &agc = sim.ctx().configuration.agc;
++		ControlList md;
++		for (unsigned int i = 0; i < 600; i++)
++			md = sim.frame();
++
++		if (sim.exposure() != agc.exposureMaxExtended || sim.gain() < 15.5)
++			return fail(std::string(name) + ": dark scene, exposure " +
++				    std::to_string(sim.exposure()) + " of " +
++				    std::to_string(agc.exposureMaxExtended) + ", gain " +
++				    std::to_string(sim.gain()));
++
++		/* The reported ranges are the ones reached */
++		const ControlInfo &frameInfo = sim.ctx().ctrlMap.at(&controls::FrameDurationLimits);
++		const ControlInfo &expInfo = sim.ctx().ctrlMap.at(&controls::ExposureTime);
++		const int64_t duration = md.get(controls::FrameDuration).value_or(0);
++		const int64_t lineDuration = micros(agc.lineDuration * sim.frameLines);
++		if (frameInfo.max().get<int64_t>() != duration ||
++		    std::abs(duration - lineDuration) > 1 ||
++		    expInfo.max().get<int32_t>() != md.get(controls::ExposureTime).value_or(0) ||
++		    frameInfo.min().get<int64_t>() != micros(agc.lineDuration * mode.defaultLines))
++			return fail(std::string(name) + ": ranges " + frameInfo.toString() + " " +
++				    expInfo.toString() + ", reached " + std::to_string(duration) +
++				    " (sensor " + std::to_string(lineDuration) + ")");
++
++		/* A fixed frame rate of 30 fps from the application */
++		const int64_t fixed = 33333;
++		ControlList fps = limits(fixed, fixed);
++		sim.frame(&fps);
++		if (sim.ctx().activeState.agc.exposure > agc.exposureMax ||
++		    sim.ctx().activeState.agc.again < 15.5)
++			return fail(std::string(name) + ": the limit did not apply at once");
++		for (unsigned int i = 0; i < 100; i++) {
++			md = sim.frame();
++			if (i < 2)
++				continue;
++			if (micros(agc.lineDuration * sim.frameLines) > fixed ||
++			    md.get(controls::FrameDuration).value_or(0) > fixed ||
++			    sim.exposure() > agc.exposureMax)
++				return fail(std::string(name) + ": 30 fps not held, frame " +
++					    std::to_string(sim.frameLines) + " lines, exposure " +
++					    std::to_string(sim.exposure()));
++		}
++		if (sim.gain() < 15.5)
++			return fail(std::string(name) + ": gain not at its limit at 30 fps");
++
++		/* Up to 20 fps */
++		const int64_t longest = 50000;
++		ControlList up(limits(fixed, longest));
++		sim.frame(&up);
++		for (unsigned int i = 0; i < 200; i++)
++			md = sim.frame();
++		const int64_t frame = micros(agc.lineDuration * sim.frameLines);
++		if (frame > longest || frame < longest - 2 * micros(agc.lineDuration * 2) ||
++		    sim.exposure() != sim.ctx().activeState.agc.exposureLimit)
++			return fail(std::string(name) + ": 20 fps, frame " + std::to_string(frame) +
++				    " us, exposure " + std::to_string(sim.exposure()));
++
++		/* A fixed 20 fps in a brighter scene: the frame stays long, the gain comes down */
++		sim.brightness *= 100;
++		ControlList slow(limits(longest, longest));
++		sim.frame(&slow);
++		for (unsigned int i = 0; i < 200; i++)
++			md = sim.frame();
++		const int64_t slowFrame = micros(agc.lineDuration * sim.frameLines);
++		if (slowFrame > longest || slowFrame < longest - micros(agc.lineDuration * 2) ||
++		    sim.exposure() > sim.ctx().activeState.agc.exposureLimit ||
++		    sim.gain() > 8.0)
++			return fail(std::string(name) + ": fixed 20 fps, frame " +
++				    std::to_string(slowFrame) + " us, exposure " +
++				    std::to_string(sim.exposure()));
++
++		return TestPass;
++	}
++
++	int run() override
++	{
++		int ret = testFrameLength();
++		if (ret != TestPass)
++			return ret;
++
++		ret = testDark(kFull, "full");
++		if (ret != TestPass)
++			return ret;
++
++		return testDark(kBinned, "binned");
++	}
++};
++
++TEST_REGISTER(MtkIsp50AgcTest)
 diff --git a/test/mtkisp50/frames.cpp b/test/mtkisp50/frames.cpp
 new file mode 100644
 index 0000000..42b7cdc
@@ -11520,10 +12110,10 @@ index 0000000..42b7cdc
 +TEST_REGISTER(MtkIsp50FramesTest)
 diff --git a/test/mtkisp50/meson.build b/test/mtkisp50/meson.build
 new file mode 100644
-index 0000000..c28fd98
+index 0000000..f23719f
 --- /dev/null
 +++ b/test/mtkisp50/meson.build
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,63 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +if 'mtkisp50' not in pipelines
@@ -11556,6 +12146,19 @@ index 0000000..c28fd98
 +        'af.cpp',
 +        '../../src/ipa/mtkisp50/algorithms/af.cpp',
 +        '../../src/ipa/mtkisp50/algorithms/af_search.cpp',
++        '../../src/ipa/mtkisp50/ipa_context.cpp',
++    ],
++    'ipa': true,
++}
++
++# The frame length of the exposure regulation, with the autofocus
++mtkisp50_tests += {
++    'name': 'mtkisp50-agc',
++    'sources': [
++        'agc.cpp',
++        '../../src/ipa/mtkisp50/algorithms/af.cpp',
++        '../../src/ipa/mtkisp50/algorithms/af_search.cpp',
++        '../../src/ipa/mtkisp50/algorithms/agc.cpp',
 +        '../../src/ipa/mtkisp50/ipa_context.cpp',
 +    ],
 +    'ipa': true,
