@@ -29,9 +29,12 @@ Description:
    of the scene and a limit for highlights.
  - Exposure time for images taken by hand (key "handheld" of the program
    block, [time, total gain]): the preview and still image programs hold
-   the exposure time at that time up to that total gain, darker scenes
-   take the stages beyond; the video program keeps its own. Without the
-   key as before.
+   the exposure time at that time up to that total gain, in darker scenes
+   the time rises over the times of the longer stages at least at that
+   total gain, one step of the program after the other; the video program
+   keeps its own. Without the key as before. Down from a longer exposure
+   time a program keeps it while the total exposure is within a factor
+   below the step to it (key "hysteresis" in stops, default 0.3).
  - White balance in dim light: channel means averaged per unit of
    exposure over a few frames and judged against their noise, the last
    estimate held below it, the first one taken at once; module
@@ -146,7 +149,9 @@ Description:
    other outputs than the streaming ones waits until the ISP is idle, then
    the outputs are switched.
  - Controls: AeEnable, ExposureTimeMode/AnalogueGainMode with
-   ExposureTime/AnalogueGain, ExposureValue, AeMeteringMode,
+   ExposureTime/AnalogueGain, ExposureValue, AeMeteringMode (spot
+   metering over the AfWindows rectangle, also with a manual lens and on
+   a camera without autofocus),
    FrameDurationLimits (also as a control of the start), AwbEnable,
    AwbMode, ColourGains, ColourTemperature, AfMode/AfTrigger/AfWindows/
    AfPause, LensPosition, ScalerCrop and ScalerCropMaximum,
@@ -161,6 +166,17 @@ Description:
    frame length (VBLANK back to its default before the sensor format),
    so that the exposure limit of the default frame does not depend on
    the session before, also for a sensor with a single mode.
+ - Sensor controls of each frame: the capture device reports no frame
+   start; the handler records the time of each write and takes the values
+   a frame was taken with from the ends of the frames (on frame n act the
+   values written before the start of frame n - d + 1 for a delay of d,
+   the start being the end of the frame less the readout of its active
+   lines), and holds a write that would fall within 2 ms of a frame start
+   until 2 ms after it. The IPA gets these values with the parameters and
+   with the statistics of a frame: the digital gain of a frame makes up
+   the total exposure of the regulation over the exposure and gain the
+   sensor took it with, the metadata (exposure time, gains, frame
+   duration) describe the frame.
  - Mode changes (preview to photo and back) keep exposure (with the frame
    length), white balance, lens position and focus state; no new search
    after the return. Optional zone metering after the lens shading.
@@ -178,7 +194,10 @@ Description:
    without PD, a lens held during a series), the contrast scan over a
    curve recorded in dim light, exposure
    programs and the regulation with them, the limit of the exposure time
-   by hand, white balance in dim light and
+   by hand and its steps, the hysteresis of the steps, a sensor that takes
+   new values two frames late, spot metering, the sensor controls in
+   effect per frame from the times of the writes, white balance in dim
+   light and
    the preference, the exact fit of the white point, the steady rendering
    under a recorded drifting light, with the calibration of the module
    and for a new light, the temporal noise reduction (restarts, settings
@@ -395,10 +414,10 @@ index 3ee3ada..4ce3df8 100644
      'rpi/vc4': 'raspberrypi.mojom',
 diff --git a/include/libcamera/ipa/mtkisp50.mojom b/include/libcamera/ipa/mtkisp50.mojom
 new file mode 100644
-index 0000000..77495d9
+index 0000000..25fc5d7
 --- /dev/null
 +++ b/include/libcamera/ipa/mtkisp50.mojom
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,160 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +
 +/*
@@ -521,9 +540,12 @@ index 0000000..77495d9
 +	[async] queueRequest(uint32 frame, libcamera.ControlList controls);
 +	/*
 +	 * jobUse: what the ISP job of the frame makes (a frame with a still
-+	 * image of a session with still images, else the use of the session)
++	 * image of a session with still images, else the use of the session).
++	 * sensorControls: the exposure, gain and frame length the sensor took
++	 * the frame with (as for processStats()).
 +	 */
-+	[async] computeParams(uint32 frame, uint32 paramsBufferId, UseCase jobUse);
++	[async] computeParams(uint32 frame, uint32 paramsBufferId, UseCase jobUse,
++			      libcamera.ControlList sensorControls);
 +	[async] processStats(uint32 frame, uint32 statsBufferId,
 +			     libcamera.ControlList sensorControls);
 +
@@ -3616,10 +3638,10 @@ index 0000000..61fe9e1
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/agc.cpp b/src/ipa/mtkisp50/algorithms/agc.cpp
 new file mode 100644
-index 0000000..f9776f0
+index 0000000..3393015
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/agc.cpp
-@@ -0,0 +1,1359 @@
+@@ -0,0 +1,1515 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024, Red Hat Inc.
@@ -3755,7 +3777,11 @@ index 0000000..f9776f0
 + *   For images taken by hand: a long exposure blurs them with the shake of
 + *   the hand, the gain instead adds noise, which the multi-frame still image
 + *   takes out in part. The frames of a still image have the exposure of the
-+ *   preview, so the preview has the same limit.
++ *   preview, so the preview has the same limit. Optionally "hysteresis": in
++ *   stops (0.0 to 1.0, default 0.3), how far the total exposure has to come
++ *   below the step to a longer exposure time before the shorter one comes
++ *   back, so that a scene at a step does not switch the time (and with it
++ *   the frame length) back and forth.
 + * - fNumber: for the brightness of the scene (BV = log2(fNumber^2 / time) -
 + *   log2(gain) - 5 + log2(level / exposureTarget), ISO 100 at gain 1.0;
 + *   default 2.0)
@@ -3777,6 +3803,18 @@ index 0000000..f9776f0
 + *   statistics histogram); the zones are combined with zoneWeights (25
 + *   values row by row, default all equal). The regulated value is this mean
 + *   times the digital gain, meteringRange does not apply.
++ *
++ * With zone metering the control AeMeteringMode selects the weights:
++ * centre weighted (the tuned zoneWeights), matrix (all zones equal) or spot.
++ * Spot metering measures the area of the AfWindows rectangle (the first one,
++ * in the coordinates of the pixel array active area as for the autofocus,
++ * mapped through the analogue crop onto the sensor output frame and the
++ * statistics window), whatever the autofocus mode and also with a manual
++ * lens: each zone of the 15x15 grid of the statistics by the part of it the
++ * rectangle covers. Without a rectangle, or with one outside the statistics
++ * window, it measures the centre zone of the 5x5 grid. A camera whose
++ * autofocus does not take AfWindows (fixed focus) gets the control for the
++ * spot metering.
 + */
 +int Agc::init(IPAContext &context, const ValueNode &tuningData)
 +{
@@ -3849,6 +3887,13 @@ index 0000000..f9776f0
 +			LOG(IPAMtkIsp50Exposure, Error) << "Agc program needs a preview program";
 +			return -EINVAL;
 +		}
++
++		const double stops = prog["hysteresis"].get<double>(0.3);
++		if (!(stops >= 0.0 && stops <= 1.0)) {
++			LOG(IPAMtkIsp50Exposure, Error) << "Invalid Agc program hysteresis";
++			return -EINVAL;
++		}
++		stageHysteresis_ = std::exp2(stops);
 +
 +		/* The exposure time for images taken by hand (preview and still) */
 +		if (prog.contains("handheld")) {
@@ -4001,6 +4046,7 @@ index 0000000..f9776f0
 +	context.activeState.agc.converging = true;
 +	context.activeState.agc.levelRatio = 1.0;
 +	total_ = 0.0;
++	programTime_ = 0.0;
 +	highlightStops_ = 0.0;
 +	useCase_ = configInfo.useCase == UseCase::Video ? 1 : configInfo.useCase == UseCase::Still ? 2 : 0;
 +
@@ -4034,6 +4080,20 @@ index 0000000..f9776f0
 +
 +	/* The frame durations of the application carry over a configuration */
 +	updateFrameLimits(context);
++
++	/* Spot metering of a window also without an autofocus that takes one */
++	if (zoneMetering_) {
++		if (!context.ctrlMap.count(&controls::AfWindows)) {
++			Rectangle crop = context.sensorInfo.analogCrop;
++			if (crop.isNull())
++				crop = Rectangle(context.sensorInfo.outputSize);
++			context.ctrlMap[&controls::AfWindows] =
++				ControlInfo(Rectangle{},
++					    Rectangle(0, 0, crop.x + crop.width, crop.y + crop.height),
++					    Rectangle{});
++		}
++		updateSpotWeights(context);
++	}
 +
 +	/*
 +	 * Ranges in this sensor mode: the exposure up to the extended frame
@@ -4145,13 +4205,18 @@ index 0000000..f9776f0
 +	double sum = 0.0;
 +	double weights = 0.0;
 +
-+	for (unsigned int my = 0; my < kMeteringZones; my++) {
-+		for (unsigned int mx = 0; mx < kMeteringZones; mx++) {
++	/* Spot metering of a window: the zones of the statistics themselves */
++	const bool spot = meteringMode_ == controls::MeteringSpot && spotWindow_;
++	const unsigned int grid = spot ? Statistics::kZones : kMeteringZones;
++	const unsigned int block = Statistics::kZones / grid;
++
++	for (unsigned int my = 0; my < grid; my++) {
++		for (unsigned int mx = 0; mx < grid; mx++) {
 +			RGB<double> zone({ 0.0, 0.0, 0.0 });
 +			uint64_t count = 0;
 +
-+			for (unsigned int y = 3 * my; y < 3 * my + 3; y++) {
-+				for (unsigned int x = 3 * mx; x < 3 * mx + 3; x++) {
++			for (unsigned int y = block * my; y < block * my + block; y++) {
++				for (unsigned int x = block * mx; x < block * mx + block; x++) {
 +					const unsigned int i = y * Statistics::kZones + x;
 +					for (unsigned int c = 0; c < 3; c++)
 +						zone[c] += stats->zoneSum[i][c];
@@ -4159,14 +4224,13 @@ index 0000000..f9776f0
 +				}
 +			}
 +
-+			const double w = zoneWeights_[my * kMeteringZones + mx];
++			const double w = spot ? spotWeights_[my * grid + mx] : zoneWeights_[my * grid + mx];
 +			if (!count || !(w > 0.0) || !(range > 0.0))
 +				continue;
 +
 +			/* Gain of the lens shading correction at the block centre */
 +			const RGB<double> shading = meteringShading_
-+				? shadingGain(context, (mx + 0.5) / kMeteringZones,
-+					      (my + 0.5) / kMeteringZones)
++				? shadingGain(context, (mx + 0.5) / grid, (my + 0.5) / grid)
 +				: RGB<double>({ 1.0, 1.0, 1.0 });
 +
 +			double y = 0.0;
@@ -4183,6 +4247,57 @@ index 0000000..f9776f0
 +	}
 +
 +	return weights > 0.0 ? sum / weights : -1.0;
++}
++
++/*
++ * The zones of the statistics grid the AfWindows rectangle covers, each by
++ * the part of it covered: the rectangle in active area coordinates mapped
++ * through the analogue crop onto the sensor output frame and the statistics
++ * window (both in sensor output pixels)
++ */
++void Agc::updateSpotWeights(const IPAContext &context)
++{
++	spotWindow_ = false;
++	spotWeights_.fill(0.0);
++
++	const Size &out = context.sensorInfo.outputSize;
++	const Rectangle &win = context.configuration.statsWindow;
++	Rectangle crop = context.sensorInfo.analogCrop;
++	if (crop.isNull())
++		crop = Rectangle(out);
++	if (meteringWindow_.isNull() || out.isNull() || win.isNull() || crop.isNull())
++		return;
++
++	/* A coordinate of the active area as a fraction of the statistics window */
++	auto map = [](double v, double cropOrigin, double cropSize, double outSize,
++		      double winOrigin, double winSize) {
++		const double o = (v - cropOrigin) * outSize / cropSize;
++		return std::clamp((o - winOrigin) / winSize, 0.0, 1.0);
++	};
++	const double x0 = map(meteringWindow_.x, crop.x, crop.width, out.width, win.x, win.width);
++	const double x1 = map(static_cast<double>(meteringWindow_.x) + meteringWindow_.width,
++			      crop.x, crop.width, out.width, win.x, win.width);
++	const double y0 = map(meteringWindow_.y, crop.y, crop.height, out.height, win.y, win.height);
++	const double y1 = map(static_cast<double>(meteringWindow_.y) + meteringWindow_.height,
++			      crop.y, crop.height, out.height, win.y, win.height);
++
++	constexpr unsigned int n = Statistics::kZones;
++	double total = 0.0;
++	for (unsigned int y = 0; y < n; y++) {
++		const double h = std::min(y1, (y + 1.0) / n) - std::max(y0, static_cast<double>(y) / n);
++		for (unsigned int x = 0; x < n; x++) {
++			const double w = std::min(x1, (x + 1.0) / n) - std::max(x0, static_cast<double>(x) / n);
++			if (w > 0.0 && h > 0.0) {
++				spotWeights_[y * n + x] = w * h;
++				total += w * h;
++			}
++		}
++	}
++
++	spotWindow_ = total > 0.0;
++	LOG(IPAMtkIsp50Exposure, Debug)
++		<< "Spot window " << meteringWindow_ << ": " << x0 << "-" << x1 << " x " << y0
++		<< "-" << y1 << " of the statistics window" << (spotWindow_ ? "" : ", centre");
 +}
 +
 +/*
@@ -4276,6 +4391,19 @@ index 0000000..f9776f0
 +		limit = std::min(limit, std::max(agc.exposureMax, exposure));
 +
 +	return limit;
++}
++
++/* Largest digital gain of the regulation of the moment */
++double Agc::digitalGainLimit(const IPAContext &context) const
++{
++	const auto &agc = context.configuration.agc;
++
++	if (programs_[0] && !manualExposure_ && !manualGain_) {
++		const ExposureProgram &prog = programs_[useCase_ == 1 && programs_[1] ? 1 : 0].value();
++		return std::max(prog.maxGain() / agc.againMax, 1.0);
++	}
++
++	return maxDigitalGain_;
 +}
 +
 +/*
@@ -4679,7 +4807,9 @@ index 0000000..f9776f0
 +	total_ = total;
 +
 +	const ExposureProgram::Split split = prog.split(total, minTime, maxTime, agc.againMin,
-+							agc.againMax, dmaxFrames);
++							agc.againMax, dmaxFrames, programTime_,
++							stageHysteresis_);
++	programTime_ = split.time;
 +
 +	int32_t lines = static_cast<int32_t>(std::lround(split.time / agc.lineDuration.get<std::micro>()));
 +	lines = std::clamp(lines, agc.exposureMin, std::max(limitLines, agc.exposureMin));
@@ -4751,6 +4881,28 @@ index 0000000..f9776f0
 +	if (const auto &v = controls.get(controls::ExposureValue))
 +		exposureValue_ = std::clamp<double>(*v, -8.0, 8.0);
 +
++	/*
++	 * The window of the spot metering: the first AfWindows rectangle, as
++	 * a list or a single rectangle; an empty list none
++	 */
++	if (zoneMetering_ && controls.contains(controls::AfWindows.id())) {
++		const ControlValue &value = controls.get(controls::AfWindows.id());
++		if (value.type() == ControlTypeRectangle) {
++			Rectangle window;
++			if (!value.isArray()) {
++				window = value.get<Rectangle>();
++			} else {
++				const auto list = value.get<Span<const Rectangle>>();
++				if (!list.empty())
++					window = list[0];
++			}
++			if (window != meteringWindow_) {
++				meteringWindow_ = window;
++				updateSpotWeights(context);
++			}
++		}
++	}
++
 +	if (const auto &v = controls.get(controls::AeMeteringMode)) {
 +		meteringMode_ = static_cast<controls::AeMeteringModeEnum>(*v);
 +		switch (meteringMode_) {
@@ -4804,9 +4956,15 @@ index 0000000..f9776f0
 +		context.configuration.agc.lineDuration * frameContext.sensor.exposure;
 +	metadata.set(controls::ExposureTime, exposureTime.get<std::micro>());
 +	{
-+		/* The frame length that goes with the exposure of this frame */
++		/*
++		 * The frame length the frame was taken with, else the one that
++		 * goes with its exposure
++		 */
 +		const auto &agc = context.configuration.agc;
-+		const int32_t lines = agc.vblankEnabled
++		const int32_t height = static_cast<int32_t>(context.sensorInfo.outputSize.height);
++		const int32_t lines = frameContext.sensor.vblank >= 0 && height > 0
++					      ? height + frameContext.sensor.vblank
++				      : agc.vblankEnabled
 +					      ? agc.frame.linesFor(frameContext.sensor.exposure,
 +								   context.activeState.agc.minFrameLines)
 +					      : agc.frame.defaultLines;
@@ -4948,11 +5106,34 @@ index 0000000..f9776f0
 +
 +/**
 + * \brief Apply the digital gain to the colour gains of the debayer parameters
++ *
++ * The digital gain acts on the frame it is prepared for, the exposure and
++ * gain written to the sensor reach the frames only later (the sensor delays,
++ * also a frame length that changes with them). The digital gain of a frame
++ * therefore goes with the exposure and gain the sensor took this frame with
++ * (frameContext.sensor): it makes up the total exposure the regulation set,
++ * within its range, so that a frame taken before new values of the sensor
++ * arrive has the brightness of the regulation already, and one taken with
++ * them does not have the old digital gain on top.
 + */
 +void Agc::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
 +		  IPAFrameContext &frameContext, DipFrameParams *params)
 +{
-+	double digitalGain = context.activeState.agc.digitalGain;
++	const auto &agc = context.configuration.agc;
++	const auto &state = context.activeState.agc;
++	/* Without the values of the frame those of the regulation */
++	const bool taken = frameContext.sensor.exposure > 0 && frameContext.sensor.gain > 0.0;
++	const double tFrame = utils::Duration(agc.lineDuration * (taken ? frameContext.sensor.exposure
++									: state.exposure)).get<std::micro>();
++	const double aFrame = taken ? frameContext.sensor.gain : state.again;
++	double digitalGain = state.digitalGain;
++
++	const bool regulated = aeEnable_ && !(manualExposure_ && manualGain_);
++	if (regulated && state.valid && tFrame > 0.0 && aFrame > 0.0) {
++		const double tSet = utils::Duration(agc.lineDuration * state.exposure).get<std::micro>();
++		digitalGain = std::clamp(tSet * state.again * state.digitalGain / (tFrame * aFrame),
++					 1.0, std::max(digitalGainLimit(context), 1.0));
++	}
 +
 +	/*
 +	 * A frame for a still image: the digital gain the still program
@@ -4960,12 +5141,9 @@ index 0000000..f9776f0
 +	 */
 +	if (params->useCase == static_cast<uint8_t>(UseCase::Still) && programs_[2] && total_ > 0.0 &&
 +	    !manualExposure_ && !manualGain_) {
-+		const auto &agc = context.configuration.agc;
-+		const double t = utils::Duration(agc.lineDuration * context.activeState.agc.exposure).get<std::micro>();
-+		const double a = context.activeState.agc.again;
-+		const double dmax = std::max(programs_[2]->maxGain() / agc.againMax, 1.0);
-+		if (t > 0.0 && a > 0.0)
-+			digitalGain = std::clamp(total_ / (t * a), digitalGain, dmax);
++		const double dmax = std::max(programs_[2]->maxGain() / agc.againMax, digitalGain);
++		if (tFrame > 0.0 && aFrame > 0.0)
++			digitalGain = std::clamp(total_ / (tFrame * aFrame), digitalGain, dmax);
 +	}
 +
 +	frameContext.digitalGain = digitalGain;
@@ -4981,10 +5159,10 @@ index 0000000..f9776f0
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/agc.h b/src/ipa/mtkisp50/algorithms/agc.h
 new file mode 100644
-index 0000000..df79493
+index 0000000..590e3ea
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/agc.h
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,146 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024, Red Hat Inc.
@@ -5041,10 +5219,12 @@ index 0000000..df79493
 +	static double interpolate(const std::vector<double> &x, const std::vector<double> &y, double v);
 +	double stepFactor(double error) const;
 +	double zoneMean(const IPAContext &context, const Statistics *stats) const;
++	void updateSpotWeights(const IPAContext &context);
 +	RGB<double> shadingGain(const IPAContext &context, double x, double y) const;
 +	void applyManual(IPAContext &context, IPAFrameContext &frameContext);
 +	void updateFrameLimits(IPAContext &context) const;
 +	int32_t exposureLimit(const IPAContext &context, int32_t exposure) const;
++	double digitalGainLimit(const IPAContext &context) const;
 +	void fitExposure(const IPAContext &context, int32_t &exposure, double &again,
 +			 int32_t limit) const;
 +
@@ -5076,6 +5256,14 @@ index 0000000..df79493
 +	}();
 +	/* Weights of the metering modes: tuned centre weighted, spot, matrix */
 +	std::array<double, kMeteringZones * kMeteringZones> tunedWeights_{};
++	/*
++	 * Spot metering of the AfWindows rectangle (active area coordinates,
++	 * null for none): weights of the zones of the statistics grid by the
++	 * part of each zone it covers, valid if it covers any
++	 */
++	Rectangle meteringWindow_;
++	std::array<double, Statistics::kZones * Statistics::kZones> spotWeights_{};
++	bool spotWindow_ = false;
 +	/* Measure after the lens shading correction, and its scale */
 +	bool meteringShading_ = false;
 +	double meteringScale_ = 1.0;
@@ -5087,6 +5275,12 @@ index 0000000..df79493
 +	 */
 +	std::array<std::optional<ExposureProgram>, 3> programs_;
 +	double total_ = 0.0;
++	/*
++	 * Exposure time of the last split (us), and the factor of the total
++	 * exposure below the step to it within which it stays
++	 */
++	double programTime_ = 0.0;
++	double stageHysteresis_ = 1.0;
 +	unsigned int useCase_ = 0;
 +	double fNumber_ = 2.0;
 +	/* Target over the brightness of the scene: offset in stops over BV */
@@ -9075,10 +9269,10 @@ index 0000000..33920ee
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/exposure_program.cpp b/src/ipa/mtkisp50/exposure_program.cpp
 new file mode 100644
-index 0000000..d516e0f
+index 0000000..eb1a6da
 --- /dev/null
 +++ b/src/ipa/mtkisp50/exposure_program.cpp
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,161 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Exposure program: how a total exposure is split into exposure time,
@@ -9151,7 +9345,8 @@ index 0000000..d516e0f
 +
 +ExposureProgram::Split ExposureProgram::split(double total, double minTime, double maxTime,
 +					      double againMin, double againMax,
-+					      double dgainMax) const
++					      double dgainMax, double keepTime,
++					      double keepFactor) const
 +{
 +	againMin = std::max(againMin, 1e-3);
 +	againMax = std::max(againMax, againMin);
@@ -9189,6 +9384,15 @@ index 0000000..d516e0f
 +			time = total / againMin;
 +	}
 +
++	/*
++	 * Down from a longer time: it stays while a total larger by the
++	 * factor would still take it, and it reaches the total at a gain
++	 */
++	if (keepTime > time && keepFactor > 1.0 && keepTime <= maxTime &&
++	    total >= keepTime * againMin &&
++	    split(total * keepFactor, minTime, maxTime, againMin, againMax, dgainMax).time >= keepTime)
++		time = keepTime;
++
 +	time = std::clamp(time, minTime, maxTime);
 +
 +	const double gain = std::clamp(total / time, againMin, againMax * dgainMax);
@@ -9210,9 +9414,10 @@ index 0000000..d516e0f
 +		return *this;
 +	stages.push_back({ time, gain });
 +
++	/* Products keep rising: each is at least the one before at a longer time */
 +	for (const Stage &s : stages_) {
-+		if (s.time > time && s.time * s.gain > total)
-+			stages.push_back(s);
++		if (s.time > time)
++			stages.push_back({ s.time, std::max(s.gain, gain) });
 +	}
 +
 +	return fromStages(std::move(stages));
@@ -9231,10 +9436,10 @@ index 0000000..d516e0f
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/exposure_program.h b/src/ipa/mtkisp50/exposure_program.h
 new file mode 100644
-index 0000000..3c14c40
+index 0000000..821c1ba
 --- /dev/null
 +++ b/src/ipa/mtkisp50/exposure_program.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,90 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Exposure program: how a total exposure is split into exposure time,
@@ -9266,6 +9471,12 @@ index 0000000..3c14c40
 + * it (or the limit itself if no stage is), the gain takes the rest. A stage
 + * up to 2 % beyond the limit is shortened to it (the longest frame of a mode
 + * may end just short of a stage).
++ *
++ * The time steps from one stage to the next where the total exposure reaches
++ * the next one. Back down it may stay at the longer time (the time of the
++ * frames before) while the total is within a factor of the step: a scene
++ * close to a step then does not switch between the two times with every
++ * small change.
 + */
 +class ExposureProgram
 +{
@@ -9285,15 +9496,24 @@ index 0000000..3c14c40
 +	static std::optional<ExposureProgram> fromTuning(const ValueNode &node);
 +	static std::optional<ExposureProgram> fromStages(std::vector<Stage> stages);
 +
++	/*
++	 * \a keepTime: time of the frames before (0 for none), kept while
++	 * the total is within \a keepFactor (1.0: none) below the step to it
++	 */
 +	Split split(double total, double minTime, double maxTime, double againMin,
-+		    double againMax, double dgainMax) const;
++		    double againMax, double dgainMax, double keepTime = 0.0,
++		    double keepFactor = 1.0) const;
 +
 +	/*
 +	 * The program with the exposure time held at \a time up to a total
-+	 * gain of \a gain: the stages below that total and from that time on
-+	 * give way to the stage [time, gain], the stages beyond take over in
-+	 * darker scenes. If a shorter stage reaches that total already, the
-+	 * program stays as it is. Nothing if the result is not a program.
++	 * gain of \a gain: the stages below that total give way to the stage
++	 * [time, gain]. In darker scenes the time grows over the times of the
++	 * longer stages at least at that total gain: a stage beyond keeps its
++	 * time, its total gain is at least \a gain. The time then rises in
++	 * the steps of the program (multiples of the flicker period) rather
++	 * than to the first stage that reaches more than the held one. If a
++	 * shorter stage reaches that total already, the program stays as it
++	 * is. Nothing if the result is not a program.
 +	 */
 +	std::optional<ExposureProgram> limited(double time, double gain) const;
 +
@@ -9492,10 +9712,10 @@ index 0000000..9958d5f
 +} /* namespace libcamera::ipa::mtkisp50 */
 diff --git a/src/ipa/mtkisp50/ipa_context.h b/src/ipa/mtkisp50/ipa_context.h
 new file mode 100644
-index 0000000..56afd9a
+index 0000000..0665b2f
 --- /dev/null
 +++ b/src/ipa/mtkisp50/ipa_context.h
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,178 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024-2026 Red Hat, Inc.
@@ -9621,9 +9841,15 @@ index 0000000..56afd9a
 +struct IPAFrameContext : public FrameContext {
 +	Matrix<float, 3, 3> ccm;
 +
++	/*
++	 * Exposure and gain of the sensor for the frame: those it was taken
++	 * with (from computeParams() on), and in process() the new ones
++	 * regulated after it. VBLANK it was taken with, -1 if unknown.
++	 */
 +	struct {
 +		int32_t exposure;
 +		double gain;
++		int32_t vblank = -1;
 +	} sensor;
 +
 +	RGB<float> gains;
@@ -9749,10 +9975,10 @@ index 0000000..e38120a
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/mtkisp50.cpp b/src/ipa/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..64747e4
+index 0000000..96d54c6
 --- /dev/null
 +++ b/src/ipa/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,841 @@
+@@ -0,0 +1,857 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2023, Linaro Ltd
@@ -9832,7 +10058,7 @@ index 0000000..64747e4
 +
 +	void queueRequest(const uint32_t frame, const ControlList &controls) override;
 +	void computeParams(const uint32_t frame, const uint32_t paramsBufferId,
-+			   const UseCase jobUse) override;
++			   const UseCase jobUse, const ControlList &sensorControls) override;
 +	void processStats(const uint32_t frame, const uint32_t statsBufferId,
 +			  const ControlList &sensorControls) override;
 +
@@ -9847,6 +10073,8 @@ index 0000000..64747e4
 +
 +private:
 +	void resetParams();
++	bool takeSensorControls(uint32_t frame, IPAFrameContext &frameContext,
++				const ControlList &sensorControls);
 +	void saveState();
 +	void restoreState();
 +	uint32_t encodeInto(uint32_t paramsBufferId);
@@ -10265,12 +10493,42 @@ index 0000000..64747e4
 +		algo->queueRequest(context_, frame, frameContext, controls);
 +}
 +
++/*
++ * The exposure, gain and frame length the sensor took the frame with, as the
++ * pipeline handler gives them; without them the values of the regulation
++ */
++bool IPAMtkIsp50::takeSensorControls(uint32_t frame, IPAFrameContext &frameContext,
++				     const ControlList &sensorControls)
++{
++	const ControlValue &exposure = sensorControls.get(V4L2_CID_EXPOSURE);
++	const ControlValue &gain = sensorControls.get(V4L2_CID_ANALOGUE_GAIN);
++	const ControlValue &vblank = sensorControls.get(V4L2_CID_VBLANK);
++	frameContext.sensor.vblank = vblank.type() == ControlTypeInteger32 ? vblank.get<int32_t>() : -1;
++
++	if (exposure.type() == ControlTypeInteger32 && gain.type() == ControlTypeInteger32) {
++		frameContext.sensor.exposure = exposure.get<int32_t>();
++		int32_t again = gain.get<int32_t>();
++		frameContext.sensor.gain = camHelper_ ? camHelper_->gain(again) : again;
++		return true;
++	}
++
++	LOG(IPAMtkIsp50, Error)
++		<< "Frame " << frame << ": sensor controls missing or of the wrong type"
++		<< " (exposure type " << static_cast<int>(exposure.type())
++		<< ", gain type " << static_cast<int>(gain.type()) << "), keeping the last values";
++	frameContext.sensor.exposure = context_.activeState.agc.exposure;
++	frameContext.sensor.gain = context_.activeState.agc.again;
++	return false;
++}
++
 +void IPAMtkIsp50::computeParams(const uint32_t frame, const uint32_t paramsBufferId,
-+				const UseCase jobUse)
++				const UseCase jobUse, const ControlList &sensorControls)
 +{
 +	context_.activeState.combinedMatrix = Matrix<float, 3, 3>::identity();
 +
 +	IPAFrameContext &frameContext = context_.frameContexts.get(frame);
++	/* What the algorithms derive from the exposure follows the frame */
++	takeSensorControls(frame, frameContext, sensorControls);
 +
 +	const bool seriesJob = jobUse == UseCase::StillSeries || jobUse == UseCase::SeriesFrame;
 +	/* Frames of a series are still image frames for the algorithms */
@@ -10473,24 +10731,8 @@ index 0000000..64747e4
 +{
 +	IPAFrameContext &frameContext = context_.frameContexts.get(frame);
 +
-+	/*
-+	 * Software ISP stats are valid only for some frames: the values of
-+	 * the sensor controls of this frame are in sensorControls.
-+	 */
-+	const ControlValue &exposure = sensorControls.get(V4L2_CID_EXPOSURE);
-+	const ControlValue &gain = sensorControls.get(V4L2_CID_ANALOGUE_GAIN);
-+	if (exposure.type() == ControlTypeInteger32 && gain.type() == ControlTypeInteger32) {
-+		frameContext.sensor.exposure = exposure.get<int32_t>();
-+		int32_t again = gain.get<int32_t>();
-+		frameContext.sensor.gain = camHelper_ ? camHelper_->gain(again) : again;
-+	} else {
-+		LOG(IPAMtkIsp50, Error)
-+			<< "Frame " << frame << ": sensor controls missing or of the wrong type"
-+			<< " (exposure type " << static_cast<int>(exposure.type())
-+			<< ", gain type " << static_cast<int>(gain.type()) << "), keeping the last values";
-+		frameContext.sensor.exposure = context_.activeState.agc.exposure;
-+		frameContext.sensor.gain = context_.activeState.agc.again;
-+	}
++	/* The values of the sensor controls this frame was taken with */
++	takeSensorControls(frame, frameContext, sensorControls);
 +
 +	auto it = buffers_.find(statsBufferId);
 +	if (it != buffers_.end() &&
@@ -14130,10 +14372,10 @@ index 0000000..670ed64
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/frames.h b/src/libcamera/pipeline/mtkisp50/frames.h
 new file mode 100644
-index 0000000..9fc4557
+index 0000000..152c200
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/frames.h
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,201 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Per request bookkeeping of the mtkisp50 pipeline
@@ -14147,6 +14389,8 @@ index 0000000..9fc4557
 +#include <queue>
 +#include <stdint.h>
 +#include <vector>
++
++#include <libcamera/controls.h>
 +
 +namespace libcamera {
 +
@@ -14202,6 +14446,8 @@ index 0000000..9fc4557
 +
 +		uint32_t rawSequence;
 +		uint64_t rawTimestamp;
++		/* Sensor controls the raw frame was taken with */
++		ControlList sensorControls;
 +		/* Phase detection frame of the same sensor frame, if any */
 +		FrameBuffer *pdBuffer;
 +		/* Size of the parameters of the ISP job, 0 for none */
@@ -14333,10 +14579,10 @@ index 0000000..9fc4557
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/meson.build b/src/libcamera/pipeline/mtkisp50/meson.build
 new file mode 100644
-index 0000000..b3d288a
+index 0000000..52a2778
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/meson.build
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,26 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +libcamera_internal_sources += files([
@@ -14346,6 +14592,7 @@ index 0000000..b3d288a
 +    'multi_frame.cpp',
 +    'pd.cpp',
 +    'raw_stats_cpu.cpp',
++    'sensor_timeline.cpp',
 +    'streams.cpp',
 +])
 +
@@ -14364,10 +14611,10 @@ index 0000000..b3d288a
 +libcamera_deps += declare_dependency(link_whole : mtkisp50_align)
 diff --git a/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..312c286
+index 0000000..79382be
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,3756 @@
+@@ -0,0 +1,3915 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the MediaTek MT6785 camera subsystem with the ISP pass 2
@@ -14437,7 +14684,6 @@ index 0000000..312c286
 +#include "libcamera/internal/camera_manager.h"
 +#include "libcamera/internal/camera_sensor.h"
 +#include "libcamera/internal/camera_sensor_properties.h"
-+#include "libcamera/internal/delayed_controls.h"
 +#include "libcamera/internal/device_enumerator.h"
 +#include "libcamera/internal/dma_buf_allocator.h"
 +#include "libcamera/internal/formats.h"
@@ -14456,11 +14702,13 @@ index 0000000..312c286
 +#include "multi_frame.h"
 +#include "pd.h"
 +#include "raw_stats_cpu.h"
++#include "sensor_timeline.h"
 +#include "streams.h"
 +
 +namespace libcamera {
 +
 +LOG_DEFINE_CATEGORY(MtkIsp50)
++LOG_DEFINE_CATEGORY(MtkIsp50Sensor)
 +
 +namespace {
 +
@@ -14875,7 +15123,19 @@ index 0000000..312c286
 +	bool ispAvailable_ = false;
 +	std::unique_ptr<ipa::mtkisp50::IPAProxyMtkIsp50> ipa_;
 +	ControlInfoMap ipaControls_;
-+	std::unique_ptr<DelayedControls> delayedCtrls_;
++
++	/*
++	 * Sensor controls: which frame the values written reach, and the
++	 * values waiting for a write clear of a frame start
++	 */
++	MtkIsp50SensorTimeline sensorTimeline_;
++	std::map<uint32_t, unsigned int> sensorDelays_;
++	ControlList pendingSensorControls_;
++	/* Values asked for last (the driver may round them) */
++	MtkIsp50SensorTimeline::Values requestedSensorControls_;
++	Timer sensorWriteTimer_;
++	/* Longest recent duration of a write */
++	int64_t sensorWriteNs_ = 0;
 +
 +	/* Configuration */
 +	V4L2SubdeviceFormat sensorFormat_;
@@ -15030,6 +15290,10 @@ index 0000000..312c286
 +
 +	void setSensorControls(uint32_t frame, const ControlList &sensorControls,
 +			       const ControlList &lensControls);
++	void writeSensorControls();
++	void configureSensorTimeline(const IPACameraSensorInfo &sensorInfo);
++	void resetSensorTimeline();
++	ControlList sensorControlsOf(const MtkIsp50SensorTimeline::Values &values) const;
 +	void paramsComputed(uint32_t frame, uint32_t bytesused,
 +			    const ipa::mtkisp50::StatsConfig &config, uint32_t seriesFrames);
 +	void metadataReady(uint32_t frame, const ControlList &metadata);
@@ -15264,14 +15528,15 @@ index 0000000..312c286
 +		LOG(MtkIsp50, Info) << "No capture device for the PD frames of " << sensor_->id();
 +
 +	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
-+	std::unordered_map<uint32_t, DelayedControls::ControlParams> params = {
-+		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
-+		{ V4L2_CID_EXPOSURE, { delays.exposureDelay, false } },
++	sensorDelays_ = {
++		{ V4L2_CID_ANALOGUE_GAIN, delays.gainDelay },
++		{ V4L2_CID_EXPOSURE, delays.exposureDelay },
 +	};
 +	/* The IPA may raise the frame length for longer exposures. */
 +	if (sensor_->controls().count(V4L2_CID_VBLANK))
-+		params[V4L2_CID_VBLANK] = { delays.vblankDelay, true };
-+	delayedCtrls_ = std::make_unique<DelayedControls>(sensor_->device(), params);
++		sensorDelays_[V4L2_CID_VBLANK] = delays.vblankDelay;
++	pendingSensorControls_ = ControlList(sensor_->controls());
++	sensorWriteTimer_.timeout.connect(this, &MtkIsp50CameraData::writeSensorControls);
 +
 +	return 0;
 +}
@@ -15553,24 +15818,154 @@ index 0000000..312c286
 +	return 0;
 +}
 +
++namespace {
++
++int64_t monotonicNs()
++{
++	return std::chrono::duration_cast<std::chrono::nanoseconds>(
++		       std::chrono::steady_clock::now().time_since_epoch())
++		.count();
++}
++
++/* Margin of a sensor write from a frame start */
++constexpr int64_t kSensorWriteGuardNs = 2000000;
++
++} /* namespace */
++
++/*
++ * The timing of the frames of the sensor mode: line duration and active
++ * lines, from which the frame starts follow the ends of the frames
++ */
++void MtkIsp50CameraData::configureSensorTimeline(const IPACameraSensorInfo &sensorInfo)
++{
++	MtkIsp50SensorTimeline::Timing timing;
++	if (sensorInfo.pixelRate)
++		timing.lineNs = static_cast<int64_t>(sensorInfo.minLineLength) * 1000000000 /
++				static_cast<int64_t>(sensorInfo.pixelRate);
++	timing.activeLines = static_cast<int32_t>(sensorInfo.outputSize.height);
++	timing.guardNs = kSensorWriteGuardNs;
++
++	sensorTimeline_.configure(sensorDelays_, V4L2_CID_VBLANK, timing);
++
++	LOG(MtkIsp50Sensor, Debug)
++		<< "Frames: line " << timing.lineNs << " ns, " << timing.activeLines
++		<< " active lines";
++}
++
++/* At the start of a stream: the values of the sensor now are those of the first frames */
++void MtkIsp50CameraData::resetSensorTimeline()
++{
++	sensorWriteTimer_.stop();
++	pendingSensorControls_.clear();
++	requestedSensorControls_.clear();
++
++	std::vector<uint32_t> ids;
++	for (const auto &[id, delay] : sensorDelays_)
++		ids.push_back(id);
++
++	const ControlList current = sensor_->getControls(ids);
++	MtkIsp50SensorTimeline::Values values;
++	for (const auto &[id, value] : current) {
++		if (value.type() == ControlTypeInteger32)
++			values[id] = value.get<int32_t>();
++	}
++	sensorTimeline_.reset(values);
++}
++
++ControlList MtkIsp50CameraData::sensorControlsOf(const MtkIsp50SensorTimeline::Values &values) const
++{
++	ControlList controls(sensor_->controls());
++	for (const auto &[id, value] : values)
++		controls.set(id, value);
++	return controls;
++}
++
++/*
++ * Write the pending sensor controls: a new frame length goes first, the
++ * exposure limit of the sensor follows it
++ */
++void MtkIsp50CameraData::writeSensorControls()
++{
++	if (pendingSensorControls_.empty())
++		return;
++
++	ControlList vblank(sensor_->controls());
++	ControlList ctrls(sensor_->controls());
++	for (const auto &[id, value] : pendingSensorControls_)
++		(id == V4L2_CID_VBLANK ? vblank : ctrls).set(id, value);
++	pendingSensorControls_.clear();
++
++	/* The lists come back with the values the driver applied */
++	const int64_t begin = monotonicNs();
++	if (!vblank.empty())
++		sensor_->setControls(&vblank);
++	if (!ctrls.empty())
++		sensor_->setControls(&ctrls);
++	const int64_t end = monotonicNs();
++
++	MtkIsp50SensorTimeline::Values values;
++	std::ostringstream text;
++	for (const ControlList *list : { &vblank, &ctrls }) {
++		for (const auto &[id, value] : *list) {
++			if (value.type() != ControlTypeInteger32)
++				continue;
++			values[id] = value.get<int32_t>();
++			text << " " << utils::hex(id) << "=" << values[id];
++		}
++	}
++	sensorTimeline_.written(values, begin, end);
++	/* Follows a longer write at once, a shorter one slowly */
++	sensorWriteNs_ = std::max(end - begin, sensorWriteNs_ - sensorWriteNs_ / 16);
++
++	LOG(MtkIsp50Sensor, Debug)
++		<< "Written at " << begin << " in " << (end - begin) / 1000 << " us:" << text.str();
++}
++
++/*
++ * The capture device has no frame start event: the controls go to the sensor
++ * right away, unless the write would come close to the start of a frame,
++ * where it is not clear which frame takes the values (see
++ * MtkIsp50SensorTimeline). Then they wait until shortly after that start.
++ */
 +void MtkIsp50CameraData::setSensorControls([[maybe_unused]] uint32_t frame,
 +					   const ControlList &sensorControls,
 +					   const ControlList &lensControls)
 +{
-+	delayedCtrls_->push(sensorControls);
++	if (stopping_)
++		return;
 +
 +	/*
-+	 * Without a frame start event of the capture device the controls are
-+	 * applied right away, as the simple pipeline handler does. A new frame
-+	 * length goes first, the exposure limit of the sensor follows it.
++	 * Values the sensor has or is about to get need no write, nor do
++	 * those asked for last (which the driver may have rounded)
 +	 */
-+	ControlList ctrls(sensorControls);
-+	if (ctrls.contains(V4L2_CID_VBLANK)) {
-+		ControlList vblank(sensor_->controls());
-+		vblank.set(V4L2_CID_VBLANK, ctrls.get(V4L2_CID_VBLANK));
-+		sensor_->setControls(&vblank);
++	const MtkIsp50SensorTimeline::Values &latest = sensorTimeline_.latest();
++	for (const auto &[id, value] : sensorControls) {
++		if (value.type() != ControlTypeInteger32) {
++			pendingSensorControls_.set(id, value);
++			continue;
++		}
++		const int32_t v = value.get<int32_t>();
++		const auto it = latest.find(id);
++		const auto asked = requestedSensorControls_.find(id);
++		if (pendingSensorControls_.contains(id) ||
++		    ((it == latest.end() || v != it->second) &&
++		     (asked == requestedSensorControls_.end() || v != asked->second)))
++			pendingSensorControls_.set(id, value);
++		requestedSensorControls_[id] = v;
 +	}
-+	sensor_->setControls(&ctrls);
++
++	if (!pendingSensorControls_.empty() && !sensorWriteTimer_.isRunning()) {
++		const int64_t now = monotonicNs();
++		const int64_t at = sensorTimeline_.safeWriteTime(now, sensorWriteNs_);
++		if (at <= now) {
++			writeSensorControls();
++		} else {
++			sensorWriteTimer_.start(std::chrono::steady_clock::time_point(
++				std::chrono::nanoseconds(at)));
++			LOG(MtkIsp50Sensor, Debug)
++				<< "Waiting " << (at - now) / 1000 << " us for a frame start";
++		}
++	}
 +
 +	CameraLens *lens = sensor_->focusLens();
 +	if (lens && lensControls.contains(V4L2_CID_FOCUS_ABSOLUTE)) {
@@ -16214,6 +16609,7 @@ index 0000000..312c286
 +	ret = data->sensor_->sensorInfo(&sensorInfo);
 +	if (ret)
 +		return ret;
++	data->configureSensorTimeline(sensorInfo);
 +
 +	const Rectangle &analog = sensorInfo.analogCrop;
 +	const Size &out = sensorInfo.outputSize;
@@ -16550,7 +16946,7 @@ index 0000000..312c286
 +		}
 +	}
 +
-+	data->delayedCtrls_->reset();
++	data->resetSensorTimeline();
 +
 +	activeData_ = data;
 +
@@ -16613,6 +17009,8 @@ index 0000000..312c286
 +
 +	/* Returned buffers come back cancelled and complete their requests */
 +	data->stopping_ = true;
++	data->sensorWriteTimer_.stop();
++	data->pendingSensorControls_.clear();
 +	data->frames_.holdIsp(true);
 +	if (data->pd_.streaming) {
 +		data->pd_.video->streamOff();
@@ -16874,6 +17272,14 @@ index 0000000..312c286
 +	info->captured = true;
 +	info->rawSequence = buffer->metadata().sequence;
 +	info->rawTimestamp = buffer->metadata().timestamp;
++	/* The values the sensor took this frame with, also for a failed one */
++	const MtkIsp50SensorTimeline::Values taken =
++		data->sensorTimeline_.frame(info->rawSequence, static_cast<int64_t>(info->rawTimestamp));
++	info->sensorControls = data->sensorControlsOf(taken);
++	LOG(MtkIsp50Sensor, Debug)
++		<< "Frame " << info->id << " (" << info->rawSequence << ") ended at "
++		<< info->rawTimestamp << ", exposure "
++		<< (taken.count(V4L2_CID_EXPOSURE) ? taken.at(V4L2_CID_EXPOSURE) : -1);
 +
 +	if (info->seriesCandidate)
 +		seriesCandidateCaptured(data, info,
@@ -16963,7 +17369,8 @@ index 0000000..312c286
 +		jobUse = UseCase::StillSeries;
 +
 +	data->paramsPending_++;
-+	data->ipa_->computeParams(info->id, info->paramsBuffer->cookie(), jobUse);
++	data->ipa_->computeParams(info->id, info->paramsBuffer->cookie(), jobUse,
++				  info->sensorControls);
 +}
 +
 +void PipelineHandlerMtkIsp50::ispRawBufferReady(FrameBuffer *buffer)
@@ -17155,8 +17562,7 @@ index 0000000..312c286
 +		info->pdBuffer = nullptr;
 +	}
 +
-+	data->ipa_->processStats(frame, info->statsBuffer->cookie(),
-+				 data->delayedCtrls_->get(frame));
++	data->ipa_->processStats(frame, info->statsBuffer->cookie(), info->sensorControls);
 +
 +	tryComplete(data, info);
 +}
@@ -21261,6 +21667,306 @@ index 0000000..c54b38b
 +};
 +
 +} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/mtkisp50/sensor_timeline.cpp b/src/libcamera/pipeline/mtkisp50/sensor_timeline.cpp
+new file mode 100644
+index 0000000..f41f93a
+--- /dev/null
++++ b/src/libcamera/pipeline/mtkisp50/sensor_timeline.cpp
+@@ -0,0 +1,188 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Sensor controls in effect for each frame, from the times they were written
++ */
++
++#include "sensor_timeline.h"
++
++#include <algorithm>
++#include <limits>
++
++namespace libcamera {
++
++namespace {
++
++/* Frames whose ends are kept, and writes kept per control without frames */
++constexpr unsigned int kEnds = 8;
++constexpr unsigned int kWrites = 64;
++
++} /* namespace */
++
++void MtkIsp50SensorTimeline::configure(const std::map<uint32_t, unsigned int> &delays,
++				       uint32_t vblankId, const Timing &timing)
++{
++	controls_.clear();
++	for (const auto &[id, delay] : delays)
++		controls_[id].delay = std::max(delay, 1u);
++	vblankId_ = controls_.count(vblankId) ? vblankId : 0;
++	timing_ = timing;
++	reset({});
++}
++
++void MtkIsp50SensorTimeline::reset(const Values &values)
++{
++	for (auto &[id, control] : controls_) {
++		const auto it = values.find(id);
++		control.known = it != values.end();
++		control.base = control.known ? it->second : 0;
++		control.writes.clear();
++	}
++	latest_ = values;
++	ends_.clear();
++	const auto it = values.find(vblankId_);
++	lastVblank_ = vblankId_ && it != values.end() ? it->second : 0;
++}
++
++void MtkIsp50SensorTimeline::written(const Values &values, [[maybe_unused]] int64_t begin,
++				     int64_t end)
++{
++	/*
++	 * A write counts from its end: one that had not ended at a frame
++	 * start is taken for the next (safeWriteTime() keeps writes apart
++	 * from the frame starts, so that this does not decide).
++	 */
++	for (const auto &[id, value] : values) {
++		auto it = controls_.find(id);
++		latest_[id] = value;
++		if (it == controls_.end())
++			continue;
++
++		Control &control = it->second;
++		if (!control.known) {
++			control.base = value;
++			control.known = true;
++			continue;
++		}
++		control.writes.push_back({ end, value });
++		if (control.writes.size() > kWrites) {
++			control.base = control.writes.front().value;
++			control.writes.pop_front();
++		}
++	}
++}
++
++int64_t MtkIsp50SensorTimeline::frameNs(int32_t vblank) const
++{
++	if (vblankId_)
++		return (timing_.activeLines + vblank) * timing_.lineNs;
++
++	/* Without the frame length: the interval of the last two frames */
++	if (ends_.size() >= 2) {
++		auto last = ends_.rbegin();
++		auto before = std::next(last);
++		const uint32_t frames = last->first - before->first;
++		if (frames)
++			return (last->second - before->second) / frames;
++	}
++
++	return 0;
++}
++
++/*
++ * Start of the frame \a sequence, from its end if it was seen, else from the
++ * end of a later frame \a laterEnd back by \a backNs
++ */
++int64_t MtkIsp50SensorTimeline::frameStart(uint32_t sequence, int64_t laterEnd,
++					    int64_t backNs) const
++{
++	const auto it = ends_.find(sequence);
++	const int64_t end = it != ends_.end() ? it->second : laterEnd - backNs;
++
++	return end - timing_.activeLines * timing_.lineNs - timing_.startOffsetNs;
++}
++
++int32_t MtkIsp50SensorTimeline::valueAt(Control &control, int64_t time)
++{
++	/* The starts asked for rise with the frames: earlier writes are done */
++	while (!control.writes.empty() && control.writes.front().end < time) {
++		control.base = control.writes.front().value;
++		control.writes.pop_front();
++	}
++
++	return control.base;
++}
++
++MtkIsp50SensorTimeline::Values MtkIsp50SensorTimeline::frame(uint32_t sequence, int64_t end)
++{
++	const int64_t period = frameNs(lastVblank_);
++
++	ends_[sequence] = end;
++	while (ends_.size() > kEnds)
++		ends_.erase(ends_.begin());
++
++	Values values;
++	for (auto &[id, control] : controls_) {
++		if (!control.known)
++			continue;
++
++		/* The values written before the start of frame n - d + 1 */
++		const uint32_t back = control.delay - 1;
++		int64_t start;
++		if (sequence < back)
++			start = std::numeric_limits<int64_t>::min();
++		else
++			start = frameStart(sequence - back, end, back * period);
++
++		values[id] = valueAt(control, start);
++	}
++
++	if (vblankId_) {
++		const auto it = values.find(vblankId_);
++		if (it != values.end())
++			lastVblank_ = it->second;
++	}
++
++	return values;
++}
++
++int64_t MtkIsp50SensorTimeline::safeWriteTime(int64_t now, int64_t duration) const
++{
++	if (ends_.empty() || !(timing_.lineNs > 0))
++		return now;
++
++	/* Value of the frame length written before a time */
++	auto vblankBefore = [&](int64_t time) {
++		if (!vblankId_)
++			return 0;
++		const Control &control = controls_.at(vblankId_);
++		int32_t value = control.base;
++		for (const Write &w : control.writes) {
++			if (w.end >= time)
++				break;
++			value = w.value;
++		}
++		return value;
++	};
++
++	/*
++	 * From the start of the last frame seen: each frame lasts the frame
++	 * length taken at its start.
++	 */
++	const auto last = ends_.rbegin();
++	int64_t start = last->second - timing_.activeLines * timing_.lineNs - timing_.startOffsetNs;
++	for (unsigned int i = 0; i < 64; i++) {
++		const int64_t length = frameNs(vblankBefore(start));
++		if (length <= 0)
++			return now;
++		start += length;
++		if (start + timing_.guardNs > now)
++			break;
++	}
++
++	if (now + duration + timing_.guardNs <= start)
++		return now;
++
++	return start + timing_.guardNs;
++}
++
++} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/mtkisp50/sensor_timeline.h b/src/libcamera/pipeline/mtkisp50/sensor_timeline.h
+new file mode 100644
+index 0000000..260a250
+--- /dev/null
++++ b/src/libcamera/pipeline/mtkisp50/sensor_timeline.h
+@@ -0,0 +1,100 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Sensor controls in effect for each frame, from the times they were written
++ */
++
++#pragma once
++
++#include <deque>
++#include <map>
++#include <stdint.h>
++
++namespace libcamera {
++
++/*
++ * The capture device has no frame start event: the controls are written to
++ * the sensor whenever the IPA has them, and which frame they reach follows
++ * from the time of the write. The sensor takes the values written during a
++ * frame at the start of the next one (its frame boundary), a control with a
++ * delay of d frames then acts on the frame d - 1 frames after that boundary:
++ * on frame n act the values written before the start of frame n - d + 1.
++ *
++ * The start of a frame is not reported either. It is the end of the frame
++ * (the timestamp of the raw buffer) less the readout of its active lines:
++ * the frame length beyond them (VBLANK) lies between the end of a frame and
++ * the start of the next. A write close to a frame start could fall on either
++ * side of it; safeWriteTime() gives the time to wait for, so that a write
++ * keeps a margin from the frame starts.
++ *
++ * All times in nanoseconds of the monotonic clock, as the buffer timestamps.
++ * The values are integers of V4L2 controls (exposure, gain, VBLANK).
++ */
++class MtkIsp50SensorTimeline
++{
++public:
++	struct Timing {
++		/* Duration of a line */
++		int64_t lineNs = 0;
++		/* Active lines, read out from the start of a frame to its end */
++		int32_t activeLines = 0;
++		/* Frame start earlier than the readout gives (the end of the frame lags) */
++		int64_t startOffsetNs = 0;
++		/* Margin of a write from a frame start */
++		int64_t guardNs = 0;
++	};
++
++	using Values = std::map<uint32_t, int32_t>;
++
++	/* Controls with their delays in frames (at least 1), VBLANK id or 0 */
++	void configure(const std::map<uint32_t, unsigned int> &delays, uint32_t vblankId,
++		       const Timing &timing);
++
++	/* Stream start: the values in effect for the first frames */
++	void reset(const Values &values);
++	/* Values written to the sensor between the two times */
++	void written(const Values &values, int64_t begin, int64_t end);
++	/*
++	 * A frame ended: the values in effect for it. Frames come in the
++	 * order of their sequence, frames may be missing.
++	 */
++	Values frame(uint32_t sequence, int64_t end);
++
++	/*
++	 * Earliest time from \a now on at which a write of \a duration keeps
++	 * the margin from the frame starts expected (now if it does)
++	 */
++	int64_t safeWriteTime(int64_t now, int64_t duration) const;
++
++	/* Values last written (or of the start) */
++	const Values &latest() const { return latest_; }
++
++private:
++	struct Write {
++		int64_t end;
++		int32_t value;
++	};
++
++	struct Control {
++		unsigned int delay = 1;
++		/* In effect before the first write kept */
++		int32_t base = 0;
++		bool known = false;
++		std::deque<Write> writes;
++	};
++
++	int64_t frameStart(uint32_t sequence, int64_t laterEnd, int64_t backNs) const;
++	int64_t frameNs(int32_t vblank) const;
++	int32_t valueAt(Control &control, int64_t time);
++
++	std::map<uint32_t, Control> controls_;
++	uint32_t vblankId_ = 0;
++	Timing timing_;
++
++	Values latest_;
++	/* Ends of the last frames, by sequence */
++	std::map<uint32_t, int64_t> ends_;
++	/* Frame length of the last frame, in lines beyond the active ones (VBLANK) */
++	int32_t lastVblank_ = 0;
++};
++
++} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/streams.cpp b/src/libcamera/pipeline/mtkisp50/streams.cpp
 new file mode 100644
 index 0000000..8d1aeef
@@ -24476,10 +25182,10 @@ index 0000000..42b7cdc
 +TEST_REGISTER(MtkIsp50FramesTest)
 diff --git a/test/mtkisp50/meson.build b/test/mtkisp50/meson.build
 new file mode 100644
-index 0000000..a5cf16c
+index 0000000..52cc20d
 --- /dev/null
 +++ b/test/mtkisp50/meson.build
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,167 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +if 'mtkisp50' not in pipelines
@@ -24532,6 +25238,9 @@ index 0000000..a5cf16c
 +
 +# The PD statistics and the pairing of PD and raw frames
 +mtkisp50_tests += {'name': 'mtkisp50-pd', 'sources': ['pd.cpp']}
++
++# The sensor controls in effect per frame, from the times of their writes
++mtkisp50_tests += {'name': 'mtkisp50-sensor-timeline', 'sources': ['sensor_timeline.cpp']}
 +
 +# The frame length of the exposure regulation, with the autofocus
 +mtkisp50_tests += {
@@ -25379,21 +26088,27 @@ index 0000000..3b2be94
 +TEST_REGISTER(MtkIsp50PdTest)
 diff --git a/test/mtkisp50/program.cpp b/test/mtkisp50/program.cpp
 new file mode 100644
-index 0000000..f407687
+index 0000000..1892b41
 --- /dev/null
 +++ b/test/mtkisp50/program.cpp
-@@ -0,0 +1,624 @@
+@@ -0,0 +1,871 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * mtkisp50 IPA: exposure program
 + */
 +
++#include <algorithm>
 +#include <cmath>
 +#include <cstring>
++#include <deque>
 +#include <iostream>
++#include <iterator>
++#include <optional>
 +#include <memory>
 +#include <string>
 +#include <unistd.h>
++#include <utility>
++#include <vector>
 +
 +#include <linux/v4l2-controls.h>
 +
@@ -25499,7 +26214,7 @@ index 0000000..f407687
 +	{
 +	}
 +
-+	int init(const char *tuning = kTuning)
++	int init(const char *tuning = kTuning, bool lens = true)
 +	{
 +		UniqueFD fd = MemFd::create("mtkisp50-program-tuning", 0);
 +		if (!fd.isValid() || write(fd.get(), tuning, strlen(tuning)) < 0)
@@ -25513,9 +26228,11 @@ index 0000000..f407687
 +		if (!tuning_)
 +			return -EINVAL;
 +
-+		ControlInfoMap::Map map;
-+		map.emplace(&focusId_, ControlInfo(0, 1023, 0));
-+		ctx_.lensControls = ControlInfoMap(std::move(map), lensIdMap_);
++		if (lens) {
++			ControlInfoMap::Map map;
++			map.emplace(&focusId_, ControlInfo(0, 1023, 0));
++			ctx_.lensControls = ControlInfoMap(std::move(map), lensIdMap_);
++		}
 +
 +		int ret = agc_.init(ctx_, (*tuning_)["Agc"]);
 +		if (ret)
@@ -25534,6 +26251,9 @@ index 0000000..f407687
 +		ctx_.activeState.awb.gains = RGB<float>({ 1.0f, 1.0f, 1.0f });
 +		ctx_.sensorInfo.minFrameLength = mode.defaultLines;
 +		ctx_.sensorInfo.outputSize = Size(2304, 1728);
++		/* Binned 4 times from the active area, the statistics over the whole frame */
++		ctx_.sensorInfo.analogCrop = Rectangle(16, 16, 9216, 6912);
++		ctx_.configuration.statsWindow = Rectangle(0, 0, 2304, 1728);
 +
 +		auto &agc = ctx_.configuration.agc;
 +		agc.lineDuration = mode.line;
@@ -25560,6 +26280,7 @@ index 0000000..f407687
 +		exposure_ = mode.exposureMax / 2;
 +		gain_ = 1.0;
 +		frame_ = 0;
++		pipeline_.clear();
 +		return 0;
 +	}
 +
@@ -25572,22 +26293,41 @@ index 0000000..f407687
 +			af_.queueRequest(ctx_, n, fc, *request);
 +		}
 +
++		/*
++		 * With a delay the sensor takes the values written delay frames
++		 * before, and the IPA learns them before it prepares the frame
++		 * (as the pipeline handler gives them)
++		 */
++		if (delay) {
++			while (pipeline_.size() < delay)
++				pipeline_.push_back({ exposure_, gain_ });
++			taken_ = pipeline_.front();
++			pipeline_.pop_front();
++			fc.sensor.exposure = taken_.first;
++			fc.sensor.gain = taken_.second;
++		}
++
 +		DipFrameParams params{};
 +		agc_.prepare(ctx_, n, fc, &params);
 +		af_.prepare(ctx_, n, fc, &params);
 +
 +		/* The sensor applies what it was given */
-+		fc.sensor.exposure = exposure_;
-+		fc.sensor.gain = gain_;
++		if (!delay)
++			taken_ = { exposure_, gain_ };
++		fc.sensor.exposure = taken_.first;
++		fc.sensor.gain = taken_.second;
 +		frameLines = ctx_.configuration.agc.vblankEnabled
 +				     ? mode_.defaultLines + vblank_ - mode_.vblankDefault
 +				     : mode_.defaultLines;
 +
-+		const double level = std::min(brightness * exposure_ * gain_, 255.0 - kBlack);
++		const double level = std::min(brightness * taken_.first * taken_.second, 255.0 - kBlack);
++		/* The image: the level with the digital gain of the frame */
++		output = std::min(brightness * taken_.first * taken_.second * fc.digitalGain, 255.0 - kBlack);
 +		Statistics &s = *stats_;
-+		s.valid = true;
++		s.valid = n % statsInterval == 0;
 +		for (unsigned int i = 0; i < Statistics::kZones * Statistics::kZones; i++) {
-+			const uint64_t v = static_cast<uint64_t>((kBlack + level) * 100);
++			const double zoneLevel = std::min(level * zoneScale[i], 255.0 - kBlack);
++			const uint64_t v = static_cast<uint64_t>((kBlack + zoneLevel) * 100);
 +			s.zoneSum[i] = RGB<uint64_t>({ v, v, v });
 +			s.zoneCount[i] = 100;
 +		}
@@ -25609,6 +26349,8 @@ index 0000000..f407687
 +		/* Controls for the next frame, as IPAMtkIsp50::processStats() */
 +		exposure_ = fc.sensor.exposure;
 +		gain_ = fc.sensor.gain;
++		if (delay)
++			pipeline_.push_back({ exposure_, gain_ });
 +		const auto &agc = ctx_.configuration.agc;
 +		if (agc.vblankEnabled) {
 +			vblank_ = agc.frame.vblankFor(exposure_, ctx_.activeState.agc.minFrameLines);
@@ -25638,6 +26380,18 @@ index 0000000..f407687
 +	double brightness = 0.0;
 +	/* Frame length of the last frame, in lines */
 +	int32_t frameLines = 0;
++	/* Frames from a write to the frame it acts on (0: the next frame, no delay) */
++	unsigned int delay = 0;
++	/* Statistics every statsInterval-th frame */
++	unsigned int statsInterval = 1;
++	/* Image level of the last frame, with its digital gain */
++	double output = 0.0;
++	/* Brightness of the zones of the statistics grid relative to brightness */
++	std::array<double, Statistics::kZones * Statistics::kZones> zoneScale = [] {
++		std::array<double, Statistics::kZones * Statistics::kZones> a;
++		a.fill(1.0);
++		return a;
++	}();
 +
 +private:
 +	ControlId vblankId_{ V4L2_CID_VBLANK, "Vertical Blanking", "v4l2",
@@ -25656,6 +26410,9 @@ index 0000000..f407687
 +	double gain_ = 1.0;
 +	int32_t vblank_ = 0;
 +	uint32_t frame_ = 0;
++	/* Values written, on their way to the frames they act on; those of the frame */
++	std::deque<std::pair<int32_t, double>> pipeline_;
++	std::pair<int32_t, double> taken_{ 0, 1.0 };
 +};
 +
 +ControlList limits(int64_t minUs, int64_t maxUs)
@@ -25868,10 +26625,16 @@ index 0000000..f407687
 +		if (!p)
 +			return fail("program refused");
 +
-+		/* 30 ms up to a gain of 64: the stages of 30 to 60 ms give way */
++		/*
++		 * 30 ms up to a gain of 64: the stage of 30 ms gives way, the
++		 * longer ones keep their times at a gain of at least 64
++		 */
 +		auto h = p->limited(30000, 64.0);
-+		if (!h || h->stages().size() != 4 || h->stages()[2].time != 30000 ||
-+		    h->stages()[2].gain != 64.0 || h->stages()[3].time != 100000)
++		if (!h || h->stages().size() != 6 || h->stages()[2].time != 30000 ||
++		    h->stages()[2].gain != 64.0 || h->stages()[3].time != 40000 ||
++		    h->stages()[3].gain != 64.0 || h->stages()[4].time != 60000 ||
++		    h->stages()[4].gain != 64.0 || h->stages()[5].time != 100000 ||
++		    h->stages()[5].gain != 120.0)
 +			return fail("limited program");
 +
 +		struct Case {
@@ -25883,8 +26646,11 @@ index 0000000..f407687
 +			{ 30000.0 * 8.0, 30000.0 },
 +			{ 30000.0 * 30.0, 30000.0 },
 +			{ 30000.0 * 64.0, 30000.0 },
-+			/* Beyond: the stage of 100 ms */
-+			{ 30000.0 * 64.0 * 1.01, 100000.0 },
++			/* Beyond: the times of the longer stages one after the other */
++			{ 30000.0 * 64.0 * 1.01, 40000.0 },
++			{ 40000.0 * 64.0, 40000.0 },
++			{ 40000.0 * 64.0 * 1.01, 60000.0 },
++			{ 60000.0 * 64.0 * 1.01, 100000.0 },
 +			{ 100000.0 * 100.0, 100000.0 },
 +			/* Below the limit as before */
 +			{ 15000.0, 10000.0 },
@@ -25898,17 +26664,57 @@ index 0000000..f407687
 +					    std::to_string(s.time) + " us " + std::to_string(s.again) +
 +					    " x " + std::to_string(s.dgain));
 +		}
++		/* No step skips a time of the program */
++		const double times[] = { 10000.0, 20000.0, 30000.0, 40000.0, 60000.0, 100000.0 };
++		double last = 0.0;
 +		for (double total = 50.0; total < 1e7; total *= 1.05) {
 +			const auto s = h->split(total, 10.0, 100000.0, 1.0, 15.5, 8.0);
 +			if (!flickerFree(s.time) || (s.dgain > 1.0 + 1e-9 && s.again < 15.5 - 1e-9) ||
-+			    (total <= 30000.0 * 64.0 && s.time > 30000.0 + 0.5))
++			    (total <= 30000.0 * 64.0 && s.time > 30000.0 + 0.5) || s.time < last - 0.5)
 +				return fail("limited split " + std::to_string(total) + ": " +
 +					    std::to_string(s.time) + " us");
++			if (last >= 10000.0 && s.time > last + 0.5) {
++				const double *next = std::upper_bound(std::begin(times), std::end(times), last + 0.5);
++				if (next == std::end(times) || std::abs(s.time - *next) > 0.5)
++					return fail("limited split " + std::to_string(total) + ": " +
++						    std::to_string(last) + " -> " + std::to_string(s.time) + " us");
++			}
++			last = s.time;
++		}
++
++		/*
++		 * Down from a longer time: it stays within the hysteresis below
++		 * the step to it, unless the limit of the moment is shorter
++		 */
++		const double keep = std::exp2(0.3);
++		struct KeepCase {
++			double total;
++			double keepTime;
++			double maxTime;
++			double time;
++		};
++		const KeepCase keepCases[] = {
++			{ 30000.0 * 64.0 / 1.1, 40000.0, 100000.0, 40000.0 },
++			{ 30000.0 * 64.0 / 1.3, 40000.0, 100000.0, 30000.0 },
++			{ 30000.0 * 64.0 / 1.1, 40000.0, 35000.0, 30000.0 },
++			{ 40000.0 * 64.0 / 1.1, 60000.0, 100000.0, 60000.0 },
++			/* Rising: the step at once */
++			{ 30000.0 * 64.0 * 1.01, 30000.0, 100000.0, 40000.0 },
++			/* Below the first stage the time is free */
++			{ 9000.0, 10000.0, 100000.0, 9000.0 },
++		};
++		for (const KeepCase &c : keepCases) {
++			const auto s = h->split(c.total, 10.0, c.maxTime, 1.0, 15.5, 8.0, c.keepTime, keep);
++			if (std::abs(s.time - c.time) > 0.5 ||
++			    std::abs(s.time * s.again * s.dgain - c.total) > 1e-6 * c.total)
++				return fail("split from " + std::to_string(c.keepTime) + " us at " +
++					    std::to_string(c.total) + ": " + std::to_string(s.time) + " us");
 +		}
 +
 +		/* The gain of the limit beyond the last stage: the largest gain */
 +		auto g = p->limited(30000, 200.0);
-+		if (!g || g->maxGain() != 200.0 || g->stages().back().time != 100000)
++		if (!g || g->maxGain() != 200.0 || g->stages().back().time != 100000 ||
++		    g->stages().size() != 6)
 +			return fail("limited program with a large gain");
 +
 +		/* A shorter stage reaches the total already: unchanged */
@@ -25964,13 +26770,22 @@ index 0000000..f407687
 +		ControlList slow = limits(33333, 100000);
 +		sim.frame(&slow);
 +
-+		/* Darker than the limit reaches: the longest exposure */
++		/*
++		 * Darker than the limit reaches: the time of the next stage
++		 * that reaches the total at the gain of the limit (60 ms for
++		 * 100 ms at a gain of 60), much darker the longest exposure
++		 */
 +		sim.brightness /= 2.0;
++		for (unsigned int i = 0; i < 600; i++)
++			sim.frame();
++		if (std::abs(sim.exposure() * line - 60000.0) > line)
++			return fail("handheld, darker: " + std::to_string(sim.exposure() * line) + " us");
++		sim.brightness /= 4.0;
 +		for (unsigned int i = 0; i < 600; i++)
 +			sim.frame();
 +		const double longest = std::min(100000.0, sim.ctx().activeState.agc.exposureLimit * line);
 +		if (std::abs(sim.exposure() * line - longest) > line)
-+			return fail("handheld, darker: " + std::to_string(sim.exposure() * line) + " us");
++			return fail("handheld, much darker: " + std::to_string(sim.exposure() * line) + " us");
 +
 +		/* Video keeps its program */
 +		Sim video;
@@ -25985,9 +26800,150 @@ index 0000000..f407687
 +		return TestPass;
 +	}
 +
++	/*
++	 * A sensor that takes new values two frames after the write,
++	 * statistics every fourth frame: the digital gain goes with the
++	 * exposure the sensor took the frame with. While the scene changes
++	 * back and forth over the step of the program to longer times, no
++	 * frame stands out of its neighbours (a frame with the exposure of one
++	 * step and the digital gain of the other would be brighter or darker
++	 * than both).
++	 */
++	int testDelayedSensor()
++	{
++		Sim sim;
++		if (sim.init(kHandheldTuning) || sim.configure(kBinned))
++			return fail("delayed sensor init");
++		sim.delay = 2;
++		sim.statsInterval = 4;
++		const auto &agc = sim.ctx().configuration.agc;
++		const double line = agc.lineDuration.get<std::micro>();
++		ControlList slow = limits(33333, 100000);
++		sim.frame(&slow);
++
++		/* 30 ms at a total gain of 60, darker 5 times: 100 ms at a gain of 90 */
++		const double bright = (0.18 * (255.0 - kBlack)) / (30000.0 / line * 60.0);
++		std::vector<double> out;
++		std::vector<double> times;
++		for (unsigned int cycle = 0; cycle < 6; cycle++) {
++			sim.brightness = cycle % 2 ? bright / 5.0 : bright;
++			for (unsigned int i = 0; i < 120; i++) {
++				sim.frame();
++				out.push_back(sim.output);
++				times.push_back(sim.exposure() * line);
++			}
++		}
++
++		bool longer = false;
++		for (double t : times)
++			longer |= t > 35000.0;
++		if (!longer)
++			return fail("delayed sensor: no longer exposure in the dark phases");
++
++		for (unsigned int i = 121; i + 1 < out.size(); i++) {
++			/* The frames of a change of the scene itself */
++			if (i % 120 == 0)
++				continue;
++			const double lo = std::min(out[i - 1], out[i + 1]);
++			const double hi = std::max(out[i - 1], out[i + 1]);
++			if (out[i] > hi * 1.05 || out[i] < lo / 1.05)
++				return fail("delayed sensor: frame " + std::to_string(i) + " at " +
++					    std::to_string(out[i]) + ", neighbours " + std::to_string(out[i - 1]) +
++					    " and " + std::to_string(out[i + 1]));
++		}
++
++		return TestPass;
++	}
++
++	/*
++	 * Spot metering of the AfWindows rectangle: a scene with its left
++	 * third four times as bright as the rest. Matrix metering takes the
++	 * mean of both, a window on the bright part half the total exposure,
++	 * one on the dark part twice; no window (or one outside the frame) the
++	 * centre, which is dark; matrix again the mean. A camera without a
++	 * lens gets AfWindows for it.
++	 */
++	int testSpot()
++	{
++		Sim sim;
++		if (sim.init() || sim.configure(kBinned))
++			return fail("spot init");
++		for (unsigned int i = 0; i < Statistics::kZones * Statistics::kZones; i++)
++			sim.zoneScale[i] = i % Statistics::kZones < Statistics::kZones / 3 ? 4.0 : 1.0;
++		const double line = sim.ctx().configuration.agc.lineDuration.get<std::micro>();
++		sim.brightness = (0.18 * (255.0 - kBlack)) / (20000.0 / line * 2.0) / 2.0;
++
++		auto total = [&]() {
++			return sim.exposure() * line * sim.gain() * sim.digitalGain();
++		};
++		auto settle = [&](ControlList *request) {
++			sim.frame(request);
++			for (unsigned int i = 0; i < 300; i++)
++				sim.frame();
++			return total();
++		};
++		/* A window of 20 % of each side centred at (u, v) of the active area */
++		auto window = [](double u, double v) {
++			return Rectangle(static_cast<int>(16 + (u - 0.1) * 9216),
++					 static_cast<int>(16 + (v - 0.1) * 6912), 1843, 1382);
++		};
++		auto request = [&](controls::AeMeteringModeEnum mode, std::optional<Rectangle> w) {
++			ControlList c(controls::controls);
++			c.set(controls::AeMeteringMode, mode);
++			if (w)
++				c.set(controls::AfWindows, Span<const Rectangle>(&*w, w->isNull() ? 0 : 1));
++			return c;
++		};
++
++		ControlList matrix = request(controls::MeteringMatrix, std::nullopt);
++		const double tMatrix = settle(&matrix);
++
++		ControlList bright = request(controls::MeteringSpot, window(0.15, 0.5));
++		const double tBright = settle(&bright);
++		ControlList dark = request(controls::MeteringSpot, window(0.7, 0.3));
++		const double tDark = settle(&dark);
++		ControlList none = request(controls::MeteringSpot, Rectangle{});
++		const double tCentre = settle(&none);
++		ControlList outside = request(controls::MeteringSpot, Rectangle(9300, 7000, 500, 500));
++		const double tOutside = settle(&outside);
++		ControlList back = request(controls::MeteringMatrix, std::nullopt);
++		const double tBack = settle(&back);
++
++		/* Within the dead band of the regulation, 0.1 stops either way */
++		if (std::abs(tBright / tMatrix - 0.5) > 0.08 || std::abs(tDark / tMatrix - 2.0) > 0.3 ||
++		    std::abs(tCentre / tDark - 1.0) > 0.15 || std::abs(tOutside / tDark - 1.0) > 0.15 ||
++		    std::abs(tBack / tMatrix - 1.0) > 0.15)
++			return fail("spot metering: matrix " + std::to_string(tMatrix) + ", bright " +
++				    std::to_string(tBright) + ", dark " + std::to_string(tDark) +
++				    ", centre " + std::to_string(tCentre) + ", outside " +
++				    std::to_string(tOutside) + ", matrix again " + std::to_string(tBack));
++
++		/* A window over both parts: weighted by the parts it covers */
++		ControlList half = request(controls::MeteringSpot,
++					   Rectangle(16 + 9216 / 3 - 1000, 16 + 3000, 2000, 1000));
++		const double tHalf = settle(&half);
++		if (std::abs(tHalf / tMatrix - 0.8) > 0.12)
++			return fail("spot over both parts: " + std::to_string(tHalf / tMatrix));
++
++		/* Fixed focus: AfWindows for the spot metering */
++		Sim fixed;
++		if (fixed.init(kTuning, false) || fixed.configure(kBinned))
++			return fail("fixed focus init");
++		if (!fixed.ctx().ctrlMap.count(&controls::AfWindows))
++			return fail("no AfWindows without a lens");
++
++		return TestPass;
++	}
++
 +	int run() override
 +	{
-+		int ret = testSplit();
++		int ret = testSpot();
++		if (ret != TestPass)
++			return ret;
++		ret = testDelayedSensor();
++		if (ret != TestPass)
++			return ret;
++		ret = testSplit();
 +		if (ret != TestPass)
 +			return ret;
 +		ret = testLimited();
@@ -26557,6 +27513,273 @@ index 0000000..bb16fec
 +};
 +
 +TEST_REGISTER(MtkIsp50RawStatsTest)
+diff --git a/test/mtkisp50/sensor_timeline.cpp b/test/mtkisp50/sensor_timeline.cpp
+new file mode 100644
+index 0000000..17868f5
+--- /dev/null
++++ b/test/mtkisp50/sensor_timeline.cpp
+@@ -0,0 +1,261 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * mtkisp50 pipeline: sensor controls in effect per frame from the times they
++ * were written
++ */
++
++#include <iostream>
++#include <string>
++
++#include <linux/v4l2-controls.h>
++
++#include "sensor_timeline.h"
++
++#include "test.h"
++
++using namespace libcamera;
++
++namespace {
++
++/* Binned mode of the main camera: 1728 active lines of 5555 ns, VBLANK 4272 (33.3 ms) */
++constexpr int64_t kLine = 5555;
++constexpr int32_t kActive = 1728;
++constexpr int32_t kVblank = 4272;
++constexpr int64_t kMs = 1000000;
++constexpr int64_t kGuard = 2 * kMs;
++
++int64_t frameNs(int32_t vblank)
++{
++	return (kActive + vblank) * kLine;
++}
++
++/* A sensor with the controls taking effect as the timeline assumes */
++class Run
++{
++public:
++	Run(unsigned int gainDelay = 2)
++	{
++		MtkIsp50SensorTimeline::Timing timing;
++		timing.lineNs = kLine;
++		timing.activeLines = kActive;
++		timing.guardNs = kGuard;
++		timeline.configure({ { V4L2_CID_EXPOSURE, 2 },
++				     { V4L2_CID_ANALOGUE_GAIN, gainDelay },
++				     { V4L2_CID_VBLANK, 2 } },
++				   V4L2_CID_VBLANK, timing);
++		timeline.reset({ { V4L2_CID_EXPOSURE, 100 },
++				 { V4L2_CID_ANALOGUE_GAIN, 256 },
++				 { V4L2_CID_VBLANK, kVblank } });
++	}
++
++	/* The next frame ends after a frame of \a vblank: its values */
++	MtkIsp50SensorTimeline::Values next(int32_t vblank = kVblank, bool seen = true)
++	{
++		end += frameNs(vblank);
++		const uint32_t seq = sequence++;
++		if (!seen)
++			return {};
++		return timeline.frame(seq, end);
++	}
++
++	void write(int64_t afterEnd, int32_t exposure, int32_t gain, int32_t vblank = kVblank,
++		   int64_t duration = 100000)
++	{
++		const int64_t at = end + afterEnd;
++		timeline.written({ { V4L2_CID_EXPOSURE, exposure },
++				   { V4L2_CID_ANALOGUE_GAIN, gain },
++				   { V4L2_CID_VBLANK, vblank } },
++				 at, at + duration);
++	}
++
++	MtkIsp50SensorTimeline timeline;
++	int64_t end = 1000 * kMs;
++	uint32_t sequence = 0;
++};
++
++} /* namespace */
++
++class MtkIsp50SensorTimelineTest : public Test
++{
++protected:
++	int fail(const std::string &what)
++	{
++		std::cerr << what << std::endl;
++		return TestFail;
++	}
++
++	static int32_t exposure(const MtkIsp50SensorTimeline::Values &v)
++	{
++		auto it = v.find(V4L2_CID_EXPOSURE);
++		return it != v.end() ? it->second : -1;
++	}
++
++	static int32_t gain(const MtkIsp50SensorTimeline::Values &v)
++	{
++		auto it = v.find(V4L2_CID_ANALOGUE_GAIN);
++		return it != v.end() ? it->second : -1;
++	}
++
++	static int32_t vblank(const MtkIsp50SensorTimeline::Values &v)
++	{
++		auto it = v.find(V4L2_CID_VBLANK);
++		return it != v.end() ? it->second : -1;
++	}
++
++	/*
++	 * Measured on the main camera: written 13-18 ms after the end of
++	 * frame m (before the start of m + 1, 23.7 ms after it) the values
++	 * act on frame m + 2; written 23.9 ms after it, on m + 3.
++	 */
++	int testDelays()
++	{
++		Run run;
++		if (exposure(run.next()) != 100 || exposure(run.next()) != 100)
++			return fail("start values");
++
++		/* Frame 1 ended: written within its frame length */
++		run.write(14 * kMs, 200, 512);
++		if (exposure(run.next()) != 100)
++			return fail("frame 2 took the values written after frame 1 ended");
++		auto v = run.next();
++		if (exposure(v) != 200 || gain(v) != 512)
++			return fail("frame 3 without the values written after frame 1");
++
++		/* After the start of the next frame: one frame later */
++		run.write(frameNs(kVblank) - kActive * kLine + kMs, 300, 768);
++		run.next();
++		if (exposure(run.next()) != 200)
++			return fail("a write after the frame start acted a frame early");
++		if (exposure(run.next()) != 300)
++			return fail("a write after the frame start did not act");
++
++		return TestPass;
++	}
++
++	/* A longer frame comes with the exposure, as the frame length of the frame before it */
++	int testFrameLength()
++	{
++		Run run;
++		run.next();
++		run.write(14 * kMs, 18000, 512, 16272);
++		auto v1 = run.next();
++		auto v2 = run.next(16272);
++		if (exposure(v1) != 100 || vblank(v1) != kVblank ||
++		    exposure(v2) != 18000 || vblank(v2) != 16272)
++			return fail("frame length with the exposure");
++
++		/* In the long blanking after frame 2: still before the start of frame 3 */
++		run.write(80 * kMs, 5000, 512, kVblank);
++		auto v3 = run.next(16272);
++		auto v4 = run.next(kVblank);
++		if (exposure(v3) != 18000 || exposure(v4) != 5000 || vblank(v4) != kVblank)
++			return fail("write in a long blanking");
++
++		return TestPass;
++	}
++
++	/* A frame that did not come: its start follows from the frame length */
++	int testMissingFrame()
++	{
++		Run run;
++		run.next();
++		run.next();
++		run.write(14 * kMs, 200, 512);
++		run.next(kVblank, false);
++		auto v = run.next();
++		if (exposure(v) != 200)
++			return fail("missing frame: " + std::to_string(exposure(v)));
++
++		/* Written after the start of the missing frame: the frame after */
++		Run late;
++		late.next();
++		late.write(28 * kMs, 200, 512);
++		late.next(kVblank, false);
++		auto w = late.next();
++		auto x = late.next();
++		if (exposure(w) != 100 || exposure(x) != 200)
++			return fail("missing frame, late write: " + std::to_string(exposure(w)) +
++				    ", " + std::to_string(exposure(x)));
++
++		return TestPass;
++	}
++
++	/* A control with a delay of one frame acts on the frame after the write */
++	int testShortDelay()
++	{
++		Run run(1);
++		run.next();
++		run.write(14 * kMs, 200, 512);
++		auto v = run.next();
++		if (exposure(v) != 100 || gain(v) != 512)
++			return fail("gain with a delay of one frame");
++		return TestPass;
++	}
++
++	/* No write within the margin around a frame start */
++	int testSafeWrite()
++	{
++		Run run;
++		run.next();
++		const int64_t end = run.end;
++		const int64_t start = end + kVblank * kLine;
++
++		if (run.timeline.safeWriteTime(end + 14 * kMs, kMs) != end + 14 * kMs)
++			return fail("write clear of the frame start held back");
++		if (run.timeline.safeWriteTime(start - kMs, kMs) != start + kGuard)
++			return fail("write at the frame start not held back");
++		if (run.timeline.safeWriteTime(start - 3 * kMs, 2 * kMs) != start + kGuard)
++			return fail("write running into the frame start not held back");
++		if (run.timeline.safeWriteTime(start + 3 * kMs, kMs) != start + 3 * kMs)
++			return fail("write after the frame start held back");
++
++		/* Later frames that have not ended yet: by the frame length */
++		const int64_t later = start + frameNs(kVblank);
++		if (run.timeline.safeWriteTime(later, kMs) != later + kGuard)
++			return fail("write at a later frame start not held back");
++
++		/* A frame length written before the start counts */
++		run.write(5 * kMs, 18000, 512, 16272);
++		const int64_t longer = start + frameNs(16272);
++		if (run.timeline.safeWriteTime(start + frameNs(kVblank), kMs) != start + frameNs(kVblank) ||
++		    run.timeline.safeWriteTime(longer, kMs) != longer + kGuard)
++			return fail("frame start after a longer frame");
++
++		return TestPass;
++	}
++
++	/* A new stream: the values of its start, no frames before */
++	int testReset()
++	{
++		Run run;
++		run.next();
++		run.write(14 * kMs, 200, 512);
++		run.timeline.reset({ { V4L2_CID_EXPOSURE, 400 },
++				     { V4L2_CID_ANALOGUE_GAIN, 256 },
++				     { V4L2_CID_VBLANK, kVblank } });
++		run.sequence = 0;
++		if (exposure(run.next()) != 400 || exposure(run.next()) != 400)
++			return fail("values after a reset");
++		if (run.timeline.latest().at(V4L2_CID_EXPOSURE) != 400)
++			return fail("latest values after a reset");
++		return TestPass;
++	}
++
++	int run() override
++	{
++		int ret = testDelays();
++		if (ret == TestPass)
++			ret = testFrameLength();
++		if (ret == TestPass)
++			ret = testMissingFrame();
++		if (ret == TestPass)
++			ret = testShortDelay();
++		if (ret == TestPass)
++			ret = testSafeWrite();
++		if (ret == TestPass)
++			ret = testReset();
++		return ret;
++	}
++};
++
++TEST_REGISTER(MtkIsp50SensorTimelineTest)
 diff --git a/test/mtkisp50/streams.cpp b/test/mtkisp50/streams.cpp
 new file mode 100644
 index 0000000..22b8cff
