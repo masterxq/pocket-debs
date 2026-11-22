@@ -71,6 +71,15 @@ Description:
    single frame; failed frames and unusable alignments fall out, without a
    blend the base frame alone; a capture that times out goes on with the
    frames back; a stop during the series returns everything.
+ - Faster multi-frame still images: the earliest preview frame not yet
+   captured takes the still image (requests with controls keep their own
+   frame) and the preview frames on their way join the series; each frame
+   is reduced for the alignment as soon as it is back and the motion is
+   estimated while the series is captured; the alignment module copies
+   the rows it needs from the frames, which the CPU does not cache, into
+   row buffers and is built with -O3 as an argument of its target, after
+   the flags of the environment. The request of the still image carries
+   the sensor time and metadata of the frame that took it.
  - Calibration of the single camera module: the tuning holds the values
    of a reference module, an optional file <sensor>-unit.yaml in
    ipa/mtkisp50 below localstatedir/lib/libcamera (or the directory of
@@ -10956,10 +10965,10 @@ index 0000000..76300e4
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/align/frame_aligner.cpp b/src/libcamera/pipeline/mtkisp50/align/frame_aligner.cpp
 new file mode 100644
-index 0000000..7a5d075
+index 0000000..7527a22
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/align/frame_aligner.cpp
-@@ -0,0 +1,1981 @@
+@@ -0,0 +1,2129 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Alignment of a burst of NV12 frames for multi-frame noise reduction
@@ -11218,25 +11227,41 @@ index 0000000..7a5d075
 +
 +/* ---- Reduction ---------------------------------------------------------- */
 +
++/*
++ * The frames may lie in memory the CPU does not cache (buffers of the
++ * devices): every load goes to the memory, narrow or scattered loads are
++ * many times slower there. The frames are read once, row by row, with the
++ * wide loads of memcpy into cached row buffers; the computation runs on
++ * those.
++ */
++void copyRows(const uint8_t *src, unsigned int stride, int row, int rows, int bytes,
++	      std::vector<uint8_t> &buf)
++{
++	buf.resize(size_t(rows) * bytes);
++	for (int r = 0; r < rows; r++)
++		memcpy(buf.data() + size_t(r) * bytes, src + size_t(row + r) * stride, bytes);
++}
++
 +/* Rows [r0, r1) of the reduced image from the full size luma */
 +void reduceRows(const uint8_t *src, unsigned int stride, int factor, Image16 &dst,
-+		int r0, int r1, std::vector<uint16_t> &tmp)
++		int r0, int r1, std::vector<uint16_t> &tmp, std::vector<uint8_t> &rows)
 +{
 +	const int w = dst.w;
 +	const int n = w * factor;
 +	tmp.resize(n);
 +	uint16_t *t = tmp.data();
 +	for (int y = r0; y < r1; y++) {
-+		const uint8_t *s = src + size_t(y) * factor * stride;
++		copyRows(src, stride, y * factor, factor, n, rows);
++		const uint8_t *s = rows.data();
 +		uint16_t *d = dst.row(y);
 +		if (factor == 4) {
-+			const uint8_t *s1 = s + stride, *s2 = s1 + stride, *s3 = s2 + stride;
++			const uint8_t *s1 = s + n, *s2 = s1 + n, *s3 = s2 + n;
 +			for (int x = 0; x < n; x++)
 +				t[x] = s[x] + s1[x] + s2[x] + s3[x];
 +			for (int x = 0; x < w; x++)
 +				d[x] = t[4 * x] + t[4 * x + 1] + t[4 * x + 2] + t[4 * x + 3];
 +		} else {
-+			const uint8_t *s1 = s + stride;
++			const uint8_t *s1 = s + n;
 +			for (int x = 0; x < n; x++)
 +				t[x] = s[x] + s1[x];
 +			for (int x = 0; x < w; x++)
@@ -11290,15 +11315,16 @@ index 0000000..7a5d075
 + * vertical, on rows [r0, r1) of a sparse set of row pairs.
 + */
 +double sharpRows(const uint8_t *y, unsigned int stride, int width, int r0, int r1,
-+		 std::vector<uint16_t> &tmp)
++		 std::vector<uint16_t> &tmp, std::vector<uint8_t> &rows)
 +{
 +	const int n = width / 2;
 +	tmp.resize(2 * n);
 +	uint16_t *a = tmp.data(), *b = a + n;
 +	double sum = 0;
 +	for (int r = r0; r < r1; r++) {
-+		const uint8_t *s0 = y + size_t(r) * stride;
-+		const uint8_t *s1 = s0 + stride, *s2 = s1 + stride, *s3 = s2 + stride;
++		copyRows(y, stride, r, 4, width, rows);
++		const uint8_t *s0 = rows.data();
++		const uint8_t *s1 = s0 + width, *s2 = s1 + width, *s3 = s2 + width;
 +		for (int x = 0; x < n; x++) {
 +			a[x] = s0[2 * x] + s0[2 * x + 1] + s1[2 * x] + s1[2 * x + 1];
 +			b[x] = s2[2 * x] + s2[2 * x + 1] + s3[2 * x] + s3[2 * x + 1];
@@ -11707,6 +11733,13 @@ index 0000000..7a5d075
 +	unsigned int height = 0;
 +	unsigned int baseIndex = 0;
 +	std::vector<Frame> frames;
++	/* Frames reduced since begin() */
++	std::vector<bool> prepared;
++	/* Frames whose motion against the base frame estBase is estimated */
++	int estBase = -1;
++	std::vector<bool> estimated;
++	/* Frames estimate() works on now */
++	std::vector<unsigned int> active;
 +	std::vector<TileGrid> grids;	/* per level */
 +	Gradients grad;			/* of the base, finest level */
 +	BlockGrid blockGrid{};
@@ -11721,6 +11754,8 @@ index 0000000..7a5d075
 +	}
 +
 +	int levels() const { return grids.size(); }
++	unsigned int chooseBase(unsigned int count, unsigned int expected) const;
++	int estimate(unsigned int count, unsigned int expected);
 +	float noiseAt(const Frame &f, float mean) const;
 +	void matchLevel(int level);
 +	void signalTensors(Frame &f);
@@ -11730,9 +11765,11 @@ index 0000000..7a5d075
 +	void localField(Frame &f);
 +	void finish(Frame &f);
 +	Vec2 localAt(const Frame &f, float x, float y) const;
-+	void warpPlane(const Frame &f, const uint8_t *src, unsigned int sstride, uint8_t *dst,
-+		       unsigned int dstride, int w, int h, int channels, int step, float scale,
-+		       int r0, int r1) const;
++	void sourceRows(const Frame &f, int h, int step, float scale, int r0, int r1,
++			int *first, int *last) const;
++	void warpPlane(const Frame &f, const uint8_t *src, unsigned int sstride, int srcRow0,
++		       uint8_t *dst, unsigned int dstride, int w, int h, int channels, int step,
++		       float scale, int r0, int r1) const;
 +};
 +
 +FrameAligner::FrameAligner(const AlignConfig &config)
@@ -11793,10 +11830,7 @@ index 0000000..7a5d075
 +	const int radius = coarsest ? 4 : 2;
 +	const int margin = g.tile / 4;
 +	const Frame &base = frames[baseIndex];
-+	std::vector<unsigned int> refs;
-+	for (unsigned int i = 0; i < frames.size(); i++)
-+		if (i != baseIndex)
-+			refs.push_back(i);
++	const std::vector<unsigned int> &refs = active;
 +
 +	for (unsigned int i : refs)
 +		frames[i].fields[level].assign(g.size(), { 0, 0 });
@@ -12413,22 +12447,21 @@ index 0000000..7a5d075
 +	res.usable = res.rejected < cfg.maxRejected && res.residual < cfg.maxResidual;
 +}
 +
-+int FrameAligner::estimate(const Nv12Frame *in, unsigned int count, unsigned int width,
-+			   unsigned int height)
++int FrameAligner::begin(unsigned int capacity, unsigned int width, unsigned int height)
 +{
 +	Impl &d = *impl_;
 +	const AlignConfig &cfg = d.cfg;
-+	if (!in || count < 1 || count > 16 || width < 64 || height < 64 || (width | height) & 1 ||
++	if (capacity < 1 || capacity > 16 || width < 64 || height < 64 || (width | height) & 1 ||
 +	    (cfg.downscale != 2 && cfg.downscale != 4) || cfg.block < 4)
 +		return -1;
-+	for (unsigned int i = 0; i < count; i++)
-+		if (!in[i].y || !in[i].uv || in[i].strideY < width || in[i].strideUV < width)
-+			return -1;
 +
-+	double t0 = nowMs();
 +	d.width = width;
 +	d.height = height;
-+	d.frames.assign(count, Frame());
++	d.frames.assign(capacity, Frame());
++	d.prepared.assign(capacity, false);
++	d.estBase = -1;
++	d.estimated.assign(capacity, false);
++	d.timing = {};
 +	const auto sizes = pyramidSizes(width, height, cfg);
 +	const int nl = sizes.size();
 +	d.grids.assign(nl, TileGrid());
@@ -12441,75 +12474,153 @@ index 0000000..7a5d075
 +	d.nodeStep = g0.tile * cfg.downscale;
 +	d.nodeCols = (width + d.nodeStep - 1) / d.nodeStep;
 +	d.nodeRows = (height + d.nodeStep - 1) / d.nodeStep;
++	return 0;
++}
 +
-+	/* 1. reduction and sharpness */
-+	for (unsigned int i = 0; i < count; i++) {
-+		Frame &f = d.frames[i];
-+		f.img = in[i];
-+		f.pyr.resize(nl);
-+		f.pyr[0].resize(sizes[0].first, sizes[0].second);
-+		f.fields.resize(nl);
-+		f.result = FrameResult();
-+		f.result.model = Model::Translation;
-+	}
++/* 1. reduction and sharpness of one frame */
++int FrameAligner::prepare(unsigned int index, const Nv12Frame &in)
++{
++	Impl &d = *impl_;
++	const AlignConfig &cfg = d.cfg;
++	const unsigned int width = d.width, height = d.height;
++	if (index >= d.frames.size() || !in.y || !in.uv || in.strideY < width || in.strideUV < width)
++		return -1;
++
++	const double t0 = nowMs();
++	const auto sizes = pyramidSizes(width, height, cfg);
++	const int nl = sizes.size();
++	Frame &f = d.frames[index];
++	f = Frame();
++	f.img = in;
++	f.pyr.resize(nl);
++	f.pyr[0].resize(sizes[0].first, sizes[0].second);
++	f.fields.resize(nl);
++
 +	const int band = 32;
 +	const int bands = (sizes[0].second + band - 1) / band;
 +	/* sharpness on every 16th row pair: 4 rows each */
 +	const int sharpStep = 16;
 +	const int sharpRowsTotal = (int(height) - 4) / sharpStep + 1;
-+	std::vector<double> sharpParts(size_t(count) * bands, 0.0);
-+	d.pool.run(size_t(count) * bands, [&](size_t item) {
++	std::vector<double> sharpParts(bands, 0.0);
++	d.pool.run(bands, [&](size_t b) {
 +		thread_local std::vector<uint16_t> tmp;
-+		Frame &f = d.frames[item / bands];
-+		const int b = item % bands;
++		thread_local std::vector<uint8_t> rows;
 +		const int r0 = b * band, r1 = std::min(sizes[0].second, r0 + band);
-+		reduceRows(f.img.y, f.img.strideY, cfg.downscale, f.pyr[0], r0, r1, tmp);
++		reduceRows(f.img.y, f.img.strideY, cfg.downscale, f.pyr[0], r0, r1, tmp, rows);
 +		/* the share of the sharpness rows of this band */
 +		const int s0 = b * sharpRowsTotal / bands, s1 = (b + 1) * sharpRowsTotal / bands;
 +		double sum = 0;
 +		for (int s = s0; s < s1; s++)
-+			sum += sharpRows(f.img.y, f.img.strideY, width, s * sharpStep, s * sharpStep + 1, tmp);
-+		sharpParts[item] = sum;
++			sum += sharpRows(f.img.y, f.img.strideY, width, s * sharpStep, s * sharpStep + 1,
++					 tmp, rows);
++		sharpParts[b] = sum;
 +	});
-+	d.pool.run(count, [&](size_t i) {
-+		thread_local std::vector<uint16_t> tmp;
-+		Frame &f = d.frames[i];
-+		smooth121(f.pyr[0], tmp);
-+		for (int l = 1; l < nl; l++)
-+			halve(f.pyr[l - 1], f.pyr[l]);
-+		double s = 0;
-+		for (int b = 0; b < bands; b++)
-+			s += sharpParts[i * bands + b];
-+		f.sharp = s / (double(sharpRowsTotal) * (width / 2));
-+	});
++	std::vector<uint16_t> tmp;
++	smooth121(f.pyr[0], tmp);
++	for (int l = 1; l < nl; l++)
++		halve(f.pyr[l - 1], f.pyr[l]);
++	double sum = 0;
++	for (double part : sharpParts)
++		sum += part;
++	f.sharp = sum / (double(sharpRowsTotal) * (width / 2));
++
++	d.prepared[index] = true;
++	d.estimated[index] = false;
++	if (int(index) == d.estBase)
++		d.estBase = -1;
++	d.timing.reduce += nowMs() - t0;
++	return 0;
++}
++
++int FrameAligner::estimate(const Nv12Frame *in, unsigned int count, unsigned int width,
++			   unsigned int height)
++{
++	if (!in || begin(count, width, height))
++		return -1;
++	for (unsigned int i = 0; i < count; i++)
++		if (prepare(i, in[i]))
++			return -1;
++	return estimate(count);
++}
++
++int FrameAligner::estimate(unsigned int count)
++{
++	Impl &d = *impl_;
++	const int base = d.estimate(count, count);
++	if (base >= 0) {
++		d.frames.resize(count);
++		d.prepared.resize(count);
++		d.estimated.resize(count);
++	}
++	return base;
++}
++
++int FrameAligner::estimateAhead(unsigned int count, unsigned int expected)
++{
++	return expected >= count ? impl_->estimate(count, expected) : -1;
++}
++
++/*
++ * 2. base frame: the sharpest, among nearly equal ones the one nearest to the
++ * middle of the @expected frames
++ */
++unsigned int FrameAligner::Impl::chooseBase(unsigned int count, unsigned int expected) const
++{
++	if (cfg.baseIndex >= 0 && unsigned(cfg.baseIndex) < count)
++		return cfg.baseIndex;
++
++	unsigned int base = 0;
++	double best = 0;
++	for (unsigned int i = 0; i < count; i++)
++		best = std::max(best, frames[i].sharp);
++	double mid = (expected - 1) * 0.5, bestDist = 1e9;
++	for (unsigned int i = 0; i < count; i++) {
++		if (frames[i].sharp < best * (1 - cfg.baseTolerance))
++			continue;
++		if (std::fabs(i - mid) < bestDist) {
++			bestDist = std::fabs(i - mid);
++			base = i;
++		}
++	}
++	return base;
++}
++
++/* Motion of the first @count frames against the base frame, those not done */
++int FrameAligner::Impl::estimate(unsigned int count, unsigned int expected)
++{
++	Impl &d = *this;
++	if (count < 1 || count > d.frames.size())
++		return -1;
++	for (unsigned int i = 0; i < count; i++)
++		if (!d.prepared[i])
++			return -1;
++
++	const int nl = d.grids.size();
++	const TileGrid &g0 = d.grids[0];
++	const int band = 32;
++	const int bands = (d.frames[0].pyr[0].h + band - 1) / band;
 +	double t1 = nowMs();
 +
-+	/* 2. base frame */
-+	unsigned int base = 0;
-+	if (cfg.baseIndex >= 0 && unsigned(cfg.baseIndex) < count) {
-+		base = cfg.baseIndex;
-+	} else {
-+		double best = 0;
-+		for (const Frame &f : d.frames)
-+			best = std::max(best, f.sharp);
-+		double mid = (count - 1) * 0.5, bestDist = 1e9;
-+		for (unsigned int i = 0; i < count; i++) {
-+			if (d.frames[i].sharp < best * (1 - cfg.baseTolerance))
-+				continue;
-+			if (std::fabs(i - mid) < bestDist) {
-+				bestDist = std::fabs(i - mid);
-+				base = i;
-+			}
-+		}
++	const unsigned int base = d.chooseBase(count, expected);
++	if (int(base) != d.estBase) {
++		d.estBase = base;
++		std::fill(d.estimated.begin(), d.estimated.end(), false);
 +	}
 +	d.baseIndex = base;
 +	for (unsigned int i = 0; i < count; i++)
 +		d.frames[i].result.sharpness = float(d.frames[i].sharp / std::max(1e-9, d.frames[base].sharp));
 +
-+	std::vector<unsigned int> refs;
-+	for (unsigned int i = 0; i < count; i++)
-+		if (i != base)
-+			refs.push_back(i);
++	std::vector<unsigned int> &refs = d.active;
++	refs.clear();
++	for (unsigned int i = 0; i < count; i++) {
++		if (i == base || d.estimated[i])
++			continue;
++		refs.push_back(i);
++		const float sharpness = d.frames[i].result.sharpness;
++		d.frames[i].result = FrameResult();
++		d.frames[i].result.model = Model::Translation;
++		d.frames[i].result.sharpness = sharpness;
++	}
 +
 +	/* 3. global shift on the coarsest level, then tiles coarse to fine */
 +	d.pool.run(refs.size(), [&](size_t k) {
@@ -12601,7 +12712,7 @@ index 0000000..7a5d075
 +		d.brightnessField(f);
 +	});
 +	/* second measurement near the model, then the final fit */
-+	std::vector<std::atomic<int>> changed(count);
++	std::vector<std::atomic<int>> changed(d.frames.size());
 +	d.pool.run(refs.size() * g0.rows, [&](size_t item) {
 +		const unsigned int i = refs[item / g0.rows];
 +		changed[i] += d.remeasure(d.frames[i], d.frames[base].pyr[0], item % g0.rows);
@@ -12641,6 +12752,10 @@ index 0000000..7a5d075
 +	/* the base frame: identity */
 +	{
 +		Frame &f = d.frames[base];
++		const float sharpness = f.result.sharpness;
++		f.result = FrameResult();
++		f.result.model = Model::Translation;
++		f.result.sharpness = sharpness;
 +		f.rel.assign(g0.size(), 255);
 +		f.local.assign(g0.size(), { 0, 0 });
 +		f.nodes.assign(size_t(d.nodeCols + 1) * (d.nodeRows + 1), { 0, 0 });
@@ -12655,18 +12770,27 @@ index 0000000..7a5d075
 +		f.result.validRect[3] = height;
 +	}
 +
-+	/* release the pyramids */
++	std::vector<int16_t>().swap(d.grad.gx);
++	std::vector<int16_t>().swap(d.grad.gy);
++	for (unsigned int i : refs)
++		d.estimated[i] = true;
++	double t3 = nowMs();
++	d.timing.match = t2 - t1;
++	d.timing.fit = t3 - t2;
++	return base;
++}
++
++void FrameAligner::release()
++{
++	Impl &d = *impl_;
 +	std::vector<int16_t>().swap(d.grad.gx);
 +	std::vector<int16_t>().swap(d.grad.gy);
 +	for (Frame &f : d.frames) {
 +		std::vector<Image16>().swap(f.pyr);
 +		std::vector<std::vector<Vec2i>>().swap(f.fields);
 +	}
-+	double t3 = nowMs();
-+	d.timing.reduce = t1 - t0;
-+	d.timing.match = t2 - t1;
-+	d.timing.fit = t3 - t2;
-+	return base;
++	std::fill(d.prepared.begin(), d.prepared.end(), false);
++	d.estBase = -1;
 +}
 +
 +unsigned int FrameAligner::count() const
@@ -12789,13 +12913,37 @@ index 0000000..7a5d075
 +} /* namespace */
 +
 +/*
-+ * Rows [r0, r1) of one plane: w samples of channels bytes per row. step is
-+ * the control point distance in plane pixels, scale converts the frame
-+ * displacement to plane pixels.
++ * Source rows [first, last] that the output rows [r0, r1) of a plane read:
++ * the vertical displacement over the control points of those rows, one row
++ * more for the bilinear step and one for rounding, within the plane
++ */
++void FrameAligner::Impl::sourceRows(const Frame &f, int h, int step, float scale, int r0, int r1,
++				    int *first, int *last) const
++{
++	const int nc = nodeCols + 1;
++	const int j0 = std::clamp(int((r0 + 0.5f) / step), 0, nodeRows - 1);
++	const int j1 = std::clamp(int((r1 - 0.5f) / step), 0, nodeRows - 1) + 1;
++	float lo = 0, hi = 0;
++	for (int j = j0; j <= j1; j++) {
++		const Vec2 *n = &f.nodes[size_t(j) * nc];
++		for (int i = 0; i < nc; i++) {
++			lo = std::min(lo, n[i].y);
++			hi = std::max(hi, n[i].y);
++		}
++	}
++	*first = std::clamp(int(std::floor(r0 + lo * scale)) - 1, 0, h - 1);
++	*last = std::clamp(int(std::floor(r1 - 1 + hi * scale)) + 2, 0, h - 1);
++}
++
++/*
++ * Rows [r0, r1) of one plane: w samples of channels bytes per row. src holds
++ * the source rows from srcRow0 on (all that the rows read, see sourceRows()).
++ * step is the control point distance in plane pixels, scale converts the
++ * frame displacement to plane pixels.
 + */
 +void FrameAligner::Impl::warpPlane(const Frame &f, const uint8_t *src, unsigned int sstride,
-+				   uint8_t *dst, unsigned int dstride, int w, int h, int channels,
-+				   int step, float scale, int r0, int r1) const
++				   int srcRow0, uint8_t *dst, unsigned int dstride, int w, int h,
++				   int channels, int step, float scale, int r0, int r1) const
 +{
 +	const int nc = nodeCols + 1;
 +	std::vector<Vec2> d(nc);
@@ -12831,7 +12979,7 @@ index 0000000..7a5d075
 +				/* fractions over the run (constant if the offset does not move) */
 +				const bool fx = dox || (ox & 0xf000), fy = doy || (oy & 0xf000);
 +				if (sy >= 0 && sy + (fy ? 1 : 0) < h && sx >= 0 && sx + n - 1 + (fx ? 1 : 0) < w) {
-+					const uint8_t *s0 = src + size_t(sy) * sstride + sx * channels;
++					const uint8_t *s0 = src + size_t(sy - srcRow0) * sstride + sx * channels;
 +					const uint8_t *s1 = fy ? s0 + sstride : s0;
 +					if (dox || doy) {
 +						if (channels == 1)
@@ -12857,7 +13005,8 @@ index 0000000..7a5d075
 +						const unsigned int cx = (px >> 12) & 15, cy = (py >> 12) & 15;
 +						const int xa = std::clamp(qx, 0, w - 1), xb = std::clamp(qx + 1, 0, w - 1);
 +						const int ya = std::clamp(qy, 0, h - 1), yb = std::clamp(qy + 1, 0, h - 1);
-+						const uint8_t *s0 = src + size_t(ya) * sstride, *s1 = src + size_t(yb) * sstride;
++						const uint8_t *s0 = src + size_t(ya - srcRow0) * sstride;
++						const uint8_t *s1 = src + size_t(yb - srcRow0) * sstride;
 +						for (int c = 0; c < channels; c++) {
 +							const unsigned int v =
 +								(s0[xa * channels + c] * (16 - cx) + s0[xb * channels + c] * cx) * (16 - cy) +
@@ -12886,15 +13035,23 @@ index 0000000..7a5d075
 +	const int band = 16;
 +	const int bandsY = (h + band - 1) / band, bandsC = (hc + band - 1) / band;
 +	d.pool.run(bandsY + bandsC, [&](size_t item) {
-+		if (int(item) < bandsY) {
-+			const int r0 = item * band;
-+			d.warpPlane(f, f.img.y, f.img.strideY, out.y, out.strideY, d.width, h, 1,
-+				    d.nodeStep, 1.0f, r0, std::min(h, r0 + band));
-+		} else {
-+			const int r0 = (item - bandsY) * band;
-+			d.warpPlane(f, f.img.uv, f.img.strideUV, out.uv, out.strideUV, d.width / 2, hc, 2,
-+				    d.nodeStep / 2, 0.5f, r0, std::min(hc, r0 + band));
-+		}
++		thread_local std::vector<uint8_t> rows;
++		const bool luma = int(item) < bandsY;
++		const int ph = luma ? h : hc;
++		const int step = luma ? d.nodeStep : d.nodeStep / 2;
++		const float scale = luma ? 1.0f : 0.5f;
++		const int r0 = (luma ? item : item - bandsY) * band, r1 = std::min(ph, r0 + band);
++		int first, last;
++		d.sourceRows(f, ph, step, scale, r0, r1, &first, &last);
++		const uint8_t *src = luma ? f.img.y : f.img.uv;
++		const unsigned int stride = luma ? f.img.strideY : f.img.strideUV;
++		copyRows(src, stride, first, last - first + 1, d.width, rows);
++		if (luma)
++			d.warpPlane(f, rows.data(), d.width, first, out.y, out.strideY, d.width, h, 1,
++				    step, scale, r0, r1);
++		else
++			d.warpPlane(f, rows.data(), d.width, first, out.uv, out.strideUV, d.width / 2,
++				    hc, 2, step, scale, r0, r1);
 +	});
 +	d.timing.warp = nowMs() - t0;
 +	return 0;
@@ -12943,10 +13100,10 @@ index 0000000..7a5d075
 +} /* namespace libcamera::mtkisp50 */
 diff --git a/src/libcamera/pipeline/mtkisp50/align/frame_aligner.h b/src/libcamera/pipeline/mtkisp50/align/frame_aligner.h
 new file mode 100644
-index 0000000..1bb50fd
+index 0000000..99388ab
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/align/frame_aligner.h
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,214 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Alignment of a burst of NV12 frames for multi-frame noise reduction
@@ -12966,7 +13123,9 @@ index 0000000..1bb50fd
 + *
 + * No device, no allocation of image buffers: the caller passes the frames
 + * and the output buffers. Working memory is the reduced pyramids of all
-+ * frames (see workingMemory()), released at the end of estimate().
++ * frames (see workingMemory()), kept until release(). The frames are read
++ * once, row by row, into cached buffers: they may lie in memory the CPU
++ * does not cache.
 + */
 +
 +#pragma once
@@ -13088,9 +13247,33 @@ index 0000000..1bb50fd
 +	 * Choose the base frame and estimate the motion of all others. Width and
 +	 * height must be even and at least 64. The frames must stay valid until
 +	 * the last warp(). Returns the base index, or -1 on bad arguments.
++	 * Same as begin(), prepare() of every frame and estimate(count).
 +	 */
 +	int estimate(const Nv12Frame *frames, unsigned int count,
 +		     unsigned int width, unsigned int height);
++
++	/*
++	 * The same in steps, so that the frames of a burst can be reduced while
++	 * the next ones are captured: begin() for up to @capacity frames of the
++	 * size, prepare() of each frame (index in capture order, any order of
++	 * the calls, again to replace a frame), estimate() over the first
++	 * @count frames, all prepared. The reduced frames stay until release()
++	 * or the next begin(): estimate() may run again, with another base
++	 * frame. Return 0 (begin, prepare) or the base index, -1 on bad
++	 * arguments.
++	 */
++	int begin(unsigned int capacity, unsigned int width, unsigned int height);
++	int prepare(unsigned int index, const Nv12Frame &frame);
++	int estimate(unsigned int count);
++	void release();
++
++	/*
++	 * Before all frames are there: base frame among the first @count
++	 * frames (all prepared) as if @expected frames came, and the motion of
++	 * the others against it. estimate() keeps the motion of those frames
++	 * if it chooses the same base frame. Returns the base index or -1.
++	 */
++	int estimateAhead(unsigned int count, unsigned int expected);
 +
 +	/* Base frame of the next estimate(), -1 = choose by sharpness */
 +	void setBaseIndex(int index);
@@ -13117,7 +13300,10 @@ index 0000000..1bb50fd
 +	 * 0 outside validRect) */
 +	int expandReliability(unsigned int index, uint8_t *map, unsigned int stride) const;
 +
-+	/* Time in ms of the phases of the last estimate() and warp() calls */
++	/*
++	 * Time in ms of the phases: the reductions since begin(), the last
++	 * estimate() and warp() calls
++	 */
 +	struct Timing {
 +		double reduce;
 +		double match;
@@ -13134,10 +13320,10 @@ index 0000000..1bb50fd
 +} /* namespace libcamera::mtkisp50 */
 diff --git a/src/libcamera/pipeline/mtkisp50/frames.cpp b/src/libcamera/pipeline/mtkisp50/frames.cpp
 new file mode 100644
-index 0000000..c094475
+index 0000000..72042c5
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/frames.cpp
-@@ -0,0 +1,346 @@
+@@ -0,0 +1,350 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Per request bookkeeping of the mtkisp50 pipeline
@@ -13209,6 +13395,8 @@ index 0000000..c094475
 +	info->rawBuffer = rawBuffer;
 +	info->rawFromRequest = rawFromRequest;
 +	info->outputBuffer = outputBuffer;
++	info->outputRequest = nullptr;
++	info->outputHolder = 0;
 +	info->scaledBuffer = scaledBuffer;
 +	info->paramsBuffer = availableParamsBuffers_.front();
 +	info->statsBuffer = availableStatsBuffers_.front();
@@ -13229,6 +13417,8 @@ index 0000000..c094475
 +	info->error = false;
 +	info->series = false;
 +	info->held = false;
++	info->seriesImage = false;
++	info->seriesCandidate = false;
 +
 +	availableParamsBuffers_.pop();
 +	availableStatsBuffers_.pop();
@@ -13486,10 +13676,10 @@ index 0000000..c094475
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/frames.h b/src/libcamera/pipeline/mtkisp50/frames.h
 new file mode 100644
-index 0000000..5f29fd6
+index 0000000..9fc4557
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/frames.h
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,197 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Per request bookkeeping of the mtkisp50 pipeline
@@ -13545,6 +13735,13 @@ index 0000000..5f29fd6
 +		bool rawFromRequest;
 +		/* Processed outputs of the request, nullptr if not in it */
 +		FrameBuffer *outputBuffer;
++		/*
++		 * The request of the main output when it is not @request: a still
++		 * image taken by an earlier frame on its way (the frame of its own
++		 * request, @outputHolder, is held until the still image is done)
++		 */
++		Request *outputRequest;
++		unsigned int outputHolder;
 +		FrameBuffer *scaledBuffer;
 +		FrameBuffer *paramsBuffer;
 +		FrameBuffer *statsBuffer;
@@ -13573,12 +13770,18 @@ index 0000000..5f29fd6
 +
 +		/*
 +		 * Multi-frame series: the output buffer is an image of the
-+		 * series (internal frames, and the still image whose buffer
-+		 * takes the first frame and later the result); held: the
-+		 * frame waits for the result of the series
++		 * series (frames of the series, and the still image whose
++		 * buffer takes the first frame and later the result); held:
++		 * the frame waits for the result of the series. seriesImage:
++		 * the output buffer is an image of the handler, not of the
++		 * request (a frame of the series after the still image; its
++		 * request, if any, has only the scaled output). seriesCandidate:
++		 * a frame on its way when the series started, which may join it.
 +		 */
 +		bool series;
 +		bool held;
++		bool seriesImage;
++		bool seriesCandidate;
 +	};
 +
 +	MtkIsp50Frames();
@@ -13676,10 +13879,10 @@ index 0000000..5f29fd6
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/meson.build b/src/libcamera/pipeline/mtkisp50/meson.build
 new file mode 100644
-index 0000000..7513be7
+index 0000000..e657318
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/meson.build
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,24 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +libcamera_internal_sources += files([
@@ -13691,21 +13894,25 @@ index 0000000..7513be7
 +    'streams.cpp',
 +])
 +
-+# Alignment of the frames of a multi-frame still image (written for the
-+# auto-vectoriser, built with full optimisation)
++# Alignment of the frames of a multi-frame still image, written for the
++# auto-vectoriser: built with full optimisation. The flag goes with the target
++# arguments, which come after the flags of the environment (distribution builds
++# pass -O2 there, which would override the optimization option); without the
++# vectorised loops the reading of the frames, which are not cached for the CPU,
++# takes many times longer.
 +mtkisp50_align = static_library('mtkisp50-align',
 +                                files('align/frame_aligner.cpp'),
 +                                pic : true,
-+                                override_options : ['optimization=3'],
++                                cpp_args : ['-O3'],
 +                                dependencies : libthreads)
 +
 +libcamera_deps += declare_dependency(link_whole : mtkisp50_align)
 diff --git a/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..067e349
+index 0000000..dc2b74a
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,3483 @@
+@@ -0,0 +1,3715 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the MediaTek MT6785 camera subsystem with the ISP pass 2
@@ -13737,6 +13944,7 @@ index 0000000..067e349
 +#include <queue>
 +#include <regex>
 +#include <set>
++#include <sstream>
 +#include <string>
 +#include <vector>
 +
@@ -14267,16 +14475,31 @@ index 0000000..067e349
 +		size_t imageSize = 0;
 +
 +		State state = State::Idle;
-+		/* The frame of the still image, its request and buffer */
++		/*
++		 * The frame of the still image, the frame of its request (held
++		 * until the series is done; the same frame unless an earlier one
++		 * took the still image), its request and buffer
++		 */
 +		unsigned int still = 0;
++		unsigned int holder = 0;
 +		Request *request = nullptr;
 +		FrameBuffer *appBuffer = nullptr;
-+		/* Frames wanted, internal captures queued, frames back from the ISP */
++		/*
++		 * Frames wanted, images of the series given to frames, frames on
++		 * their way that may still join, frames back from the ISP
++		 */
 +		unsigned int wanted = 0;
-+		unsigned int queued = 0;
++		unsigned int taken = 0;
++		unsigned int candidates = 0;
 +		unsigned int finished = 0;
-+		/* Images of the frames processed well, in capture order */
++		/* Number of the series (for the worker) */
++		unsigned int number = 0;
++		/* Images of the frames processed well, in capture order, and
++		 * their sensor sequence numbers */
 +		std::vector<unsigned int> frames;
++		std::vector<uint32_t> sequences;
++		/* Times the frames came back from the ISP, ms after the start */
++		std::vector<double> times;
 +		/* Frames whose parameters wait for the ISP jobs of the series */
 +		std::deque<unsigned int> deferred;
 +		MtkIsp50SeriesResult result;
@@ -14292,6 +14515,8 @@ index 0000000..067e349
 +		std::chrono::steady_clock::time_point tIsp;
 +		Timer timeout;
 +
++		/* Frames the series still has to queue */
++		bool missing() const { return 1 + taken + candidates < wanted; }
 +		/* Index of the buffer of the still image in the image list */
 +		unsigned int appImage() const { return images.size(); }
 +		unsigned int warpImage() const { return images.size() - 1; }
@@ -14406,8 +14631,13 @@ index 0000000..067e349
 +	void queuePdBuffers(MtkIsp50CameraData *data, const std::vector<FrameBuffer *> &buffers);
 +
 +	void computeParams(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info);
++	void takeStillEarlier(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info);
++	MtkIsp50Frames::Info *stillHolder(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info);
++	void completeStill(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info, FrameBuffer *buffer);
 +	bool queueSeriesFrame(MtkIsp50CameraData *data);
++	void seriesCandidateCaptured(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info, bool ok);
 +	void startSeries(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info, unsigned int frames);
++	std::vector<MtkIsp50SeriesImage> seriesImages(MtkIsp50CameraData *data);
 +	void seriesFrameBack(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info, bool ok);
 +	void seriesCaptureTimeout();
 +	void seriesBlended(const MtkIsp50SeriesResult &result);
@@ -14936,8 +15166,21 @@ index 0000000..067e349
 +	if (!info)
 +		return;
 +
-+	if (info->request)
-+		info->request->_d()->metadata().merge(metadata);
++	/*
++	 * Only what is missing: the request of a still image taken by an
++	 * earlier frame has the metadata of that frame already
++	 */
++	if (info->request) {
++		ControlList &requestMetadata = info->request->_d()->metadata();
++		for (const auto &[id, value] : metadata) {
++			if (!requestMetadata.contains(id))
++				requestMetadata.set(id, value);
++		}
++	}
++	/* A still image taken by this frame: its request describes this frame */
++	if (MtkIsp50Frames::Info *holder = pipe()->stillHolder(this, info))
++		holder->request->_d()->metadata().merge(metadata,
++							ControlList::MergePolicy::OverwriteExisting);
 +	info->metadataDone = true;
 +
 +	pipe()->tryComplete(this, info);
@@ -15911,6 +16154,13 @@ index 0000000..067e349
 +		data->pendingRequests_.pop();
 +	}
 +
++	/* The buffer of a still image whose series did not finish */
++	if (data->series_.request && data->series_.appBuffer) {
++		data->series_.appBuffer->_d()->cancel();
++		completeBuffer(data->series_.request, data->series_.appBuffer);
++		data->series_.appBuffer = nullptr;
++	}
++
 +	while (MtkIsp50Frames::Info *info = data->frames_.first()) {
 +		Request *request = info->request;
 +
@@ -15920,10 +16170,11 @@ index 0000000..067e349
 +			continue;
 +		}
 +
-+		/* The buffer of a still image waiting for its series */
-+		if (info->outputBuffer && (!info->outputDone || info->held)) {
++		/* The buffer of a still image (not of a series, done above) */
++		if (info->outputBuffer && !info->outputDone && !info->series) {
 +			info->outputBuffer->_d()->cancel();
-+			completeBuffer(request, info->outputBuffer);
++			completeBuffer(info->outputRequest ? info->outputRequest : request,
++				       info->outputBuffer);
 +		}
 +
 +		if (info->scaledBuffer && !info->scaledDone) {
@@ -15967,7 +16218,7 @@ index 0000000..067e349
 +	while (!data->stopping_ && queueSeriesFrame(data))
 +		;
 +	if (data->series_.state == MtkIsp50CameraData::Series::State::Capture &&
-+	    data->series_.queued + 1 < data->series_.wanted)
++	    data->series_.missing())
 +		return;
 +
 +	while (!data->stopping_ && !data->pendingRequests_.empty()) {
@@ -15997,6 +16248,10 @@ index 0000000..067e349
 +		if (!rawFromRequest)
 +			data->availableRawBuffers_.pop();
 +
++		if (output && !rawFromRequest && request->controls().empty() &&
++		    data->useCase_ == ipa::mtkisp50::UseCase::Still)
++			takeStillEarlier(data, info);
++
 +		if (data->ipa_)
 +			data->ipa_->queueRequest(id, request->controls());
 +
@@ -16008,6 +16263,71 @@ index 0000000..067e349
 +			data->frames_.remove(info);
 +			cancelRequest(request);
 +		}
++	}
++}
++
++/*
++ * A still image of a photo session: the earliest preview frame on its way to
++ * the sensor takes it, as it has the same exposure, instead of the frame of
++ * its request, which the sensor captures after all frames queued before. The
++ * frame of the request keeps its preview and is held until the still image
++ * is done, so that its request completes with it. Only for a request without
++ * controls: those apply from the frame of the request on.
++ */
++void PipelineHandlerMtkIsp50::takeStillEarlier(MtkIsp50CameraData *data,
++					       MtkIsp50Frames::Info *info)
++{
++	MtkIsp50Frames::Info *first = data->frames_.first();
++	for (unsigned int id = first ? first->id : info->id; id < info->id; id++) {
++		MtkIsp50Frames::Info *earlier = data->frames_.find(id);
++		if (!earlier || earlier->captured || !earlier->request || earlier->rawFromRequest ||
++		    earlier->outputBuffer || !earlier->scaledBuffer || earlier->series ||
++		    earlier->seriesCandidate)
++			continue;
++
++		earlier->outputBuffer = info->outputBuffer;
++		earlier->outputRequest = info->request;
++		earlier->outputHolder = info->id;
++		earlier->outputDone = false;
++		info->outputBuffer = nullptr;
++		info->outputDone = true;
++		info->held = true;
++
++		LOG(MtkIsp50, Debug)
++			<< "Still image of frame " << info->id << " on frame " << earlier->id;
++		return;
++	}
++}
++
++/*
++ * The frame of the request of the still image that the earlier frame @info
++ * took, as long as that request is not complete (nullptr otherwise, or when
++ * @info did not take one)
++ */
++MtkIsp50Frames::Info *PipelineHandlerMtkIsp50::stillHolder(MtkIsp50CameraData *data,
++							   MtkIsp50Frames::Info *info)
++{
++	if (!info->outputRequest)
++		return nullptr;
++
++	MtkIsp50Frames::Info *owner = data->frames_.find(info->outputHolder);
++	return owner && owner->request == info->outputRequest ? owner : nullptr;
++}
++
++/*
++ * The still image of a frame is done (@buffer, cancelled or not): into its
++ * request, and the frame of that request goes on when another frame took it
++ */
++void PipelineHandlerMtkIsp50::completeStill(MtkIsp50CameraData *data,
++					    MtkIsp50Frames::Info *info, FrameBuffer *buffer)
++{
++	Request *request = info->outputRequest ? info->outputRequest : info->request;
++	completeBuffer(request, buffer);
++
++	MtkIsp50Frames::Info *owner = stillHolder(data, info);
++	if (owner) {
++		owner->held = false;
++		tryComplete(data, owner);
 +	}
 +}
 +
@@ -16068,22 +16388,28 @@ index 0000000..067e349
 +	info->rawSequence = buffer->metadata().sequence;
 +	info->rawTimestamp = buffer->metadata().timestamp;
 +
++	if (info->seriesCandidate)
++		seriesCandidateCaptured(data, info,
++					buffer->metadata().status == FrameMetadata::FrameSuccess);
++
 +	if (buffer->metadata().status != FrameMetadata::FrameSuccess) {
 +		info->error = true;
 +		info->rawDone = true;
 +		info->paramsDone = true;
 +		info->metadataDone = true;
-+		if (!request) {
++		if (info->seriesImage) {
 +			/* A frame of a series: it falls out */
 +			info->outputDone = true;
 +			seriesFrameBack(data, info, false);
-+			tryComplete(data, info);
-+			return;
++			if (!request) {
++				tryComplete(data, info);
++				return;
++			}
 +		}
 +		if (info->outputBuffer && !info->outputDone) {
 +			info->outputBuffer->_d()->cancel();
-+			completeBuffer(request, info->outputBuffer);
 +			info->outputDone = true;
++			completeStill(data, info, info->outputBuffer);
 +		}
 +		if (info->scaledBuffer && !info->scaledDone) {
 +			info->scaledBuffer->_d()->cancel();
@@ -16094,9 +16420,18 @@ index 0000000..067e349
 +		return;
 +	}
 +
++	/*
++	 * The request of a still image taken by this frame describes this
++	 * frame: its frame keeps the time set here
++	 */
++	if (MtkIsp50Frames::Info *holder = stillHolder(data, info))
++		holder->request->_d()->metadata().set(controls::SensorTimestamp,
++						      buffer->metadata().timestamp);
++
 +	if (request) {
-+		request->_d()->metadata().set(controls::SensorTimestamp,
-+					      buffer->metadata().timestamp);
++		if (!request->metadata().contains(controls::SensorTimestamp.id()))
++			request->_d()->metadata().set(controls::SensorTimestamp,
++						      buffer->metadata().timestamp);
 +		if (!data->scalerCrop_.isNull())
 +			request->_d()->metadata().set(controls::ScalerCrop, data->scalerCrop_);
 +	}
@@ -16132,7 +16467,7 @@ index 0000000..067e349
 +	using ipa::mtkisp50::UseCase;
 +
 +	UseCase jobUse = data->useCase_;
-+	if (!info->request)
++	if (info->seriesImage)
 +		jobUse = UseCase::SeriesFrame;
 +	else if (jobUse == UseCase::Still && !info->outputBuffer)
 +		jobUse = UseCase::Preview;
@@ -16193,7 +16528,7 @@ index 0000000..067e349
 +		info->error = true;
 +
 +	info->outputDone = true;
-+	completeBuffer(info->request, buffer);
++	completeStill(data, info, buffer);
 +	ispJobBack(data, info);
 +	tryComplete(data, info);
 +}
@@ -16364,7 +16699,7 @@ index 0000000..067e349
 +				seriesFrameBack(data, failed, false);
 +			} else {
 +				failed->outputBuffer->_d()->cancel();
-+				completeBuffer(request, failed->outputBuffer);
++				completeStill(data, failed, failed->outputBuffer);
 +			}
 +		}
 +		if (failed->scaledBuffer && !failed->scaledQueued) {
@@ -16413,16 +16748,19 @@ index 0000000..067e349
 + *
 + * A still image whose sensitivity calls for a series (the IPA decides when it
 + * computes the parameters of its frame) is the first frame of the series; the
-+ * handler captures the other frames on its own (frames without request, before
-+ * further requests) with the parameters of the first one. The ISP writes the
-+ * first frame into the buffer of the still image and the others into images of
-+ * the series. Then the ISP finishes its jobs and stops; the worker aligns and
-+ * blends the frames in the MFB (the DIP and the MFB share a memory port whose
-+ * use the drivers do not serialise yet, they do not run at the same time).
-+ * Then two ISP jobs with the NV12 input: the noise reduction of the base frame
-+ * and the blend of the result with it over the weight map into the buffer of
-+ * the still image. Frames that come meanwhile wait with their parameters, so
-+ * that the jobs reach the ISP in the order the IPA computed their parameters.
++ * other frames are processed with the parameters of the first one: the preview
++ * frames already on their way, then frames the handler captures on its own
++ * (before further requests; a waiting request of the preview alone goes with
++ * such a frame). The ISP writes the first frame into the buffer of the still
++ * image, the others into images of the series and the preview, if any; the
++ * worker reduces each frame for the alignment as it comes. Then the ISP
++ * finishes its jobs and stops; the worker aligns and blends the frames in the
++ * MFB (the DIP and the MFB share a memory port whose use the drivers do not
++ * serialise yet, they do not run at the same time). Then two ISP jobs with the
++ * NV12 input: the noise reduction of the base frame and the blend of the result
++ * with it over the weight map into the buffer of the still image. Frames that
++ * come meanwhile wait with their parameters, so that the jobs reach the ISP in
++ * the order the IPA computed their parameters.
 + */
 +
 +namespace {
@@ -16505,28 +16843,51 @@ index 0000000..067e349
 +	s.frames.clear();
 +}
 +
-+/* Queue a frame of the handler for the series being captured */
++/*
++ * Queue a frame of the handler for the series being captured. A waiting
++ * request with only the scaled output (the preview) goes with it: the outputs
++ * of the ISP stay those of the still image. The request completes after the
++ * still image, as requests complete in their order.
++ */
 +bool PipelineHandlerMtkIsp50::queueSeriesFrame(MtkIsp50CameraData *data)
 +{
 +	auto &s = data->series_;
 +
-+	if (s.state != MtkIsp50CameraData::Series::State::Capture ||
-+	    s.queued + 1 >= s.wanted || data->availableRawBuffers_.empty())
++	if (s.state != MtkIsp50CameraData::Series::State::Capture || !s.missing() ||
++	    data->availableRawBuffers_.empty())
 +		return false;
++
++	Request *request = nullptr;
++	FrameBuffer *scaled = nullptr;
++	if (!data->pendingRequests_.empty()) {
++		Request *next = data->pendingRequests_.front();
++		FrameBuffer *preview = data->outputs_ & MtkIsp50OutputScaled
++					       ? next->findBuffer(&data->scaledStream_) : nullptr;
++		const bool other = (data->outputs_ & MtkIsp50OutputMain &&
++				    next->findBuffer(&data->outputStream_)) ||
++				   (data->rawActive_ && next->findBuffer(&data->rawStream_));
++		if (preview && !other) {
++			request = next;
++			scaled = preview;
++		}
++	}
 +
 +	FrameBuffer *raw = data->availableRawBuffers_.front();
 +	const unsigned int id = data->nextFrame_;
 +	MtkIsp50Frames::Info *info =
-+		data->frames_.create(id, nullptr, raw, false, s.images[s.queued].get());
++		data->frames_.create(id, request, raw, false, s.images[s.taken].get(), scaled);
 +	if (!info)
 +		return false;
 +
 +	data->nextFrame_++;
 +	data->availableRawBuffers_.pop();
++	if (request)
++		data->pendingRequests_.pop();
 +	info->series = true;
-+	s.queued++;
++	info->seriesImage = true;
++	s.taken++;
 +
-+	data->ipa_->queueRequest(id, ControlList{ controls::controls });
++	data->ipa_->queueRequest(id, request ? request->controls() : ControlList{ controls::controls });
 +
 +	int ret = data->video_->queueBuffer(raw);
 +	if (ret) {
@@ -16534,11 +16895,41 @@ index 0000000..067e349
 +		data->availableRawBuffers_.push(raw);
 +		data->frames_.remove(info);
 +		s.wanted--;
-+		s.queued--;
++		s.taken--;
++		if (request)
++			cancelRequest(request);
 +		return false;
 +	}
 +
 +	return true;
++}
++
++/*
++ * A frame that was on its way when the series started is captured: a
++ * preview frame joins the series while it needs frames (the sensor runs
++ * with the exposure of the still image already). Its job writes an image
++ * of the series and the preview.
++ */
++void PipelineHandlerMtkIsp50::seriesCandidateCaptured(MtkIsp50CameraData *data,
++						      MtkIsp50Frames::Info *info, bool ok)
++{
++	auto &s = data->series_;
++
++	info->seriesCandidate = false;
++	if (s.state != MtkIsp50CameraData::Series::State::Capture)
++		return;
++
++	s.candidates--;
++	if (ok && 1 + s.taken < s.wanted) {
++		info->outputBuffer = s.images[s.taken].get();
++		info->outputDone = false;
++		info->series = true;
++		info->seriesImage = true;
++		s.taken++;
++	}
++
++	/* A frame that did not join: the series queues one of its own */
++	queuePendingRequests(data);
 +}
 +
 +void PipelineHandlerMtkIsp50::startSeries(MtkIsp50CameraData *data, MtkIsp50Frames::Info *info,
@@ -16554,13 +16945,17 @@ index 0000000..067e349
 +	}
 +
 +	s.state = MtkIsp50CameraData::Series::State::Capture;
++	s.number++;
 +	s.still = info->id;
-+	s.request = info->request;
++	s.request = info->outputRequest ? info->outputRequest : info->request;
 +	s.appBuffer = info->outputBuffer;
 +	s.wanted = std::min<unsigned int>(frames, s.images.size());
-+	s.queued = 0;
++	s.taken = 0;
++	s.candidates = 0;
 +	s.finished = 0;
 +	s.frames.clear();
++	s.sequences.clear();
++	s.times.clear();
 +	s.deferred.clear();
 +	s.result = {};
 +	s.ispStep = 0;
@@ -16570,8 +16965,31 @@ index 0000000..067e349
 +	s.tStart = std::chrono::steady_clock::now();
 +	s.timeout.start(kSeriesCaptureTimeout);
 +
++	/* The frame of the request of the still image waits for the series */
 +	info->series = true;
-+	info->held = true;
++	if (info->outputRequest) {
++		s.holder = info->outputHolder;
++	} else {
++		s.holder = info->id;
++		info->held = true;
++	}
++
++	/*
++	 * The preview frames on their way after the still image may join the
++	 * series: they are captured before any frame the series queues now
++	 */
++	for (unsigned int id = info->id + 1; id < data->nextFrame_; id++) {
++		MtkIsp50Frames::Info *next = data->frames_.find(id);
++		if (!next || next->captured || !next->request || next->rawFromRequest ||
++		    next->outputBuffer || !next->scaledBuffer)
++			continue;
++		next->seriesCandidate = true;
++		s.candidates++;
++	}
++
++	/* The worker reduces each frame as it comes */
++	seriesWorker_->invokeMethod(&MtkIsp50SeriesWorker::setImages, ConnectionTypeQueued,
++				    seriesImages(data));
 +
 +	queuePendingRequests(data);
 +}
@@ -16589,15 +17007,22 @@ index 0000000..067e349
 +
 +	if (info) {
 +		s.finished++;
-+		if (ok) {
-+			if (info->request) {
-+				s.frames.push_back(s.appImage());
-+			} else {
-+				for (unsigned int i = 0; i < s.images.size(); i++) {
-+					if (s.images[i].get() == info->outputBuffer)
-+						s.frames.push_back(i);
-+				}
++		int image = -1;
++		if (ok && !info->seriesImage) {
++			image = s.appImage();
++		} else if (ok) {
++			for (unsigned int i = 0; i < s.images.size(); i++) {
++				if (s.images[i].get() == info->outputBuffer)
++					image = i;
 +			}
++		}
++		if (image >= 0) {
++			s.frames.push_back(image);
++			s.sequences.push_back(info->rawSequence);
++			s.times.push_back(msBetween(s.tStart, std::chrono::steady_clock::now()));
++			seriesWorker_->invokeMethod(&MtkIsp50SeriesWorker::prepare, ConnectionTypeQueued,
++						    s.number, static_cast<unsigned int>(s.frames.size() - 1),
++						    static_cast<unsigned int>(image), s.wanted);
 +		} else {
 +			LOG(MtkIsp50, Warning) << "Frame " << info->id << " of the series failed";
 +		}
@@ -16626,13 +17051,8 @@ index 0000000..067e349
 +{
 +	auto &s = data->series_;
 +
-+	/* The buffer of the still image is the last image of the worker */
-+	std::vector<MtkIsp50SeriesImage> list;
-+	for (const auto &image : s.images)
-+		list.push_back({ image->planes()[0].fd, s.imageSize });
-+	list.push_back({ s.appBuffer->planes()[0].fd, s.imageSize });
-+
 +	MtkIsp50SeriesJob job;
++	job.series = s.number;
 +	job.frames = s.frames;
 +	job.appImage = s.appImage();
 +	job.warpImage = s.warpImage();
@@ -16643,8 +17063,18 @@ index 0000000..067e349
 +	data->ipa_->blendParams(s.still, &job.blendParams);
 +
 +	s.state = MtkIsp50CameraData::Series::State::Blend;
-+	seriesWorker_->invokeMethod(&MtkIsp50SeriesWorker::setImages, ConnectionTypeQueued, list);
 +	seriesWorker_->invokeMethod(&MtkIsp50SeriesWorker::process, ConnectionTypeQueued, job);
++}
++
++/* The images of the worker: the series, then the buffer of the still image */
++std::vector<MtkIsp50SeriesImage> PipelineHandlerMtkIsp50::seriesImages(MtkIsp50CameraData *data)
++{
++	auto &s = data->series_;
++	std::vector<MtkIsp50SeriesImage> list;
++	for (const auto &image : s.images)
++		list.push_back({ image->planes()[0].fd, s.imageSize });
++	list.push_back({ s.appBuffer->planes()[0].fd, s.imageSize });
++	return list;
 +}
 +
 +/*
@@ -16958,11 +17388,20 @@ index 0000000..067e349
 +	/* The IPA forgets the series also when its ISP jobs did not come */
 +	data->ipa_->seriesEnd();
 +
++	std::ostringstream sequences;
++	for (unsigned int i = 0; i < s.sequences.size(); i++)
++		sequences << (i ? "," : "") << s.sequences[i];
++	sequences << " back at";
++	for (unsigned int i = 0; i < s.times.size(); i++)
++		sequences << (i ? "," : " ") << static_cast<int>(s.times[i]);
++
 +	LOG(MtkIsp50, Info)
 +		<< "Series of frame " << s.still << ": " << s.frames.size() << " of " << s.wanted
 +		<< " frames, " << s.result.blends << " blends" << (s.fallback ? " (single frame)" : "")
 +		<< (ok ? "" : ", failed") << "; capture "
-+		<< msBetween(s.tStart, s.tCaptured) << " ms, estimate " << s.result.tEstimate
++		<< msBetween(s.tStart, s.tCaptured) << " ms (sensor frames " << sequences.str()
++		<< "), meanwhile reduced " << s.result.tPrepare << " ms and estimated "
++		<< s.result.tAhead << " ms, estimate " << s.result.tEstimate
 +		<< " ms (reduce " << s.result.tReduce << " ms, match " << s.result.tMatch
 +		<< " ms, fit " << s.result.tFit << " ms), warp " << s.result.tWarp << " ms, blend " << s.result.tBlend
 +		<< " ms, worker " << s.result.tTotal << " ms, wait for the ISP "
@@ -16981,10 +17420,10 @@ index 0000000..067e349
 +		completeBuffer(request, app);
 +	}
 +
-+	MtkIsp50Frames::Info *still = data->frames_.find(s.still);
-+	if (still) {
-+		still->held = false;
-+		tryComplete(data, still);
++	MtkIsp50Frames::Info *holder = data->frames_.find(s.holder);
++	if (holder) {
++		holder->held = false;
++		tryComplete(data, holder);
 +	}
 +
 +	/* The frames that waited */
@@ -17191,10 +17630,10 @@ index 0000000..067e349
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/multi_frame.cpp b/src/libcamera/pipeline/mtkisp50/multi_frame.cpp
 new file mode 100644
-index 0000000..27d71d3
+index 0000000..adf5c91
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/multi_frame.cpp
-@@ -0,0 +1,777 @@
+@@ -0,0 +1,833 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Multi-frame still images of the mtkisp50 pipeline: the multi-frame
@@ -17745,6 +18184,9 @@ index 0000000..27d71d3
 +
 +void MtkIsp50SeriesWorker::release()
 +{
++	preparing_ = false;
++	if (aligner_)
++		aligner_->release();
 +	unmapAll();
 +	images_.clear();
 +	maps_.clear();
@@ -17791,6 +18233,48 @@ index 0000000..27d71d3
 +			munmap(m.data, m.length);
 +		m = {};
 +	}
++}
++
++void MtkIsp50SeriesWorker::prepare(unsigned int series, unsigned int position, unsigned int image,
++				   unsigned int frames)
++{
++	if (!aligner_)
++		return;
++
++	if (!preparing_ || series != series_) {
++		preparing_ = false;
++		if (aligner_->begin(images_.size(), width_, height_))
++			return;
++		preparing_ = true;
++		series_ = series;
++		prepared_.assign(images_.size(), -1);
++		tPrepare_ = 0.0;
++		tAhead_ = 0.0;
++	}
++
++	if (position >= prepared_.size() || map(image))
++		return;
++
++	const auto t = std::chrono::steady_clock::now();
++	const uint8_t *data = mapped_[image].data;
++	const size_t uvOffset = static_cast<size_t>(stride_) * height_;
++	DmaSyncer sync(images_[image].fd, DmaSyncer::SyncType::Read);
++	if (!aligner_->prepare(position, { data, stride_, data + uvOffset, stride_ }))
++		prepared_[position] = image;
++	tPrepare_ += msSince(t);
++
++	/* The frames so far, all there, and half of the series: estimate ahead */
++	const unsigned int count = position + 1;
++	if (2 * count < frames || frames > prepared_.size() ||
++	    std::count(prepared_.begin(), prepared_.begin() + count, -1))
++		return;
++
++	const auto ta = std::chrono::steady_clock::now();
++	std::vector<DmaSyncer> syncs;
++	for (unsigned int k = 0; k < count; k++)
++		syncs.emplace_back(images_[prepared_[k]].fd, DmaSyncer::SyncType::Read);
++	aligner_->estimateAhead(count, frames);
++	tAhead_ += msSince(ta);
 +}
 +
 +/*
@@ -17849,8 +18333,17 @@ index 0000000..27d71d3
 +			frames.push_back({ data, stride_, data + uvOffset, stride_ });
 +		}
 +
++		/* The frames reduced while the series was captured, else all now */
++		bool prepared = preparing_ && series_ == job.series && n <= prepared_.size();
++		for (unsigned int k = 0; prepared && k < n; k++)
++			prepared = prepared_[k] == static_cast<int>(job.frames[k]);
++		result.tPrepare = prepared ? tPrepare_ : 0.0;
++		result.tAhead = prepared ? tAhead_ : 0.0;
++		preparing_ = false;
++
 +		const auto t = clock::now();
-+		int base = aligner_->estimate(frames.data(), n, width_, height_);
++		int base = prepared ? aligner_->estimate(n)
++				    : aligner_->estimate(frames.data(), n, width_, height_);
 +
 +		/*
 +		 * A base frame most frames do not match: a broken frame is
@@ -17878,7 +18371,7 @@ index 0000000..27d71d3
 +					<< ", once more with frame " << candidate;
 +				tried.push_back(candidate);
 +				aligner_->setBaseIndex(candidate);
-+				base = aligner_->estimate(frames.data(), n, width_, height_);
++				base = aligner_->estimate(n);
 +				const unsigned int m = base >= 0 ? usableFrames() : 0;
 +				if (m > matched || (m == matched && candidate == still)) {
 +					matched = m;
@@ -17889,15 +18382,17 @@ index 0000000..27d71d3
 +			}
 +			if (base >= 0 && static_cast<unsigned int>(base) != best) {
 +				aligner_->setBaseIndex(best);
-+				base = aligner_->estimate(frames.data(), n, width_, height_);
++				base = aligner_->estimate(n);
 +			}
 +			aligner_->setBaseIndex(-1);
 +		}
 +		result.tEstimate = msSince(t);
 +		const mtkisp50::FrameAligner::Timing &timing = aligner_->timing();
-+		result.tReduce = timing.reduce;
++		result.tReduce = prepared ? 0.0 : timing.reduce;
 +		result.tMatch = timing.match;
 +		result.tFit = timing.fit;
++		/* The motion is known: the reduced frames go */
++		aligner_->release();
 +		if (base < 0) {
 +			finish(-EINVAL);
 +			return;
@@ -17974,10 +18469,10 @@ index 0000000..27d71d3
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/multi_frame.h b/src/libcamera/pipeline/mtkisp50/multi_frame.h
 new file mode 100644
-index 0000000..6bae04e
+index 0000000..fe7b7f6
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/multi_frame.h
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,260 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Multi-frame still images of the mtkisp50 pipeline: the multi-frame
@@ -18082,6 +18577,8 @@ index 0000000..6bae04e
 +};
 +
 +struct MtkIsp50SeriesJob {
++	/* Number of the series, as given to MtkIsp50SeriesWorker::prepare() */
++	unsigned int series = 0;
 +	/* Images of the series in capture order, indices into the image list */
 +	std::vector<unsigned int> frames;
 +	/* The image the application gets the still image in */
@@ -18132,9 +18629,14 @@ index 0000000..6bae04e
 +	int map = -1;
 +	unsigned int blends = 0;
 +	unsigned int unusable = 0;
-+	/* Times in ms: map and sync, estimate, warp, blend */
++	/* Times in ms: reduction of the frames while the series was captured,
++	 * the estimate ahead meanwhile */
++	double tPrepare = 0.0;
++	double tAhead = 0.0;
++	/* Estimate, warp, blend */
 +	double tEstimate = 0.0;
-+	/* Phases of the estimate: reduce the frames, match, fit the models */
++	/* Phases of the estimate: reduce the frames (those not reduced
++	 * before), match, fit the models */
 +	double tReduce = 0.0;
 +	double tMatch = 0.0;
 +	double tFit = 0.0;
@@ -18145,8 +18647,9 @@ index 0000000..6bae04e
 +
 +/*
 + * Aligns and blends a series in a thread of its own, so that the pipeline
-+ * thread stays responsive: base frame and motion from the aligner, each
-+ * usable reference frame aligned onto the base frame and blended in the MFB.
++ * thread stays responsive: the frames reduced one by one as they come, base
++ * frame and motion from the aligner once all are there, each usable
++ * reference frame aligned onto the base frame and blended in the MFB.
 + */
 +class MtkIsp50SeriesWorker : public Object
 +{
@@ -18174,6 +18677,17 @@ index 0000000..6bae04e
 +	 * buffer of the application (changes from still image to still image)
 +	 */
 +	void setImages(const std::vector<MtkIsp50SeriesImage> &images);
++
++	/*
++	 * A frame of series @series is back, the image @image: reduce it for
++	 * the alignment while the next frames are captured. @position is its
++	 * place among the frames of the series in capture order (the frames
++	 * of the job), @frames the frames the series wants. From half of them
++	 * on, the motion of the frames against the base frame they give is
++	 * estimated ahead.
++	 */
++	void prepare(unsigned int series, unsigned int position, unsigned int image,
++		     unsigned int frames);
 +
 +	void process(const MtkIsp50SeriesJob &job);
 +
@@ -18207,6 +18721,13 @@ index 0000000..6bae04e
 +
 +	std::vector<MtkIsp50SeriesImage> images_;
 +	std::vector<Mapped> mapped_;
++
++	/* The series being prepared, the image of each frame (-1: not yet) */
++	bool preparing_ = false;
++	unsigned int series_ = 0;
++	std::vector<int> prepared_;
++	double tPrepare_ = 0.0;
++	double tAhead_ = 0.0;
 +
 +	std::atomic<bool> abort_ = false;
 +};
