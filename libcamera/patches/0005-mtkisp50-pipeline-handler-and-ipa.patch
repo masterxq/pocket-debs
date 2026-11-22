@@ -51,10 +51,19 @@ Description:
    their own and can be replayed through the algorithms.
  - Temporal noise reduction of the preview and video jobs (tuning block
    TemporalNoiseReduction, settings per sensitivity, off without it):
-   still image jobs without it; a new reference after jumps of exposure,
-   white balance and scene brightness and while the lens moves; only for
-   a driver whose parameter buffers have the size of the header, and with
-   at least three buffers of a main stream.
+   still image jobs and the frames of a series without it; a new
+   reference after jumps of exposure, white balance and scene brightness,
+   while the lens moves and after a still image; only for a driver whose
+   parameter buffers have the size of the header, and with at least
+   three buffers of a main stream or in a session with still images,
+   whose preview jobs have no main buffer (the driver keeps the reference
+   in frames of its own and runs the jobs without the module when the
+   camera memory is short).
+ - Image quality points made for a narrower processed area (key
+   referenceWidth beside the points of a set): the sensitivity that
+   chooses the point is multiplied by the square of the ratio of the
+   processed width to that width, for points of a preview that is scaled
+   down before the ISP. Without the key as before.
  - Multi-frame still images (tuning block MultiFrame and the image
    quality sets multiFrameInput/multiFrameBase/multiFrameOutput, off
    without them, and only with the multi-frame blending block (MFB) and
@@ -141,7 +150,9 @@ Description:
    the preference, the exact fit of the white point, the steady rendering
    under a recorded drifting light, with the calibration of the module
    and for a new light, the temporal noise reduction (restarts, settings
-   between the sensitivities, parameter buffers, fallback), the frames of
+   between the sensitivities, parameter buffers, fallback), the image
+   quality points per sensitivity and set and with a reference width, the
+   frames of
    a series per sensitivity and the plan of its blends, the calibration
    of the camera module over the tuning (keys replaced, missing, broken
    and unknown files, algorithms the tuning does not have); CPU
@@ -6460,7 +6471,7 @@ index 0000000..18e3716
 +])
 diff --git a/src/ipa/mtkisp50/algorithms/temporal_denoise.cpp b/src/ipa/mtkisp50/algorithms/temporal_denoise.cpp
 new file mode 100644
-index 0000000..b7d239e
+index 0000000..2ed7f53
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/temporal_denoise.cpp
 @@ -0,0 +1,172 @@
@@ -6557,7 +6568,7 @@ index 0000000..b7d239e
 +		LOG(IPAMtkIsp50TemporalNr, Info)
 +			<< "Temporal noise reduction off: "
 +			<< (!driver ? "the driver does not have it"
-+				    : "not in this session (still images, or too few main buffers)");
++				    : "not in this session (too few main buffers)");
 +
 +	restart_.reset();
 +	lastScene_ = 0.0;
@@ -6959,10 +6970,10 @@ index 0000000..3b6f580
 +...
 diff --git a/src/ipa/mtkisp50/dip_params.cpp b/src/ipa/mtkisp50/dip_params.cpp
 new file mode 100644
-index 0000000..aa3eb20
+index 0000000..fc5123a
 --- /dev/null
 +++ b/src/ipa/mtkisp50/dip_params.cpp
-@@ -0,0 +1,1467 @@
+@@ -0,0 +1,1529 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Translation of the frame parameters of the mtkisp50 IPA into MT6785 DIP
@@ -7708,6 +7719,14 @@ index 0000000..aa3eb20
 + * still image (see QualityTable::Set); jobs without such a set take
 + * "points". A module used in any set is sent for every job;
 + * a point without it disables it.
++ *
++ * "referenceWidth" (beside "points", and in each optional section) is the
++ * width of the processed area that the points of the set are made for, for
++ * example the width of a preview that is scaled down in the raw domain
++ * before the DIP. A stream that processes a wider area has more noise per
++ * pixel at the same gain: its sensitivity for the choice of the point is
++ * multiplied by the square of the ratio of the widths (the number of pixels
++ * of the reference that average into one). Without the key the factor is 1.
 + */
 +
 +/**
@@ -7726,7 +7745,8 @@ index 0000000..aa3eb20
 +		return std::nullopt;
 +	}
 +
-+	if (!parsePoints(node["points"], table.sets_[0], table))
++	if (!parsePoints(node["points"], table.sets_[0], table) ||
++	    !parseReferenceWidth(node, table.referenceWidth_[0]))
 +		return std::nullopt;
 +
 +	/* Optional sets of video, still image and multi-frame jobs */
@@ -7736,11 +7756,44 @@ index 0000000..aa3eb20
 +	for (unsigned int set = 1; set < kSets; set++) {
 +		if (!node.contains(names[set]))
 +			continue;
-+		if (!parsePoints(node[names[set]]["points"], table.sets_[set], table))
++		if (!parsePoints(node[names[set]]["points"], table.sets_[set], table) ||
++		    !parseReferenceWidth(node[names[set]], table.referenceWidth_[set]))
 +			return std::nullopt;
 +	}
 +
 +	return table;
++}
++
++bool QualityTable::parseReferenceWidth(const ValueNode &node, unsigned int &width)
++{
++	if (!node.contains("referenceWidth"))
++		return true;
++
++	const std::optional<unsigned int> w = node["referenceWidth"].get<unsigned int>();
++	if (!w || *w < 64 || *w > 16384) {
++		LOG(IPAMtkIsp50Dip, Error) << "mtk-dip quality: invalid referenceWidth";
++		return false;
++	}
++
++	width = *w;
++	return true;
++}
++
++/**
++ * \brief Set the width of the processed area of the stream
++ * \param[in] width The width in pixels
++ *
++ * Sets the factor on the sensitivity of the sets that have a reference
++ * width, see fromTuning().
++ */
++void QualityTable::setProcessedWidth(unsigned int width)
++{
++	for (unsigned int set = 0; set < kSets; set++) {
++		const unsigned int ref = referenceWidth_[set];
++		const double ratio = ref && width ? static_cast<double>(width) / ref : 1.0;
++		isoScale_[set] = ratio * ratio;
++		current_[set].reset();
++	}
 +}
 +
 +bool QualityTable::parsePoints(const ValueNode &points, std::vector<QualityPoint> &out,
@@ -7808,7 +7861,7 @@ index 0000000..aa3eb20
 +
 +	const std::vector<QualityPoint> &points = sets_[set];
 +	std::optional<unsigned int> &current = current_[set];
-+	const double iso = isoPerGain_ * std::max(totalGain, 1e-3f);
++	const double iso = isoPerGain_ * std::max(totalGain, 1e-3f) * isoScale_[set];
 +	auto distance = [&](unsigned int i) {
 +		return std::abs(std::log2(iso / points[i].iso));
 +	};
@@ -8338,6 +8391,15 @@ index 0000000..aa3eb20
 +		size += pending_[type].size();
 +	}
 +
++	if (included_[MTK_DIP_PARAMS_BLOCK_NR3D]) {
++		const auto *h = reinterpret_cast<const v4l2_isp_params_block_header *>(
++			pending_[MTK_DIP_PARAMS_BLOCK_NR3D].data());
++		LOG(IPAMtkIsp50Dip, Debug)
++			<< "Temporal noise reduction block: "
++			<< (h->flags & MTK_DIP_PARAMS_BLOCK_FL_DISABLE ? "off" : "on")
++			<< (forceNr3d ? ", new reference" : "");
++	}
++
 +	if (size == sizeof(struct v4l2_isp_params_buffer))
 +		return 0;
 +
@@ -8416,6 +8478,17 @@ index 0000000..aa3eb20
 +}
 +
 +/**
++ * \brief Set the width of the processed area for the quality blocks
++ * \param[in] width The width in pixels
++ * \sa QualityTable::setProcessedWidth()
++ */
++void ParamsEncoder::setProcessedWidth(unsigned int width)
++{
++	if (quality_)
++		quality_->setProcessedWidth(width);
++}
++
++/**
 + * \brief Stop sending the second noise reduction stage
 + *
 + * For a driver without the block: the other quality blocks stay.
@@ -8432,10 +8505,10 @@ index 0000000..aa3eb20
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/dip_params.h b/src/ipa/mtkisp50/dip_params.h
 new file mode 100644
-index 0000000..4e4443d
+index 0000000..b80ae7a
 --- /dev/null
 +++ b/src/ipa/mtkisp50/dip_params.h
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,338 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Translation of the frame parameters of the mtkisp50 IPA into MT6785 DIP
@@ -8629,6 +8702,8 @@ index 0000000..4e4443d
 +	static std::optional<QualityTable> fromTuning(const ValueNode &node);
 +
 +	const QualityPoint &select(float totalGain, unsigned int set = 0);
++	void setProcessedWidth(unsigned int width);
++	double isoScale(unsigned int set) const { return set < kSets ? isoScale_[set] : 1.0; }
 +	std::size_t size() const { return sets_[0].size(); }
 +	bool hasSet(unsigned int set) const { return set < kSets && !sets_[set].empty(); }
 +	double isoPerGain() const { return isoPerGain_; }
@@ -8644,11 +8719,18 @@ index 0000000..4e4443d
 +
 +	static bool parsePoints(const ValueNode &points, std::vector<QualityPoint> &out,
 +				QualityTable &table);
++	static bool parseReferenceWidth(const ValueNode &node, unsigned int &width);
 +
 +	/* Points of the sets, the first one is points_ */
 +	std::array<std::vector<QualityPoint>, kSets> sets_;
 +	double isoPerGain_ = 100.0;
 +	double hysteresis_ = 0.25;
++	/*
++	 * Width of the processed area the points of a set are made for (0:
++	 * any), and the factor on the sensitivity for the width of the stream
++	 */
++	std::array<unsigned int, kSets> referenceWidth_{};
++	std::array<double, kSets> isoScale_ = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
 +	std::array<std::optional<unsigned int>, kSets> current_;
 +	bool usesEe_ = false;
 +	bool usesYcnr_ = false;
@@ -8724,6 +8806,8 @@ index 0000000..4e4443d
 +	void setShadowLift(float lift);
 +	void setLensShading(std::optional<LensShading> lsc);
 +	void setQuality(std::optional<QualityTable> quality);
++	void setProcessedWidth(unsigned int width);
++	double isoScale(unsigned int set) const { return quality_ ? quality_->isoScale(set) : 1.0; }
 +	bool hasQuality() const { return quality_.has_value(); }
 +	bool usesNbc2() const { return quality_ && quality_->usesNbc2(); }
 +	void dropNbc2();
@@ -9434,10 +9518,10 @@ index 0000000..e38120a
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/mtkisp50.cpp b/src/ipa/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..d1adfde
+index 0000000..6d4f927
 --- /dev/null
 +++ b/src/ipa/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,829 @@
+@@ -0,0 +1,836 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2023, Linaro Ltd
@@ -9860,7 +9944,14 @@ index 0000000..d1adfde
 +
 +	/* All blocks again with the first parameters of the stream */
 +	encoder_.setTemporalNr(driverHasTemporalNr(configInfo.paramsBufferSize));
++	encoder_.setProcessedWidth(configInfo.ispCrop.width);
 +	encoder_.reset();
++	if (encoder_.isoScale(QualityTable::Preview) != 1.0 ||
++	    encoder_.isoScale(QualityTable::Video) != 1.0)
++		LOG(IPAMtkIsp50, Info)
++			<< "Quality points for a width of " << configInfo.ispCrop.width
++			<< ": sensitivity x" << encoder_.isoScale(QualityTable::Preview)
++			<< " (preview), x" << encoder_.isoScale(QualityTable::Video) << " (video)";
 +
 +	ControlInfoMap::Map ctrlMap = context_.ctrlMap;
 +	*ipaControls = ControlInfoMap(std::move(ctrlMap), controls::controls);
@@ -13320,10 +13411,10 @@ index 0000000..99388ab
 +} /* namespace libcamera::mtkisp50 */
 diff --git a/src/libcamera/pipeline/mtkisp50/frames.cpp b/src/libcamera/pipeline/mtkisp50/frames.cpp
 new file mode 100644
-index 0000000..72042c5
+index 0000000..670ed64
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/frames.cpp
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,356 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Per request bookkeeping of the mtkisp50 pipeline
@@ -13563,6 +13654,12 @@ index 0000000..72042c5
 +		}
 +
 +		ispWaiting_.pop_front();
++
++		LOG(MtkIsp50, Debug)
++			<< "ISP job " << info->id << ": outputs " << outputs
++			<< " (streaming " << ispOutputs_ << "), " << ispBusy_
++			<< " in the ISP, params " << info->paramsBytesused
++			<< (info->seriesImage ? ", image of a series" : "");
 +
 +		int ret = queueIspJob(info, info->paramsBytesused, queue);
 +		if (info->ispQueued)
@@ -13909,10 +14006,10 @@ index 0000000..e657318
 +libcamera_deps += declare_dependency(link_whole : mtkisp50_align)
 diff --git a/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..dc2b74a
+index 0000000..a089126
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,3715 @@
+@@ -0,0 +1,3720 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the MediaTek MT6785 camera subsystem with the ISP pass 2
@@ -14197,6 +14294,9 @@ index 0000000..dc2b74a
 +		if (!node)
 +			return -ENODEV;
 +
++		LOG(MtkIsp50, Debug)
++			<< (output == MtkIsp50OutputMain ? "Main" : "Scaled")
++			<< " output " << (on ? "off" : "on");
 +		if (on) {
 +			node->streamOff();
 +			streaming_ &= ~output;
@@ -15771,15 +15871,17 @@ index 0000000..dc2b74a
 +	/*
 +	 * With the temporal noise reduction the driver keeps each buffer of
 +	 * the main output until the next job: a stream of main buffers needs
-+	 * one more than the application holds. Jobs of still images run
-+	 * without the module. In a session with still images the preview jobs
-+	 * have no main buffer and the driver needs two frames of the whole
-+	 * processed area of its own; next to the buffers of the still images
-+	 * they do not fit into the camera memory region, so such sessions run
-+	 * without the module.
++	 * one more than the application holds. Jobs of still images and of
++	 * the frames of a series (also preview frames that join it) run
++	 * without the module; such a job ends the reference, and the next
++	 * preview job starts a new one. In a session with still images the
++	 * preview jobs have no main buffer: the driver writes their whole
++	 * processed area into two frames of its own, and the buffers of the
++	 * still images are never held. Without memory for its frames the
++	 * driver runs the jobs without the module.
 +	 */
-+	ipaConfig.temporalNr = ipaConfig.useCase != ipa::mtkisp50::UseCase::Still &&
-+			       (!outCfg || outCfg->bufferCount >= kTemporalNrMainBuffers);
++	ipaConfig.temporalNr = ipaConfig.useCase == ipa::mtkisp50::UseCase::Still ||
++			       !outCfg || outCfg->bufferCount >= kTemporalNrMainBuffers;
 +	ipaConfig.statsSource = static_cast<uint32_t>(mtkisp50::StatsSource::Cpu);
 +	ipaConfig.pdAvailable = data->pd_.layout != nullptr;
 +
@@ -23490,10 +23592,10 @@ index 0000000..42b7cdc
 +TEST_REGISTER(MtkIsp50FramesTest)
 diff --git a/test/mtkisp50/meson.build b/test/mtkisp50/meson.build
 new file mode 100644
-index 0000000..cab867b
+index 0000000..4ab3c63
 --- /dev/null
 +++ b/test/mtkisp50/meson.build
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,163 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +if 'mtkisp50' not in pipelines
@@ -23610,6 +23712,16 @@ index 0000000..cab867b
 +        '../../src/ipa/mtkisp50/dip_params.cpp',
 +        '../../src/ipa/mtkisp50/ipa_context.cpp',
 +        '../../src/ipa/mtkisp50/temporal_nr.cpp',
++    ],
++    'ipa': true,
++}
++
++# The image quality points per sensitivity and the width of the processed area
++mtkisp50_tests += {
++    'name': 'mtkisp50-quality',
++    'sources': [
++        'quality.cpp',
++        '../../src/ipa/mtkisp50/dip_params.cpp',
 +    ],
 +    'ipa': true,
 +}
@@ -24914,6 +25026,178 @@ index 0000000..f407687
 +};
 +
 +TEST_REGISTER(MtkIsp50ProgramTest)
+diff --git a/test/mtkisp50/quality.cpp b/test/mtkisp50/quality.cpp
+new file mode 100644
+index 0000000..4efe0ee
+--- /dev/null
++++ b/test/mtkisp50/quality.cpp
+@@ -0,0 +1,166 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Image quality points of the mtkisp50 IPA: the choice of the point per
++ * sensitivity and set, and the factor on the sensitivity for a processed area
++ * wider than the one the points are made for
++ */
++
++#include <cstring>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <unistd.h>
++#include <vector>
++
++#include <libcamera/base/file.h>
++#include <libcamera/base/memfd.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "mtkisp50/dip_params.h"
++
++#include "test.h"
++
++using namespace libcamera;
++using namespace libcamera::ipa::mtkisp50;
++
++namespace {
++
++/* A second noise reduction stage that only tells its point by scale_mode */
++std::string nbc2(unsigned int mode, const char *indent)
++{
++	static const char *const zero[] = {
++		"chroma_ref_luma", "radial_link", "chroma_smooth_edge", "chroma_filter",
++		"chroma_threshold", "aux_v_gain", "aux_gain_th", "chroma_luma_diff_th",
++		"chroma_mode", "radial_chroma_gain", "luma_weight", "core_th", "core_slope",
++		"diff_th", "diff_slope", "variance", "act_blend_base",
++	};
++	static const char *const lists[] = {
++		"luma_scale_x: [0, 0, 0]", "luma_scale_y: [0, 0, 0, 0]",
++		"luma_scale_slope: [0, 0, 0, 0]", "radial_x: [0, 0, 0]",
++		"radial_y: [0, 0, 0, 0]", "radial_slope: [0, 0, 0, 0]", "aux_th: [0, 0, 0, 0]",
++		"class_th: [0, 0, 0]", "class_slope: [0, 0, 0]", "class_level: [0, 0, 0]",
++		"class_offset: [0, 0, 0]", "strength: [0, 0, 0, 0, 0]", "chroma_dither: [0, 0]",
++	};
++	const std::string in = indent;
++	std::string s = in + "nbc2:\n" + in + "  luma_enable: 1\n" + in +
++			"  scale_mode: " + std::to_string(mode) + "\n";
++	for (const char *f : zero)
++		s += in + "  " + f + ": 0\n";
++	for (const char *l : lists)
++		s += in + "  " + l + "\n";
++	return s;
++}
++
++/* Points at ISO 100 (mode 1) and 1600 (mode 2), with extra keys of the set */
++std::string set(const std::string &extra, const char *indent)
++{
++	const std::string in = indent;
++	return (extra.empty() ? "" : in + extra) + in + "points:\n" + in + "  - iso: 100\n" +
++	       nbc2(1, (in + "    ").c_str()) + in + "  - iso: 1600\n" +
++	       nbc2(2, (in + "    ").c_str());
++}
++
++std::unique_ptr<ValueNode> parse(const std::string &text)
++{
++	UniqueFD fd = MemFd::create("mtkisp50-quality-tuning", 0);
++	if (!fd.isValid() || write(fd.get(), text.data(), text.size()) < 0)
++		return nullptr;
++	File file("/proc/self/fd/" + std::to_string(fd.get()));
++	if (!file.open(File::OpenModeFlag::ReadOnly))
++		return nullptr;
++	return YamlParser::parse(file);
++}
++
++/* scale_mode of the second noise reduction stage in a buffer, -1 without it */
++int modeOf(const std::vector<uint8_t> &buf, size_t used)
++{
++	const auto *head = reinterpret_cast<const v4l2_isp_params_buffer *>(buf.data());
++	if (!used || head->data_size + sizeof(*head) != used)
++		return -1;
++	for (size_t off = 0; off < head->data_size;) {
++		const auto *h = reinterpret_cast<const v4l2_isp_params_block_header *>(head->data + off);
++		if (h->type == MTK_DIP_PARAMS_BLOCK_NBC2)
++			return reinterpret_cast<const mtk_dip_params_nbc2 *>(h)->scale_mode;
++		off += h->size;
++	}
++	return -1;
++}
++
++} /* namespace */
++
++class MtkIsp50QualityTest : public Test
++{
++protected:
++	int run() override
++	{
++		/* Preview made for a width of 1440, video for 2880, still for any */
++		const std::string tuning = "NoiseReduction:\n" +
++					   set("referenceWidth: 1440\n", "  ") +
++					   "  video:\n" + set("referenceWidth: 2880\n", "    ") +
++					   "  still:\n" + set("", "    ");
++		std::unique_ptr<ValueNode> root = parse(tuning);
++		if (!root)
++			return fail("tuning not parsed");
++		std::optional<QualityTable> table = QualityTable::fromTuning((*root)["NoiseReduction"]);
++		if (!table)
++			return fail("table not read");
++
++		/* Without a width: the factor is 1 */
++		if (table->isoScale(QualityTable::Preview) != 1.0)
++			return fail("factor before the width");
++
++		/* Processed width 4320: preview x9, video x2.25, still x1 */
++		table->setProcessedWidth(4320);
++		if (table->isoScale(QualityTable::Preview) != 9.0 ||
++		    table->isoScale(QualityTable::Video) != 2.25 ||
++		    table->isoScale(QualityTable::Still) != 1.0 ||
++		    table->isoScale(QualityTable::MultiFrameInput) != 1.0)
++			return fail("factors for 4320");
++
++		/* The point of a job, each from a new encoder (it sends all blocks) */
++		auto point = [&](unsigned int useCase, unsigned int width) {
++			ParamsEncoder e;
++			e.setQuality(table);
++			e.setProcessedWidth(width);
++			e.reset();
++			std::vector<uint8_t> buf(MTK_DIP_PARAMS_MAX_SIZE);
++			DipFrameParams p;
++			p.totalGain = 1.0f;
++			p.useCase = useCase;
++			return modeOf(buf, e.encode(p, BayerFormat::BGGR, buf));
++		};
++
++		/* Gain 1 = ISO 100: preview 900 -> 1600, video 225 -> 100, still 100 */
++		if (point(QualityTable::Preview, 4320) != 2)
++			return fail("preview point at ISO 100 x9");
++		if (point(QualityTable::Video, 4320) != 1)
++			return fail("video point at ISO 100 x2.25");
++		if (point(QualityTable::Still, 4320) != 1)
++			return fail("still point at ISO 100");
++
++		/* The width of the reference: the points by the sensitivity alone */
++		if (point(QualityTable::Preview, 1440) != 1)
++			return fail("preview point at the reference width");
++
++		/* Invalid widths: no table */
++		for (const char *w : { "0", "20000", "wide" }) {
++			std::unique_ptr<ValueNode> bad =
++				parse("NoiseReduction:\n" +
++				      set(std::string("referenceWidth: ") + w + "\n", "  "));
++			if (!bad || QualityTable::fromTuning((*bad)["NoiseReduction"]))
++				return fail(std::string("width ") + w + " taken");
++		}
++
++		return TestPass;
++	}
++
++private:
++	int fail(const std::string &what)
++	{
++		std::cerr << what << std::endl;
++		return TestFail;
++	}
++};
++
++TEST_REGISTER(MtkIsp50QualityTest)
 diff --git a/test/mtkisp50/raw_stats.cpp b/test/mtkisp50/raw_stats.cpp
 new file mode 100644
 index 0000000..bb16fec
