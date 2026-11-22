@@ -26,6 +26,11 @@ Description:
    in steps free of mains flicker, analogue before digital gain, within
    the frame durations of the application; a target over the brightness
    of the scene and a limit for highlights.
+ - Exposure time for images taken by hand (key "handheld" of the program
+   block, [time, total gain]): the preview and still image programs hold
+   the exposure time at that time up to that total gain, darker scenes
+   take the stages beyond; the video program keeps its own. Without the
+   key as before.
  - White balance in dim light: channel means averaged per unit of
    exposure over a few frames and judged against their noise, the last
    estimate held below it, the first one taken at once; module
@@ -122,7 +127,8 @@ Description:
    new configuration, frame length of the exposure regulation, PD
    statistics (synthetic frames, optional real frames against reference
    results), pairing of PD and raw frames, autofocus with PD, exposure
-   programs and the regulation with them, white balance in dim light and
+   programs and the regulation with them, the limit of the exposure time
+   by hand, white balance in dim light and
    the preference, the exact fit of the white point, the steady rendering
    under a recorded drifting light, with the calibration of the module
    and for a new light, the temporal noise reduction (restarts, settings
@@ -3365,10 +3371,10 @@ index 0000000..73cdd01
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/agc.cpp b/src/ipa/mtkisp50/algorithms/agc.cpp
 new file mode 100644
-index 0000000..7ffeead
+index 0000000..f9776f0
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/agc.cpp
-@@ -0,0 +1,1332 @@
+@@ -0,0 +1,1359 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024, Red Hat Inc.
@@ -3497,7 +3503,14 @@ index 0000000..7ffeead
 + *   exposure of the moment (frame durations, autofocus) are left out. The
 + *   digital gain reaches the largest total gain of the program over the
 + *   largest analogue gain. maxExposureFactor still sets the frame length
-+ *   extension, extensionGain and the cascade do not apply.
++ *   extension, extensionGain and the cascade do not apply. Optionally
++ *   "handheld": [time in us, total gain], the exposure time of the preview
++ *   and still programs stays at most this time up to this total gain, the
++ *   stages beyond take over in darker scenes (see ExposureProgram::limited()).
++ *   For images taken by hand: a long exposure blurs them with the shake of
++ *   the hand, the gain instead adds noise, which the multi-frame still image
++ *   takes out in part. The frames of a still image have the exposure of the
++ *   preview, so the preview has the same limit.
 + * - fNumber: for the brightness of the scene (BV = log2(fNumber^2 / time) -
 + *   log2(gain) - 5 + log2(level / exposureTarget), ISO 100 at gain 1.0;
 + *   default 2.0)
@@ -3590,6 +3603,26 @@ index 0000000..7ffeead
 +		if (!programs_[0]) {
 +			LOG(IPAMtkIsp50Exposure, Error) << "Agc program needs a preview program";
 +			return -EINVAL;
++		}
++
++		/* The exposure time for images taken by hand (preview and still) */
++		if (prog.contains("handheld")) {
++			auto v = prog["handheld"].get<std::vector<double>>();
++			if (!v || v->size() != 2 || !((*v)[0] > 0.0) || !((*v)[1] >= 1.0)) {
++				LOG(IPAMtkIsp50Exposure, Error) << "Agc program handheld is not [time, gain]";
++				return -EINVAL;
++			}
++			for (unsigned int i : { 0u, 2u }) {
++				if (!programs_[i])
++					continue;
++				programs_[i] = programs_[i]->limited((*v)[0], (*v)[1]);
++				if (!programs_[i]) {
++					LOG(IPAMtkIsp50Exposure, Error) << "Invalid Agc program handheld";
++					return -EINVAL;
++				}
++			}
++			LOG(IPAMtkIsp50Exposure, Info)
++				<< "Exposure held at " << (*v)[0] << " us up to a total gain of " << (*v)[1];
 +		}
 +	}
 +
@@ -8723,10 +8756,10 @@ index 0000000..4e4443d
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/exposure_program.cpp b/src/ipa/mtkisp50/exposure_program.cpp
 new file mode 100644
-index 0000000..3e4af15
+index 0000000..d516e0f
 --- /dev/null
 +++ b/src/ipa/mtkisp50/exposure_program.cpp
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,150 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Exposure program: how a total exposure is split into exposure time,
@@ -8844,15 +8877,45 @@ index 0000000..3e4af15
 +	return { time, again, std::max(gain / again, 1.0) };
 +}
 +
++std::optional<ExposureProgram> ExposureProgram::limited(double time, double gain) const
++{
++	const double total = time * gain;
++	std::vector<Stage> stages;
++
++	/* The shorter stages; one that reaches the total already makes the limit moot */
++	for (const Stage &s : stages_) {
++		if (s.time < time)
++			stages.push_back(s);
++	}
++	if (!stages.empty() && stages.back().time * stages.back().gain >= total)
++		return *this;
++	stages.push_back({ time, gain });
++
++	for (const Stage &s : stages_) {
++		if (s.time > time && s.time * s.gain > total)
++			stages.push_back(s);
++	}
++
++	return fromStages(std::move(stages));
++}
++
++double ExposureProgram::maxGain() const
++{
++	double gain = 0.0;
++	for (const Stage &s : stages_)
++		gain = std::max(gain, s.gain);
++	return gain;
++}
++
 +} /* namespace ipa::mtkisp50 */
 +
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/exposure_program.h b/src/ipa/mtkisp50/exposure_program.h
 new file mode 100644
-index 0000000..0061d86
+index 0000000..3c14c40
 --- /dev/null
 +++ b/src/ipa/mtkisp50/exposure_program.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,75 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Exposure program: how a total exposure is split into exposure time,
@@ -8906,8 +8969,17 @@ index 0000000..0061d86
 +	Split split(double total, double minTime, double maxTime, double againMin,
 +		    double againMax, double dgainMax) const;
 +
-+	/* Largest total gain of the program (the gain of the last stage) */
-+	double maxGain() const { return stages_.back().gain; }
++	/*
++	 * The program with the exposure time held at \a time up to a total
++	 * gain of \a gain: the stages below that total and from that time on
++	 * give way to the stage [time, gain], the stages beyond take over in
++	 * darker scenes. If a shorter stage reaches that total already, the
++	 * program stays as it is. Nothing if the result is not a program.
++	 */
++	std::optional<ExposureProgram> limited(double time, double gain) const;
++
++	/* Largest total gain of the program (of any stage) */
++	double maxGain() const;
 +	const std::vector<Stage> &stages() const { return stages_; }
 +
 +private:
@@ -23693,10 +23765,10 @@ index 0000000..8100615
 +TEST_REGISTER(MtkIsp50PdTest)
 diff --git a/test/mtkisp50/program.cpp b/test/mtkisp50/program.cpp
 new file mode 100644
-index 0000000..e084550
+index 0000000..f407687
 --- /dev/null
 +++ b/test/mtkisp50/program.cpp
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,624 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * mtkisp50 IPA: exposure program
@@ -23759,6 +23831,30 @@ index 0000000..e084550
 +  settleFrames: 2
 +)";
 +
++/* The same with the exposure time for images taken by hand: 30 ms up to a gain of 120 */
++const char *kHandheldTuning = R"(%YAML 1.1
++---
++Agc:
++  maxExposureFactor: 3.0
++  exposureTarget: 0.18
++  exposureSpeed: 0.6
++  metering: zones
++  colourGains: false
++  afFrameRate: true
++  fNumber: 2.0
++  program:
++    preview: [ [ 10000, 2.0 ], [ 20000, 4.0 ], [ 30000, 8.0 ], [ 40000, 16.0 ], [ 60000, 32.0 ], [ 100000, 120.0 ] ]
++    video: [ [ 10000, 2.0 ], [ 20000, 3.0 ], [ 30000, 16.0 ], [ 40000, 64.0 ] ]
++    still: [ [ 10000, 2.0 ], [ 20000, 4.0 ], [ 30000, 8.0 ], [ 40000, 16.0 ], [ 60000, 32.0 ], [ 100000, 240.0 ] ]
++    handheld: [ 30000, 120.0 ]
++Af:
++  map: [ 0.1, 468, 10.0, 775 ]
++  default: 0.4
++  range: [ -0.8, 10.5 ]
++  step: 1.25
++  settleFrames: 2
++)";
++
 +/* A sensor mode: lines, line duration, VBLANK range (step 2) */
 +struct Mode {
 +	int32_t defaultLines;
@@ -23789,10 +23885,10 @@ index 0000000..e084550
 +	{
 +	}
 +
-+	int init()
++	int init(const char *tuning = kTuning)
 +	{
 +		UniqueFD fd = MemFd::create("mtkisp50-program-tuning", 0);
-+		if (!fd.isValid() || write(fd.get(), kTuning, strlen(kTuning)) < 0)
++		if (!fd.isValid() || write(fd.get(), tuning, strlen(tuning)) < 0)
 +			return -EIO;
 +
 +		File file("/proc/self/fd/" + std::to_string(fd.get()));
@@ -24148,9 +24244,142 @@ index 0000000..e084550
 +		return TestPass;
 +	}
 +
++	/* The program limited to an exposure time up to a total gain */
++	int testLimited()
++	{
++		using Stage = ExposureProgram::Stage;
++		auto p = ExposureProgram::fromStages({ Stage{ 10000, 2.0 }, Stage{ 20000, 4.0 },
++						       Stage{ 30000, 8.0 }, Stage{ 40000, 16.0 },
++						       Stage{ 60000, 32.0 }, Stage{ 100000, 120.0 } });
++		if (!p)
++			return fail("program refused");
++
++		/* 30 ms up to a gain of 64: the stages of 30 to 60 ms give way */
++		auto h = p->limited(30000, 64.0);
++		if (!h || h->stages().size() != 4 || h->stages()[2].time != 30000 ||
++		    h->stages()[2].gain != 64.0 || h->stages()[3].time != 100000)
++			return fail("limited program");
++
++		struct Case {
++			double total;
++			double time;
++		};
++		const Case cases[] = {
++			/* Up to the gain of the limit: 30 ms */
++			{ 30000.0 * 8.0, 30000.0 },
++			{ 30000.0 * 30.0, 30000.0 },
++			{ 30000.0 * 64.0, 30000.0 },
++			/* Beyond: the stage of 100 ms */
++			{ 30000.0 * 64.0 * 1.01, 100000.0 },
++			{ 100000.0 * 100.0, 100000.0 },
++			/* Below the limit as before */
++			{ 15000.0, 10000.0 },
++			{ 60000.0, 20000.0 },
++		};
++		for (const Case &c : cases) {
++			const auto s = h->split(c.total, 10.0, 100000.0, 1.0, 15.5, 8.0);
++			if (std::abs(s.time - c.time) > 0.5 ||
++			    std::abs(s.time * s.again * s.dgain - c.total) > 1e-6 * c.total)
++				return fail("limited split " + std::to_string(c.total) + ": " +
++					    std::to_string(s.time) + " us " + std::to_string(s.again) +
++					    " x " + std::to_string(s.dgain));
++		}
++		for (double total = 50.0; total < 1e7; total *= 1.05) {
++			const auto s = h->split(total, 10.0, 100000.0, 1.0, 15.5, 8.0);
++			if (!flickerFree(s.time) || (s.dgain > 1.0 + 1e-9 && s.again < 15.5 - 1e-9) ||
++			    (total <= 30000.0 * 64.0 && s.time > 30000.0 + 0.5))
++				return fail("limited split " + std::to_string(total) + ": " +
++					    std::to_string(s.time) + " us");
++		}
++
++		/* The gain of the limit beyond the last stage: the largest gain */
++		auto g = p->limited(30000, 200.0);
++		if (!g || g->maxGain() != 200.0 || g->stages().back().time != 100000)
++			return fail("limited program with a large gain");
++
++		/* A shorter stage reaches the total already: unchanged */
++		auto m = p->limited(25000, 2.0);
++		if (!m || m->stages().size() != p->stages().size())
++			return fail("limit within a shorter stage");
++
++		/* Not a program: a gain below 1.0 */
++		if (p->limited(5000, 0.5))
++			return fail("limit with a gain below 1.0 accepted");
++
++		return TestPass;
++	}
++
++	/*
++	 * Images taken by hand: a scene that needs 100 ms at a gain of 30
++	 * takes 30 ms at a gain of 100 at 30 fps, preview and still image;
++	 * darker scenes the longest exposure, video its own program
++	 */
++	int testHandheld()
++	{
++		Sim sim;
++		if (sim.init(kHandheldTuning) || sim.configure(kFull, UseCase::Still))
++			return fail("handheld init");
++		const auto &agc = sim.ctx().configuration.agc;
++		const double line = agc.lineDuration.get<std::micro>();
++
++		sim.brightness = (0.18 * (255.0 - kBlack)) / (100000.0 / line * 30.0);
++		for (unsigned int i = 0; i < 600; i++) {
++			sim.frame();
++			if (i > 100 && sim.exposure() * line > 30000.0 + line)
++				return fail("handheld: " + std::to_string(sim.exposure() * line) + " us");
++		}
++		const double time = sim.exposure() * line;
++		const double total = time * sim.gain() * sim.digitalGain();
++		if (std::abs(time - 30000.0) > line || sim.gain() < 15.5 - 1e-6 ||
++		    std::abs(total / (100000.0 * 30.0) - 1.0) > 0.08)
++			return fail("handheld: " + std::to_string(time) + " us, gain " +
++				    std::to_string(sim.gain()) + " x " + std::to_string(sim.digitalGain()));
++		if (sim.frameLines != kFull.defaultLines)
++			return fail("handheld frame of " + std::to_string(sim.frameLines) + " lines");
++		const double still = sim.stillDigitalGain();
++		if (std::abs(time * sim.gain() * still / total - 1.0) > 0.02)
++			return fail("handheld still digital gain " + std::to_string(still));
++
++		/* The frame durations of the application: 30 fps keeps 30 ms */
++		ControlList fps = limits(33333, 33333);
++		sim.frame(&fps);
++		for (unsigned int i = 0; i < 100; i++)
++			sim.frame();
++		if (std::abs(sim.exposure() * line - 30000.0) > line)
++			return fail("handheld at 30 fps: " + std::to_string(sim.exposure() * line) + " us");
++		ControlList slow = limits(33333, 100000);
++		sim.frame(&slow);
++
++		/* Darker than the limit reaches: the longest exposure */
++		sim.brightness /= 2.0;
++		for (unsigned int i = 0; i < 600; i++)
++			sim.frame();
++		const double longest = std::min(100000.0, sim.ctx().activeState.agc.exposureLimit * line);
++		if (std::abs(sim.exposure() * line - longest) > line)
++			return fail("handheld, darker: " + std::to_string(sim.exposure() * line) + " us");
++
++		/* Video keeps its program */
++		Sim video;
++		if (video.init(kHandheldTuning) || video.configure(kFull, UseCase::Video))
++			return fail("handheld video init");
++		video.brightness = (0.18 * (255.0 - kBlack)) / (100000.0 / line * 30.0);
++		for (unsigned int i = 0; i < 600; i++)
++			video.frame();
++		if (std::abs(video.exposure() * line - 40000.0) > line)
++			return fail("handheld video: " + std::to_string(video.exposure() * line) + " us");
++
++		return TestPass;
++	}
++
 +	int run() override
 +	{
 +		int ret = testSplit();
++		if (ret != TestPass)
++			return ret;
++		ret = testLimited();
++		if (ret != TestPass)
++			return ret;
++		ret = testHandheld();
 +		if (ret != TestPass)
 +			return ret;
 +		ret = testRegulation();
