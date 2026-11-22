@@ -32,6 +32,18 @@ Description:
    sensitivity; a preference that keeps part of the colour of warm light
    (applied after the colour matrix); colour matrix strength over the
    gain.
+ - White balance under a light whose colour drifts: with colourError
+   "whitepoint" the white point is fitted exactly to the curve (steps of
+   0.25 mired within the range of the AwbMode, refined by a parabola,
+   offset across the curve within transversePos/transverseNeg); the
+   tuning block "rendering" (band, speed, switch in mired) keeps the
+   colour temperature of the colour matrix and the preference within a
+   band of the estimate, lets it follow slowly beyond and all the way for
+   a new light beyond "switch", while the gains follow the estimate (the
+   metadata report the colour temperature of the rendering); bright
+   zones above "maxZoneLevel" (lamps) are left out of the means. Without
+   these keys as before. The statistics zones go to a debug category of
+   their own and can be replayed through the algorithms.
  - Temporal noise reduction of the preview and video jobs (tuning block
    TemporalNoiseReduction, settings per sensitivity, off without it):
    still image jobs without it; a new reference after jumps of exposure,
@@ -111,7 +123,9 @@ Description:
    statistics (synthetic frames, optional real frames against reference
    results), pairing of PD and raw frames, autofocus with PD, exposure
    programs and the regulation with them, white balance in dim light and
-   the preference, the temporal noise reduction (restarts, settings
+   the preference, the exact fit of the white point, the steady rendering
+   under a recorded drifting light, with the calibration of the module
+   and for a new light, the temporal noise reduction (restarts, settings
    between the sensitivities, parameter buffers, fallback), the frames of
    a series per sensitivity and the plan of its blends, the calibration
    of the camera module over the tuning (keys replaced, missing, broken
@@ -4853,10 +4867,10 @@ index 0000000..a957d57
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/awb.cpp b/src/ipa/mtkisp50/algorithms/awb.cpp
 new file mode 100644
-index 0000000..bccba1a
+index 0000000..f5d0fdb
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/awb.cpp
-@@ -0,0 +1,513 @@
+@@ -0,0 +1,736 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024-2026 Red Hat Inc.
@@ -4869,6 +4883,7 @@ index 0000000..bccba1a
 +#include <algorithm>
 +#include <cmath>
 +#include <numeric>
++#include <sstream>
 +#include <stdint.h>
 +#include <string>
 +
@@ -4883,6 +4898,7 @@ index 0000000..bccba1a
 +namespace libcamera {
 +
 +LOG_DEFINE_CATEGORY(IPAMtkIsp50Awb)
++LOG_DEFINE_CATEGORY(IPAMtkIsp50AwbZones)
 +
 +namespace ipa::mtkisp50::algorithms {
 +
@@ -4972,6 +4988,25 @@ index 0000000..bccba1a
 + * - colourError (curve search): "gains" (default, relative error of the
 + *   corrected means, as rkisp1) or "whitepoint" (distance of the measured
 + *   R/G, B/G from the white point of the curve)
++ * - transversePos, transverseNeg (curve search, as AwbBayes, default 0.01):
++ *   how far the white point may lie off the curve, in R/G and B/G units.
++ *   With colourError "whitepoint" the white point is fitted exactly: the
++ *   nearest point of the curve to the measured R/G, B/G (in mired, within
++ *   the range of the AwbMode) plus the offset across the curve up to these
++ *   limits. The steps of the AwbBayes search are only its start: they are
++ *   0.01 R/G, B/G apart across the curve, a jump of 3 % of B/G under warm
++ *   light, which the colour matrix doubles.
++ * - rendering (curve search): "band", "speed", "switch" (mired; defaults 0,
++ *   1.0, 0: the estimate itself): the colour temperature for the colour
++ *   matrix and the preference follows the estimate only beyond "band"
++ *   mired, with "speed" per statistics frame; beyond "switch" mired (a new
++ *   light) it goes all the way to the estimate with the speed of the
++ *   gains. The gains always follow the estimate, so the slow drift of a
++ *   light does not change the rendering while neutral surfaces stay
++ *   neutral. The colour temperature in the metadata is the rendering one.
++ * - maxZoneLevel (curve search): zones of the statistics grid with a channel
++ *   mean above this share of the range above the black level do not count
++ *   (default 1.0, all count): a lamp in the picture is clipped and grey
 + * - statistics (curve search): "mean" (default, the whole statistics window)
 + *   or "zones": only the zones of the statistics zone grid whose white point
 + *   lies within greyDistance (default 0.02, in R/G and B/G) of the curve and
@@ -5037,6 +5072,36 @@ index 0000000..bccba1a
 +	}
 +	whitePointError_ = error == "whitepoint";
 +	zones_ = statistics == "zones";
++	maxZoneLevel_ = tuningData["maxZoneLevel"].get<double>(1.0);
++	if (!(maxZoneLevel_ > 0.0 && maxZoneLevel_ <= 1.0)) {
++		LOG(IPAMtkIsp50Awb, Error) << "Invalid Awb maxZoneLevel";
++		return -EINVAL;
++	}
++	transversePos_ = tuningData["transversePos"].get<double>(0.01);
++	transverseNeg_ = tuningData["transverseNeg"].get<double>(0.01);
++
++	modeRanges_.clear();
++	if (tuningData.contains("AwbMode")) {
++		for (const auto &[name, node] : tuningData["AwbMode"].asDict()) {
++			const auto it = controls::AwbModeNameValueMap.find(name);
++			if (it == controls::AwbModeNameValueMap.end())
++				continue;
++			modeRanges_[it->second] = { node["lo"].get<double>(2000.0), node["hi"].get<double>(10000.0) };
++		}
++	}
++	mode_ = controls::AwbAuto;
++
++	if (tuningData.contains("rendering")) {
++		const ValueNode &r = tuningData["rendering"];
++		renderBand_ = r["band"].get<double>(0.0);
++		renderSpeed_ = r["speed"].get<double>(1.0);
++		renderSwitch_ = r["switch"].get<double>(0.0);
++		if (!(renderBand_ >= 0.0) || !(renderSpeed_ > 0.0 && renderSpeed_ <= 1.0) ||
++		    !(renderSwitch_ >= 0.0)) {
++			LOG(IPAMtkIsp50Awb, Error) << "Invalid Awb rendering";
++			return -EINVAL;
++		}
++	}
 +
 +	/* White points along the curve for the zone selection */
 +	whitePoints_.clear();
@@ -5080,10 +5145,14 @@ index 0000000..bccba1a
 +	samples_.clear();
 +
 +	if (curve_) {
++		renderMired_ = 0.0;
++		renderSwitching_ = false;
 +		if (haveEstimate_) {
 +			/* Where the last stream of the camera ended */
 +			gains = lastGains_;
 +			context.activeState.awb.temperatureK = lastTemperature_;
++			if (lastTemperature_)
++				renderMired_ = 1e6 / lastTemperature_;
 +		} else {
 +			auto start = curve_->gainsFromColourTemperature(startTemperature_);
 +			if (start) {
@@ -5104,8 +5173,10 @@ index 0000000..bccba1a
 +{
 +	if (curve_)
 +		curve_->handleControls(controls);
-+	if (const auto &v = controls.get(controls::AwbMode))
++	if (const auto &v = controls.get(controls::AwbMode)) {
 +		autoMode_ = *v == controls::AwbAuto;
++		mode_ = *v;
++	}
 +
 +	if (const auto &v = controls.get(controls::AwbEnable)) {
 +		enabled_ = *v;
@@ -5185,6 +5256,150 @@ index 0000000..bccba1a
 +}
 +
 +/*
++ * Means of the zones without the bright ones (a lamp in the picture, clipped
++ * or nearly so, is grey in the statistics and pulls the estimate towards the
++ * curve's middle). Returns the number of samples behind \a means; leaves
++ * \a means unchanged and returns \a n if no zone remains.
++ */
++double Awb::brightZonesExcluded(const Statistics *stats, double black, RGB<double> &means, double n) const
++{
++	const double limit = maxZoneLevel_ * (255.0 - black);
++	RGB<double> sum({ 0.0, 0.0, 0.0 });
++	uint64_t count = 0;
++	for (unsigned int i = 0; i < Statistics::kZones * Statistics::kZones; i++) {
++		const uint32_t c = stats->zoneCount[i];
++		if (!c)
++			continue;
++		RGB<double> m;
++		for (unsigned int k = 0; k < 3; k++)
++			m[k] = stats->zoneSum[i][k] / static_cast<double>(c) - black;
++		if (std::max({ m.r(), m.g(), m.b() }) > limit)
++			continue;
++		sum += m * static_cast<double>(c);
++		count += c;
++	}
++	if (!count)
++		return n;
++	means = sum / static_cast<double>(count);
++	return static_cast<double>(count);
++}
++
++/* White point R/G, B/G of the curve at a colour temperature */
++std::optional<std::pair<double, double>> Awb::curveWhite(double temperatureK) const
++{
++	auto g = curve_->gainsFromColourTemperature(temperatureK);
++	if (!g || !(g->r() > 0.0) || !(g->b() > 0.0))
++		return std::nullopt;
++	return std::make_pair(1.0 / g->r(), 1.0 / g->b());
++}
++
++/*
++ * Exact fit of the measured R/G, B/G (sensitivity of the curve) to the curve:
++ * from \a temperatureK (the AwbBayes result) the nearest point of the curve in
++ * steps of 0.25 mired within 12 mired and the range of the mode, refined by a
++ * parabola, then the offset across the curve within the transverse limits.
++ * Returns false if the curve cannot be evaluated there.
++ */
++bool Awb::fitCurve(const RGB<double> &measured, double &temperatureK, RGB<double> &gains) const
++{
++	if (!(measured.g() > 0.0) || !(temperatureK > 0.0))
++		return false;
++	const double rm = measured.r() / measured.g();
++	const double bm = measured.b() / measured.g();
++
++	double loMired = 1e6 / 20000.0, hiMired = 1e6 / 1000.0;
++	if (auto it = modeRanges_.find(mode_); it != modeRanges_.end()) {
++		loMired = 1e6 / it->second.second;
++		hiMired = 1e6 / it->second.first;
++	}
++
++	/* Distance in the logarithm, so that R/G and B/G count relatively */
++	auto distance = [&](double mired) -> double {
++		auto w = curveWhite(1e6 / mired);
++		if (!w)
++			return 1e9;
++		const double dr = std::log(rm / w->first);
++		const double db = std::log(bm / w->second);
++		return dr * dr + db * db;
++	};
++
++	constexpr double kStep = 0.25;
++	constexpr int kSteps = 48;
++	const double m0 = 1e6 / temperatureK;
++	double best = 1e9, bestMired = m0;
++	for (int i = -kSteps; i <= kSteps; i++) {
++		const double m = std::clamp(m0 + i * kStep, loMired, hiMired);
++		const double d = distance(m);
++		if (d < best) {
++			best = d;
++			bestMired = m;
++		}
++	}
++	if (best >= 1e9)
++		return false;
++
++	/* Parabola through the neighbours */
++	const double dl = distance(bestMired - kStep);
++	const double dr = distance(bestMired + kStep);
++	const double den = dl - 2.0 * best + dr;
++	if (den > 0.0 && dl < 1e9 && dr < 1e9)
++		bestMired += std::clamp(0.5 * kStep * (dl - dr) / den, -kStep, kStep);
++	bestMired = std::clamp(bestMired, loMired, hiMired);
++
++	const double t = 1e6 / bestMired;
++	auto w = curveWhite(t);
++	auto wLo = curveWhite(1e6 / (bestMired + 1.0));
++	auto wHi = curveWhite(1e6 / std::max(bestMired - 1.0, 1.0));
++	if (!w || !wLo || !wHi)
++		return false;
++
++	/* Across the curve as AwbBayes: (dB, -dR) over a rising temperature */
++	double nr = wHi->second - wLo->second;
++	double nb = -(wHi->first - wLo->first);
++	const double len = std::hypot(nr, nb);
++	double r = w->first, b = w->second;
++	if (len > 0.0) {
++		nr /= len;
++		nb /= len;
++		const double offset = std::clamp((rm - r) * nr + (bm - b) * nb, -transverseNeg_, transversePos_);
++		r += offset * nr;
++		b += offset * nb;
++	}
++	if (!(r > 0.0) || !(b > 0.0))
++		return false;
++
++	temperatureK = t;
++	gains = RGB<double>({ 1.0 / r, 1.0, 1.0 / b });
++	return true;
++}
++
++/*
++ * The colour temperature of the rendering from the estimate (see init()),
++ * in kelvin
++ */
++unsigned int Awb::render(double temperatureK)
++{
++	const double m = 1e6 / temperatureK;
++	if (!renderMired_ || !(renderBand_ > 0.0 || renderSpeed_ < 1.0)) {
++		renderMired_ = m;
++	} else {
++		const double d = m - renderMired_;
++		const double beyond = std::abs(d) - renderBand_;
++		/* A new light: go all the way to the estimate, at the speed of the gains */
++		if (renderSwitch_ > 0.0 && std::abs(d) > renderSwitch_)
++			renderSwitching_ = true;
++		if (renderSwitching_) {
++			renderMired_ += std::max(speed_, renderSpeed_) * d;
++			if (std::abs(m - renderMired_) < 1.0)
++				renderSwitching_ = false;
++		} else if (beyond > 0.0) {
++			renderMired_ += std::copysign(renderSpeed_ * beyond, d);
++		}
++	}
++	return static_cast<unsigned int>(std::lround(1e6 / renderMired_));
++}
++
++/*
 + * Sum of the zones near the curve; leaves \a means unchanged and returns 0
 + * if there are none
 + */
@@ -5245,7 +5460,24 @@ index 0000000..bccba1a
 +	metadata.set(controls::AwbEnable, enabled_);
 +
 +	/* Fixed or held gains */
-+	if (!stats->valid || !enabled_)
++	if (!stats->valid)
++		return;
++
++	/* The raw statistics, also with fixed gains, for the tuning */
++	if (_LOG_CATEGORY(IPAMtkIsp50AwbZones)().severity() <= LogDebug) {
++		std::ostringstream z;
++		z.precision(4);
++		for (unsigned int i = 0; i < Statistics::kZones * Statistics::kZones; i++) {
++			const double n = std::max<uint32_t>(stats->zoneCount[i], 1);
++			z << ' ' << stats->zoneSum[i].r() / n - blackLevel << ',' << stats->zoneSum[i].g() / n - blackLevel
++			  << ',' << stats->zoneSum[i].b() / n - blackLevel;
++		}
++		LOG(IPAMtkIsp50AwbZones, Debug)
++			<< "frame " << frame << " exposure " << frameContext.sensor.exposure << " gain "
++			<< frameContext.sensor.gain << " digital " << frameContext.digitalGain << " zones" << z.str();
++	}
++
++	if (!enabled_)
 +		return;
 +
 +	/*
@@ -5266,8 +5498,10 @@ index 0000000..bccba1a
 +	auto &gains = context.activeState.awb.gains;
 +
 +	if (curve_) {
-+		const double n = std::max<uint64_t>(nPixels, 1);
-+		const RGB<double> means{ { sum.r() / n, sum.g() / n, sum.b() / n } };
++		double n = std::max<uint64_t>(nPixels, 1);
++		RGB<double> means{ { sum.r() / n, sum.g() / n, sum.b() / n } };
++		if (maxZoneLevel_ < 1.0)
++			n = brightZonesExcluded(stats, blackLevel, means, n);
 +
 +		/*
 +		 * Means per unit of exposure, averaged over the window, back in
@@ -5320,16 +5554,18 @@ index 0000000..bccba1a
 +					 measured.b() / sensitivity_.b() });
 +
 +		AwbResult result = curve_->calculateAwb(SoftAwbStats(measured, whitePointError_), 0);
++		if (whitePointError_)
++			fitCurve(measured, result.colourTemperature, result.gains);
 +		const RGB<float> target = applied(result.gains);
 +		/* The first estimate of the camera counts fully */
 +		const double speed = haveEstimate_ ? speed_ * weight : 1.0;
-+		const double ct = context.activeState.awb.temperatureK && haveEstimate_
-+					  ? speed * result.colourTemperature +
-+						    (1.0 - speed) * context.activeState.awb.temperatureK
-+					  : result.colourTemperature;
++		/* The estimate is smoothed in mired, as the gains */
++		estimateMired_ = haveEstimate_ && estimateMired_ > 0.0
++					 ? speed * 1e6 / result.colourTemperature + (1.0 - speed) * estimateMired_
++					 : 1e6 / result.colourTemperature;
 +		for (unsigned int i = 0; i < 3; i++)
 +			gains[i] = static_cast<float>(speed * target[i] + (1.0 - speed) * gains[i]);
-+		context.activeState.awb.temperatureK = std::lround(ct);
++		context.activeState.awb.temperatureK = render(1e6 / estimateMired_);
 +		haveEstimate_ = true;
 +		lastGains_ = gains;
 +		lastTemperature_ = context.activeState.awb.temperatureK;
@@ -5338,6 +5574,7 @@ index 0000000..bccba1a
 +			<< "means " << means << " window " << measured << " snr " << snr
 +			<< " (" << greyZones << " grey zones) curve gains " << result.gains
 +			<< " ct " << result.colourTemperature << " -> gains " << gains
++			<< " estimate " << std::lround(1e6 / estimateMired_)
 +			<< " ct " << context.activeState.awb.temperatureK
 +			<< " tint " << context.activeState.awb.tint;
 +	} else {
@@ -5372,10 +5609,10 @@ index 0000000..bccba1a
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/awb.h b/src/ipa/mtkisp50/algorithms/awb.h
 new file mode 100644
-index 0000000..7ac4227
+index 0000000..437ae4d
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/awb.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,120 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024-2025 Red Hat Inc.
@@ -5386,6 +5623,7 @@ index 0000000..7ac4227
 +#pragma once
 +
 +#include <deque>
++#include <map>
 +#include <memory>
 +#include <optional>
 +#include <utility>
@@ -5433,6 +5671,11 @@ index 0000000..7ac4227
 +
 +	unsigned int greyZoneMeans(const Statistics *stats, double black,
 +				   RGB<double> &means) const;
++	double brightZonesExcluded(const Statistics *stats, double black, RGB<double> &means,
++				   double n) const;
++	std::optional<std::pair<double, double>> curveWhite(double temperatureK) const;
++	bool fitCurve(const RGB<double> &measured, double &temperatureK, RGB<double> &gains) const;
++	unsigned int render(double temperatureK);
 +	void updateTint(IPAContext &context) const;
 +	RGB<float> applied(const RGB<double> &curveGains) const;
 +
@@ -5462,6 +5705,23 @@ index 0000000..7ac4227
 +	bool whitePointError_ = false;
 +	bool zones_ = false;
 +	double greyDistance_ = 0.02;
++	/* White point off the curve (as AwbBayes, R/G and B/G units) and the range per mode */
++	double maxZoneLevel_ = 1.0;
++	double transversePos_ = 0.01;
++	double transverseNeg_ = 0.01;
++	std::map<int32_t, std::pair<double, double>> modeRanges_;
++	int32_t mode_ = 0;
++	/*
++	 * Colour temperature of the rendering (colour matrix, preference):
++	 * held within renderBand mired of the estimate, followed with
++	 * renderSpeed beyond it and with speed beyond renderSwitch
++	 */
++	double renderBand_ = 0.0;
++	double renderSpeed_ = 1.0;
++	double renderSwitch_ = 0.0;
++	double renderMired_ = 0.0;
++	bool renderSwitching_ = false;
++	double estimateMired_ = 0.0;
 +	std::vector<std::pair<double, double>> whitePoints_;
 +
 +	/* Controls: automatic or fixed gains (ColourGains or ColourTemperature) */
@@ -21344,10 +21604,10 @@ index 0000000..b8eac90
 +TEST_REGISTER(MtkIsp50AgcTest)
 diff --git a/test/mtkisp50/awb.cpp b/test/mtkisp50/awb.cpp
 new file mode 100644
-index 0000000..08b7a58
+index 0000000..c73c821
 --- /dev/null
 +++ b/test/mtkisp50/awb.cpp
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,699 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * mtkisp50 IPA: white balance in dark scenes and the rendering of warm light
@@ -21355,10 +21615,13 @@ index 0000000..08b7a58
 +
 +#include <cmath>
 +#include <cstring>
++#include <fstream>
 +#include <iostream>
 +#include <memory>
++#include <stdlib.h>
 +#include <string>
 +#include <unistd.h>
++#include <vector>
 +
 +#include <libcamera/base/file.h>
 +#include <libcamera/base/memfd.h>
@@ -21371,6 +21634,7 @@ index 0000000..08b7a58
 +#include "mtkisp50/algorithms/ccm.h"
 +#include "mtkisp50/awb_preference.h"
 +#include "mtkisp50/ipa_context.h"
++#include "mtkisp50/unit_tuning.h"
 +
 +#include "test.h"
 +
@@ -21429,6 +21693,34 @@ index 0000000..08b7a58
 +      hi: 6500
 +  colourError: whitepoint
 +  sensitivity: [ 1.1, 0.9 ]
++AwbRender:
++  algorithm: bayes
++  speed: 0.7
++  window: 2
++  colourGains:
++    - ct: 2000
++      gains: [ 0.8, 3.6 ]
++    - ct: 2500
++      gains: [ 1.0, 3.0 ]
++    - ct: 4000
++      gains: [ 1.5, 2.0 ]
++    - ct: 6500
++      gains: [ 2.0, 1.5 ]
++  priors:
++    - lux: 0
++      ct: [ 2000, 8000 ]
++      probability: [ 1.0, 1.0 ]
++  AwbMode:
++    AwbAuto:
++      lo: 2000
++      hi: 6500
++  transversePos: 0.06
++  transverseNeg: 0.06
++  colourError: whitepoint
++  rendering:
++    band: 30
++    speed: 0.1
++    switch: 60
 +Ccm:
 +  ccms:
 +    - ct: 2500
@@ -21439,6 +21731,75 @@ index 0000000..08b7a58
 +    iso: [ 800, 3200 ]
 +    value: [ 1.0, 0.5 ]
 +)";
++
++/*
++ * A tuning file with the curve of a reference module and the settings of the
++ * steady rendering, and the calibration of a single module over it
++ */
++const char *kModuleTuning = R"(%YAML 1.1
++---
++version: 1
++algorithms:
++  - Awb:
++      algorithm: bayes
++      speed: 0.7
++      window: 2
++      colourGains:
++        - ct: 2000
++          gains: [ 0.8, 3.6 ]
++        - ct: 6500
++          gains: [ 2.0, 1.5 ]
++      priors:
++        - lux: 0
++          ct: [ 2000, 8000 ]
++          probability: [ 1.0, 1.0 ]
++      AwbMode:
++        AwbAuto:
++          lo: 2000
++          hi: 6500
++      transversePos: 0.06
++      transverseNeg: 0.06
++      maxZoneLevel: 0.6
++      colourError: whitepoint
++      rendering:
++        band: 30
++        speed: 0.1
++        switch: 60
++  - Ccm:
++      ccms:
++        - ct: 2500
++          ccm: [ 1.5, -0.25, -0.25, -0.25, 1.5, -0.25, -0.25, -0.25, 1.5 ]
++        - ct: 6500
++          ccm: [ 1.5, -0.25, -0.25, -0.25, 1.5, -0.25, -0.25, -0.25, 1.5 ]
++)";
++
++const char *kModuleUnit = R"(%YAML 1.1
++---
++version: 1
++algorithms:
++  - Awb:
++      colourGains:
++        - ct: 2000
++          gains: [ 0.8, 3.6 ]
++        - ct: 2500
++          gains: [ 1.0, 3.0 ]
++        - ct: 4000
++          gains: [ 1.5, 2.0 ]
++        - ct: 6500
++          gains: [ 2.0, 1.5 ]
++      sensitivity: [ 1.1, 0.9 ]
++)";
++
++const ValueNode &algorithm(const ValueNode &tuning, const std::string &name)
++{
++	static const ValueNode empty;
++
++	for (const ValueNode &algo : tuning["algorithms"].asList()) {
++		if (algo.contains(name))
++			return algo[name];
++	}
++	return empty;
++}
 +
 +constexpr uint8_t kBlack = 16;
 +constexpr uint32_t kSamples = 50000;
@@ -21463,10 +21824,15 @@ index 0000000..08b7a58
 +		if (!tuning_)
 +			return -EINVAL;
 +
-+		int ret = ccm_.init(ctx_, (*tuning_)["Ccm"]);
++		return init((*tuning_)["Ccm"], (*tuning_)[awbKey]);
++	}
++
++	int init(const ValueNode &ccm, const ValueNode &awb)
++	{
++		int ret = ccm_.init(ctx_, ccm);
 +		if (ret)
 +			return ret;
-+		return awb_.init(ctx_, (*tuning_)[awbKey]);
++		return awb_.init(ctx_, awb);
 +	}
 +
 +	int configure()
@@ -21532,6 +21898,94 @@ index 0000000..08b7a58
 +	algorithms::Ccm ccm_;
 +	std::unique_ptr<Statistics> stats_;
 +	uint32_t frame_ = 0;
++};
++
++/*
++ * Statistics recorded at the device: channel means above the black level of
++ * the zones without a lamp, exposure lines and analogue gain, one frame of
++ * statistics every 0.72 s. A dim warm light whose colour drifts by about 7 %
++ * in R/G and B/G within 30 s (another light in the room), at 15.5x.
++ */
++struct Recorded {
++	double r, g, b;
++	int32_t exposure;
++	double gain;
++};
++
++const Recorded kRecorded[] = {
++	{ 3.39, 3.28, 1.10, 3693, 15.50 },
++	{ 3.67, 3.55, 1.18, 3693, 15.50 },
++	{ 3.63, 3.52, 1.17, 3693, 15.50 },
++	{ 3.53, 3.42, 1.15, 3693, 15.50 },
++	{ 3.43, 3.31, 1.10, 3693, 15.50 },
++	{ 3.43, 3.34, 1.13, 3693, 15.50 },
++	{ 11.92, 11.69, 3.74, 12309, 15.50 },
++	{ 11.24, 11.10, 3.58, 11078, 15.50 },
++	{ 9.98, 9.89, 3.20, 9847, 15.50 },
++	{ 9.94, 9.89, 3.20, 9847, 15.50 },
++	{ 9.90, 9.89, 3.20, 9847, 15.50 },
++	{ 9.85, 9.88, 3.19, 9847, 15.50 },
++	{ 9.79, 9.86, 3.19, 9847, 15.50 },
++	{ 9.62, 9.75, 3.14, 9847, 15.50 },
++	{ 9.55, 9.72, 3.13, 9847, 15.50 },
++	{ 9.59, 9.77, 3.15, 9847, 15.50 },
++	{ 9.57, 9.80, 3.16, 9847, 15.50 },
++	{ 9.49, 9.77, 3.15, 9847, 15.50 },
++	{ 9.46, 9.76, 3.15, 9847, 15.50 },
++	{ 9.39, 9.75, 3.14, 9847, 15.50 },
++	{ 9.30, 9.74, 3.13, 9847, 15.50 },
++	{ 9.25, 9.73, 3.13, 9847, 15.50 },
++	{ 9.22, 9.74, 3.16, 9847, 15.50 },
++	{ 9.22, 9.78, 3.25, 9847, 15.50 },
++	{ 9.22, 9.80, 3.33, 9847, 15.50 },
++	{ 9.19, 9.82, 3.39, 9847, 15.50 },
++	{ 9.20, 9.85, 3.44, 9847, 15.50 },
++	{ 9.20, 9.87, 3.51, 9847, 15.50 },
++	{ 9.22, 9.91, 3.58, 9847, 15.50 },
++	{ 9.23, 9.94, 3.66, 9847, 15.50 },
++	{ 9.22, 9.95, 3.69, 9847, 15.50 },
++	{ 9.22, 9.96, 3.71, 9847, 15.50 },
++	{ 9.23, 9.90, 3.70, 9847, 15.50 },
++	{ 9.21, 9.80, 3.67, 9847, 15.50 },
++	{ 9.20, 9.72, 3.66, 9847, 15.50 },
++	{ 9.18, 9.69, 3.67, 9847, 15.50 },
++	{ 9.17, 9.62, 3.65, 9847, 15.50 },
++	{ 9.16, 9.53, 3.65, 9847, 15.50 },
++	{ 9.15, 9.46, 3.63, 9847, 15.50 },
++	{ 9.14, 9.38, 3.62, 9847, 15.50 },
++	{ 9.20, 9.38, 3.61, 9847, 15.50 },
++	{ 9.31, 9.41, 3.62, 9847, 15.50 },
++	{ 9.40, 9.42, 3.60, 9847, 15.50 },
++	{ 9.52, 9.44, 3.60, 9847, 15.50 },
++	{ 9.56, 9.44, 3.60, 9847, 15.50 },
++	{ 9.66, 9.46, 3.59, 9847, 15.50 },
++	{ 9.77, 9.47, 3.59, 9847, 15.50 },
++	{ 9.88, 9.48, 3.58, 9847, 15.50 },
++	{ 9.93, 9.50, 3.57, 9847, 15.50 },
++	{ 9.93, 9.46, 3.52, 9847, 15.50 },
++	{ 9.93, 9.43, 3.43, 9847, 15.50 },
++	{ 9.90, 9.40, 3.38, 9847, 15.50 },
++	{ 9.89, 9.37, 3.31, 9847, 15.50 },
++	{ 9.90, 9.34, 3.25, 9847, 15.50 },
++	{ 9.89, 9.31, 3.17, 9847, 15.50 },
++	{ 9.89, 9.28, 3.10, 9847, 15.50 },
++	{ 9.88, 9.24, 3.01, 9847, 15.50 },
++	{ 9.90, 9.30, 3.03, 9847, 15.50 },
++	{ 9.90, 9.33, 3.05, 9847, 15.50 },
++	{ 9.90, 9.37, 3.05, 9847, 15.50 },
++	{ 9.90, 9.45, 3.06, 9847, 15.50 },
++	{ 9.93, 9.54, 3.09, 9847, 15.50 },
++	{ 9.93, 9.59, 3.09, 9847, 15.50 },
++	{ 9.93, 9.64, 3.10, 9847, 15.50 },
++	{ 9.95, 9.73, 3.11, 9847, 15.50 },
++	{ 9.95, 9.81, 3.15, 9847, 15.50 },
++	{ 9.93, 9.84, 3.14, 9847, 15.50 },
++	{ 9.86, 9.82, 3.14, 9847, 15.50 },
++	{ 9.76, 9.81, 3.14, 9847, 15.50 },
++	{ 9.66, 9.79, 3.12, 9847, 15.50 },
++	{ 9.56, 9.79, 3.13, 9847, 15.50 },
++	{ 9.52, 9.77, 3.12, 9847, 15.50 },
++	{ 9.42, 9.77, 3.12, 9847, 15.50 }
 +};
 +
 +/* Means of a grey surface under a light of the curve at 2500 K */
@@ -21658,15 +22112,181 @@ index 0000000..08b7a58
 +		return TestPass;
 +	}
 +
++	/*
++	 * The calibration of the module over a tuning with the steady
++	 * rendering: the file replaces the curve and the sensitivity only, the
++	 * settings of the rendering stay and work with the module values
++	 */
++	int testUnitOverRendering()
++	{
++		char dir[] = "/tmp/libcamera.mtkisp50-awb.XXXXXX";
++		if (!mkdtemp(dir))
++			return fail("temporary directory");
++		const std::string path = std::string(dir) + "/sensor-unit.yaml";
++		{
++			std::ofstream out(path, std::ios::trunc);
++			out << kModuleUnit;
++		}
++		UniqueFD fd = MemFd::create("mtkisp50-awb-module", 0);
++		std::unique_ptr<ValueNode> tuning;
++		if (fd.isValid() && write(fd.get(), kModuleTuning, strlen(kModuleTuning)) > 0) {
++			File file("/proc/self/fd/" + std::to_string(fd.get()));
++			if (file.open(File::OpenModeFlag::ReadOnly))
++				tuning = YamlParser::parse(file);
++		}
++		const UnitTuning r = tuning ? UnitTuning::apply(*tuning, path)
++					    : UnitTuning{};
++		unlink(path.c_str());
++		rmdir(dir);
++		if (!tuning)
++			return fail("module tuning");
++
++		const std::vector<std::string> keys = { "Awb.colourGains", "Awb.sensitivity" };
++		if (r.status != UnitTuning::Status::Applied || r.keys != keys)
++			return fail("calibration of the module not applied");
++
++		const ValueNode &awbNode = algorithm(*tuning, "Awb");
++		if (awbNode["colourGains"].size() != 4 ||
++		    awbNode["rendering"]["band"].get<double>(0.0) != 30.0 ||
++		    awbNode["rendering"]["speed"].get<double>(0.0) != 0.1 ||
++		    awbNode["rendering"]["switch"].get<double>(0.0) != 60.0 ||
++		    awbNode["maxZoneLevel"].get<double>(0.0) != 0.6 ||
++		    awbNode["transversePos"].get<double>(0.0) != 0.06 ||
++		    awbNode["window"].get<unsigned int>(0) != 2 ||
++		    awbNode["speed"].get<double>(0.0) != 0.7)
++			return fail("keys of the tuning changed by the calibration");
++
++		Sim sim;
++		if (sim.init(algorithm(*tuning, "Ccm"), awbNode) || sim.configure())
++			return fail("init with the calibration of the module");
++
++		/* The module sees 10 % more red and 10 % less blue */
++		for (unsigned int i = 0; i < 12; i++)
++			sim.frame(RGB<double>({ 1.1 * 20.0, 20.0, 0.9 * 20.0 / 3.0 }));
++		const auto &awb = sim.ctx().activeState.awb;
++		if (awb.temperatureK > 2600 || std::abs(awb.gains.r() - 1.0f / 1.1f) > 0.03f ||
++		    std::abs(awb.gains.b() - 3.0f / 0.9f) > 0.1f)
++			return fail("module with rendering: " + std::to_string(awb.temperatureK) +
++				    " K, gains " + std::to_string(awb.gains.r()) + " " +
++				    std::to_string(awb.gains.b()));
++
++		/*
++		 * A drift of 4 % in B/G (about 17 mired on the curve): the gains
++		 * follow, the rendering stays
++		 */
++		const unsigned int ct = awb.temperatureK;
++		for (unsigned int i = 0; i < 12; i++)
++			sim.frame(RGB<double>({ 1.1 * 20.0, 20.0, 1.04 * 0.9 * 20.0 / 3.0 }));
++		if (std::abs(1e6 / ct - 1e6 / awb.temperatureK) > 2.0 ||
++		    std::abs(awb.gains.b() - 3.0f / 0.9f / 1.04f) > 0.1f)
++			return fail("drift with the calibration of the module: " +
++				    std::to_string(ct) + " -> " + std::to_string(awb.temperatureK) +
++				    " K, gain " + std::to_string(awb.gains.b()));
++
++		return TestPass;
++	}
++
++	/*
++	 * The white point is fitted exactly: a light a little off the curve
++	 * (less than the steps of the AwbBayes search across it) is
++	 * neutralised
++	 */
++	int testExactFit()
++	{
++		Sim sim;
++		if (sim.init("AwbRender") || sim.configure())
++			return fail("init");
++		/* Between 2500 and 4000 K on the curve, B/G 0.4 % above it */
++		const double r = 1.0 / 1.25, b = 1.004 / 2.5;
++		for (unsigned int i = 0; i < 20; i++)
++			sim.frame(RGB<double>({ 20.0 * r, 20.0, 20.0 * b }));
++		const auto &awb = sim.ctx().activeState.awb;
++		const double er = std::abs(std::log(r * awb.gains.r()));
++		const double eb = std::abs(std::log(b * awb.gains.b()));
++		if (er > 0.002 || eb > 0.002)
++			return fail("exact fit: residual " + std::to_string(er) + " " + std::to_string(eb));
++		return TestPass;
++	}
++
++	/*
++	 * The recorded drift of a light: the gains follow it, the colour
++	 * temperature of the rendering stays within the band
++	 */
++	int testRecorded()
++	{
++		Sim sim, plain;
++		if (sim.init("AwbRender") || sim.configure() || plain.init() || plain.configure())
++			return fail("init");
++		unsigned int lo = 100000, hi = 0, loPlain = 100000, hiPlain = 0;
++		double residual = 0.0;
++		unsigned int i = 0;
++		for (const Recorded &f : kRecorded) {
++			const RGB<double> m({ f.r, f.g, f.b });
++			sim.frame(m, f.exposure, f.gain);
++			plain.frame(m, f.exposure, f.gain);
++			if (i++ < 8)
++				continue;
++			const auto &a = sim.ctx().activeState.awb;
++			lo = std::min(lo, a.temperatureK);
++			hi = std::max(hi, a.temperatureK);
++			loPlain = std::min(loPlain, plain.ctx().activeState.awb.temperatureK);
++			hiPlain = std::max(hiPlain, plain.ctx().activeState.awb.temperatureK);
++			residual = std::max({ residual, std::abs(std::log(f.r / f.g * a.gains.r())),
++					      std::abs(std::log(f.b / f.g * a.gains.b())) });
++		}
++		const double spread = 1e6 / lo - 1e6 / hi;
++		const double spreadPlain = 1e6 / loPlain - 1e6 / hiPlain;
++		std::cout << "recorded drift: rendering " << lo << ".." << hi << " K, estimate only "
++			  << loPlain << ".." << hiPlain << " K, largest residual " << residual << std::endl;
++		if (spread > 30.0 || spreadPlain < 2.0 * spread + 10.0 || residual > 0.07)
++			return fail("recorded drift");
++		return TestPass;
++	}
++
++	/* A new light beyond the switch: the rendering follows within a few frames */
++	int testNewLight()
++	{
++		Sim sim;
++		if (sim.init("AwbRender") || sim.configure())
++			return fail("init");
++		for (unsigned int i = 0; i < 10; i++)
++			sim.frame(warm(20.0));
++		const auto &awb = sim.ctx().activeState.awb;
++		if (awb.temperatureK > 2600)
++			return fail("warm light: " + std::to_string(awb.temperatureK));
++		/* The light of the curve at 4000 K */
++		unsigned int frames = 0;
++		while (awb.temperatureK < 3900 && frames < 20) {
++			sim.frame(RGB<double>({ 20.0 / 1.5, 20.0, 20.0 / 2.0 }));
++			frames++;
++		}
++		if (frames > 8)
++			return fail("new light after " + std::to_string(frames) + " frames: " +
++				    std::to_string(awb.temperatureK) + " K");
++		return TestPass;
++	}
++
 +	int run() override
 +	{
-+		int ret = testDark();
++		int ret = testExactFit();
++		if (ret != TestPass)
++			return ret;
++		ret = testRecorded();
++		if (ret != TestPass)
++			return ret;
++		ret = testNewLight();
++		if (ret != TestPass)
++			return ret;
++		ret = testDark();
 +		if (ret != TestPass)
 +			return ret;
 +		ret = testPreference();
 +		if (ret != TestPass)
 +			return ret;
-+		return testSensitivity();
++		ret = testSensitivity();
++		if (ret != TestPass)
++			return ret;
++		return testUnitOverRendering();
 +	}
 +
 +private:
@@ -21687,6 +22307,157 @@ index 0000000..08b7a58
 +};
 +
 +TEST_REGISTER(MtkIsp50AwbTest)
+diff --git a/test/mtkisp50/awb_replay.cpp b/test/mtkisp50/awb_replay.cpp
+new file mode 100644
+index 0000000..a9948ce
+--- /dev/null
++++ b/test/mtkisp50/awb_replay.cpp
+@@ -0,0 +1,145 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * mtkisp50 IPA: replay of recorded white balance statistics (tuning aid)
++ *
++ * Without the environment variable MTKISP50_AWB_REPLAY the test is skipped.
++ * MTKISP50_AWB_REPLAY=<tuning.yaml>:<zones.txt>[:<out.txt>]: the file of zones
++ * has one statistics frame per line, "t exposure gain digitalGain" followed
++ * by 225 zone means "r g b" above the black level (8-bit scale). The Awb and
++ * Ccm algorithms of the tuning run on them; per frame the colour temperature,
++ * the gains, the tint and the combined matrix are written out.
++ */
++
++#include <cmath>
++#include <cstdlib>
++#include <fstream>
++#include <iostream>
++#include <memory>
++#include <sstream>
++#include <string>
++
++#include <libcamera/base/file.h>
++
++#include <libcamera/control_ids.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "mtkisp50/algorithms/awb.h"
++#include "mtkisp50/algorithms/ccm.h"
++#include "mtkisp50/ipa_context.h"
++
++#include "test.h"
++
++using namespace std::literals::chrono_literals;
++using namespace libcamera;
++using namespace libcamera::ipa::mtkisp50;
++
++class MtkIsp50AwbReplay : public Test
++{
++protected:
++	int run() override
++	{
++		const char *env = getenv("MTKISP50_AWB_REPLAY");
++		if (!env)
++			return TestSkip;
++
++		std::istringstream spec(env);
++		std::string tuningPath, zonesPath, outPath;
++		std::getline(spec, tuningPath, ':');
++		std::getline(spec, zonesPath, ':');
++		std::getline(spec, outPath, ':');
++
++		File file(tuningPath);
++		if (!file.open(File::OpenModeFlag::ReadOnly))
++			return TestFail;
++		std::unique_ptr<ValueNode> tuning = YamlParser::parse(file);
++		if (!tuning)
++			return TestFail;
++
++		const ValueNode *awbNode = nullptr, *ccmNode = nullptr;
++		for (const ValueNode &a : (*tuning)["algorithms"].asList()) {
++			if (a.contains("Awb"))
++				awbNode = &a["Awb"];
++			if (a.contains("Ccm"))
++				ccmNode = &a["Ccm"];
++		}
++		if (!awbNode || !ccmNode)
++			return TestFail;
++
++		IPAContext ctx(16);
++		algorithms::Awb awb;
++		algorithms::Ccm ccm;
++		if (ccm.init(ctx, *ccmNode) || awb.init(ctx, *awbNode))
++			return TestFail;
++
++		const uint8_t black = 16;
++		ctx.activeState.blc.level = black;
++		ctx.configuration.agc.lineDuration = 8.126us;
++		IPAConfigInfo config{};
++		awb.configure(ctx, config);
++
++		std::ifstream in(zonesPath);
++		std::ofstream outFile;
++		if (!outPath.empty())
++			outFile.open(outPath);
++		std::ostream &out = outPath.empty() ? std::cout : outFile;
++
++		auto stats = std::make_unique<Statistics>();
++		std::string line;
++		uint32_t frame = 0;
++		while (std::getline(in, line)) {
++			std::istringstream l(line);
++			double t, gain, digital;
++			int32_t exposure;
++			if (!(l >> t >> exposure >> gain >> digital))
++				continue;
++
++			constexpr uint32_t kCount = 1024;
++			Statistics &s = *stats;
++			s.valid = true;
++			s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
++			for (unsigned int i = 0; i < Statistics::kZones * Statistics::kZones; i++) {
++				double r, g, b;
++				l >> r >> g >> b;
++				const double m[3] = { r, g, b };
++				for (unsigned int c = 0; c < 3; c++) {
++					s.zoneSum[i][c] = static_cast<uint64_t>(std::llround(std::max(m[c] + black, 0.0) * kCount));
++					s.sum_[c] += s.zoneSum[i][c];
++				}
++				s.zoneCount[i] = kCount;
++			}
++			s.yHistogram.fill(0);
++			s.yHistogram[0] = kCount * Statistics::kZones * Statistics::kZones;
++
++			ctx.activeState.agc.exposure = exposure;
++			ctx.activeState.agc.again = gain;
++			ctx.activeState.agc.digitalGain = digital;
++			ctx.activeState.agc.valid = true;
++
++			IPAFrameContext fc{};
++			DipFrameParams params{};
++			awb.prepare(ctx, frame, fc, &params);
++			fc.sensor.exposure = exposure;
++			fc.sensor.gain = gain;
++			fc.digitalGain = digital;
++			ControlList metadata(controls::controls);
++			awb.process(ctx, frame, fc, stats.get(), metadata);
++
++			ctx.activeState.combinedMatrix = Matrix<float, 3, 3>::identity();
++			ccm.prepare(ctx, frame, fc, &params);
++			const auto &a = ctx.activeState.awb;
++			const Matrix<float, 3, 3> &m = ctx.activeState.combinedMatrix;
++			out << t << ' ' << a.temperatureK << ' ' << a.gains.r() << ' ' << a.gains.b() << ' '
++			    << a.tint.r() << ' ' << a.tint.b();
++			for (unsigned int i = 0; i < 3; i++)
++				for (unsigned int j = 0; j < 3; j++)
++					out << ' ' << m[i][j];
++			out << '\n';
++			frame += 4;
++		}
++
++		return TestPass;
++	}
++};
++
++TEST_REGISTER(MtkIsp50AwbReplay)
 diff --git a/test/mtkisp50/frames.cpp b/test/mtkisp50/frames.cpp
 new file mode 100644
 index 0000000..42b7cdc
@@ -22126,10 +22897,10 @@ index 0000000..42b7cdc
 +TEST_REGISTER(MtkIsp50FramesTest)
 diff --git a/test/mtkisp50/meson.build b/test/mtkisp50/meson.build
 new file mode 100644
-index 0000000..2ea9f33
+index 0000000..cab867b
 --- /dev/null
 +++ b/test/mtkisp50/meson.build
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,153 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +if 'mtkisp50' not in pipelines
@@ -22215,6 +22986,20 @@ index 0000000..2ea9f33
 +    'name': 'mtkisp50-awb',
 +    'sources': [
 +        'awb.cpp',
++        '../../src/ipa/mtkisp50/algorithms/awb.cpp',
++        '../../src/ipa/mtkisp50/algorithms/ccm.cpp',
++        '../../src/ipa/mtkisp50/awb_preference.cpp',
++        '../../src/ipa/mtkisp50/ipa_context.cpp',
++        '../../src/ipa/mtkisp50/unit_tuning.cpp',
++    ],
++    'ipa': true,
++}
++
++# Replay of recorded white balance statistics (skipped without its environment)
++mtkisp50_tests += {
++    'name': 'mtkisp50-awb-replay',
++    'sources': [
++        'awb_replay.cpp',
 +        '../../src/ipa/mtkisp50/algorithms/awb.cpp',
 +        '../../src/ipa/mtkisp50/algorithms/ccm.cpp',
 +        '../../src/ipa/mtkisp50/awb_preference.cpp',
