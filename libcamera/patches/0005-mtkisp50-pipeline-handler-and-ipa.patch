@@ -19,7 +19,19 @@ Description:
    parses the statistics buffer; DIP tuning from the algorithms ToneCurve,
    LensShadingCorrection and NoiseReduction; AeState; exposure, white
    balance and lens position kept over a new configuration of the same
-   camera. Uncalibrated tuning without image quality blocks.
+   camera. Uncalibrated tuning without image quality blocks. Image quality
+   sets per job (preview, video, still image).
+ - Exposure programs per use (tuning block "program" of Agc): the total
+   exposure is split into stages of exposure time and largest gain, times
+   in steps free of mains flicker, analogue before digital gain, within
+   the frame durations of the application; a target over the brightness
+   of the scene and a limit for highlights.
+ - White balance in dim light: channel means averaged per unit of
+   exposure over a few frames and judged against their noise, the last
+   estimate held below it, the first one taken at once; module
+   sensitivity; a preference that keeps part of the colour of warm light
+   (applied after the colour matrix); colour matrix strength over the
+   gain.
  - Pipeline handler: capture by sensor, seninf and CAMSV into an internal
    raw pool or the raw stream, DIP job by DMABUF (raw, parameters, NV12
    main output, YUYV scaled output), CPU statistics (copy of the software
@@ -66,14 +78,16 @@ Description:
    different outputs, stream planning (validate cases), autofocus over a
    new configuration, frame length of the exposure regulation, PD
    statistics (synthetic frames, optional real frames against reference
-   results), pairing of PD and raw frames, autofocus with PD; CPU
+   results), pairing of PD and raw frames, autofocus with PD, exposure
+   programs and the regulation with them, white balance in dim light and
+   the preference; CPU
    statistics against the software ISP statistics frame by frame.
  .
  Applies on top of 0001, 0003 and 0004.
 Forwarded: no
 License: LGPL-2.1-or-later (as the files it derives from); GPL-2.0-or-later
  for the tests
-Last-Update: 2026-11-21
+Last-Update: 2026-11-22
 ---
 diff --git a/include/libcamera/internal/mtkisp50/stats.h b/include/libcamera/internal/mtkisp50/stats.h
 new file mode 100644
@@ -271,10 +285,10 @@ index 3ee3ada..4ce3df8 100644
      'rpi/vc4': 'raspberrypi.mojom',
 diff --git a/include/libcamera/ipa/mtkisp50.mojom b/include/libcamera/ipa/mtkisp50.mojom
 new file mode 100644
-index 0000000..988866a
+index 0000000..32c76b6
 --- /dev/null
 +++ b/include/libcamera/ipa/mtkisp50.mojom
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,116 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +
 +/*
@@ -376,7 +390,11 @@ index 0000000..988866a
 +	unmapBuffers(array<uint32> ids);
 +
 +	[async] queueRequest(uint32 frame, libcamera.ControlList controls);
-+	[async] computeParams(uint32 frame, uint32 paramsBufferId);
++	/*
++	 * jobUse: what the ISP job of the frame makes (a frame with a still
++	 * image of a session with still images, else the use of the session)
++	 */
++	[async] computeParams(uint32 frame, uint32 paramsBufferId, UseCase jobUse);
 +	[async] processStats(uint32 frame, uint32 statsBufferId,
 +			     libcamera.ControlList sensorControls);
 +};
@@ -2704,10 +2722,10 @@ index 0000000..73cdd01
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/agc.cpp b/src/ipa/mtkisp50/algorithms/agc.cpp
 new file mode 100644
-index 0000000..00b468f
+index 0000000..7ffeead
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/agc.cpp
-@@ -0,0 +1,1084 @@
+@@ -0,0 +1,1332 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024, Red Hat Inc.
@@ -2826,6 +2844,29 @@ index 0000000..00b468f
 + *   target after a large change of light in a few statistics frames.
 + * - exposureTolerance: with exposureTarget, the dead band around the target
 + *   in stops within which nothing is changed (default 0.1).
++ * - program: exposure programs (see ExposureProgram), "preview", and
++ *   optionally "video" and "still": lists of [exposure time in us, largest
++ *   total gain]. With a program and zone metering the regulation works on
++ *   the total exposure and splits it with the program of the use of the
++ *   session (video for a video session, preview otherwise); a frame for a
++ *   still image of a session with still images takes the digital gain the
++ *   still program allows beyond the preview. The stages beyond the longest
++ *   exposure of the moment (frame durations, autofocus) are left out. The
++ *   digital gain reaches the largest total gain of the program over the
++ *   largest analogue gain. maxExposureFactor still sets the frame length
++ *   extension, extensionGain and the cascade do not apply.
++ * - fNumber: for the brightness of the scene (BV = log2(fNumber^2 / time) -
++ *   log2(gain) - 5 + log2(level / exposureTarget), ISO 100 at gain 1.0;
++ *   default 2.0)
++ * - targetCurve (with a program): {bv: [...], stops: [...]}, the target in
++ *   stops over exposureTarget against the brightness of the scene, linear in
++ *   between, held beyond the ends
++ * - highlight (with a program): {fraction, bv, limit, strength, maxStops}.
++ *   The mean of the brightest fraction (default 0.01) of the luminance
++ *   histogram, relative to the metered mean and taken to the target, should
++ *   not exceed limit/255 (over bv, as targetCurve). Above, the target comes
++ *   down by strength / (1 + strength) of the excess in stops, at most
++ *   maxStops: light sources in the image darken it in part.
 + * - metering: with exposureTarget, "histogram" (default, the mean of the
 + *   luminance histogram as above) or "zones": a weighted mean over a 5x5 grid
 + *   of zones over the statistics window. Per zone the channel means above the
@@ -2891,6 +2932,55 @@ index 0000000..00b468f
 +	}
 +
 +	useColourGains_ = tuningData["colourGains"].get<bool>(true);
++	fNumber_ = tuningData["fNumber"].get<double>(2.0);
++
++	if (tuningData.contains("program")) {
++		const ValueNode &prog = tuningData["program"];
++		static constexpr const char *names[] = { "preview", "video", "still" };
++		for (unsigned int i = 0; i < 3; i++) {
++			if (!prog.contains(names[i]))
++				continue;
++			programs_[i] = ExposureProgram::fromTuning(prog[names[i]]);
++			if (!programs_[i])
++				return -EINVAL;
++		}
++		if (!programs_[0]) {
++			LOG(IPAMtkIsp50Exposure, Error) << "Agc program needs a preview program";
++			return -EINVAL;
++		}
++	}
++
++	auto curve = [&](const ValueNode &node, const char *xKey, const char *yKey,
++			 std::vector<double> &x, std::vector<double> &y) {
++		auto vx = node[xKey].get<std::vector<double>>();
++		auto vy = node[yKey].get<std::vector<double>>();
++		if (!vx || !vy || vx->empty() || vx->size() != vy->size())
++			return false;
++		for (unsigned int i = 1; i < vx->size(); i++) {
++			if (!((*vx)[i] > (*vx)[i - 1]))
++				return false;
++		}
++		x = *vx;
++		y = *vy;
++		return true;
++	};
++	if (tuningData.contains("targetCurve") &&
++	    !curve(tuningData["targetCurve"], "bv", "stops", targetBv_, targetStops_)) {
++		LOG(IPAMtkIsp50Exposure, Error) << "Invalid Agc targetCurve";
++		return -EINVAL;
++	}
++	if (tuningData.contains("highlight")) {
++		const ValueNode &h = tuningData["highlight"];
++		highlightFraction_ = h["fraction"].get<double>(0.01);
++		highlightStrength_ = h["strength"].get<double>(1.0);
++		highlightMaxStops_ = h["maxStops"].get<double>(1.0);
++		if (!curve(h, "bv", "limit", highlightBv_, highlightLimit_) ||
++		    !(highlightFraction_ > 0.0 && highlightFraction_ < 0.5) ||
++		    !(highlightStrength_ >= 0.0) || !(highlightMaxStops_ >= 0.0 && highlightMaxStops_ <= 4.0)) {
++			LOG(IPAMtkIsp50Exposure, Error) << "Invalid Agc highlight";
++			return -EINVAL;
++		}
++	}
 +	tunedWeights_ = zoneWeights_;
 +
 +	/*
@@ -2958,6 +3048,11 @@ index 0000000..00b468f
 +		maxDigitalGain_ = 1.0;
 +	}
 +
++	if (programs_[0] && (!zoneMetering_ || !exposureSpeed_)) {
++		LOG(IPAMtkIsp50Exposure, Error) << "Agc program needs zone metering and exposureSpeed";
++		return -EINVAL;
++	}
++
 +	if (zoneMetering_ && !exposureTarget_) {
 +		LOG(IPAMtkIsp50Exposure, Error) << "Agc zone metering needs exposureTarget";
 +		return -EINVAL;
@@ -2983,6 +3078,10 @@ index 0000000..00b468f
 +
 +	context.activeState.agc.digitalGain = 1.0;
 +	context.activeState.agc.converging = true;
++	context.activeState.agc.levelRatio = 1.0;
++	total_ = 0.0;
++	highlightStops_ = 0.0;
++	useCase_ = configInfo.useCase == UseCase::Video ? 1 : configInfo.useCase == UseCase::Still ? 2 : 0;
 +
 +	agc.exposureMaxExtended = agc.exposureMax;
 +	agc.extensionGain = agc.againMax;
@@ -3542,6 +3641,153 @@ index 0000000..00b468f
 +		<< " exp " << exposure << " again " << again;
 +}
 +
++double Agc::interpolate(const std::vector<double> &x, const std::vector<double> &y, double v)
++{
++	if (x.empty())
++		return 0.0;
++	if (v <= x.front())
++		return y.front();
++	if (v >= x.back())
++		return y.back();
++	unsigned int i = 0;
++	while (v > x[i + 1])
++		i++;
++	return y[i] + (v - x[i]) / (x[i + 1] - x[i]) * (y[i + 1] - y[i]);
++}
++
++/*
++ * Mean of the brightest fraction of the luminance histogram, above the black
++ * level and relative to the range above it (the statistics before the digital
++ * gain); -1 without data
++ */
++double Agc::highlightLevel(const IPAContext &context, const Statistics *stats) const
++{
++	const auto &hist = stats->yHistogram;
++	const double black = context.activeState.blc.level;
++	const double binWidth = 256.0 / Statistics::kYHistogramSize;
++	uint64_t total = 0;
++	for (uint32_t n : hist)
++		total += n;
++	if (!total || !(255.0 - black > 0.0))
++		return -1.0;
++
++	const double want = highlightFraction_ * total;
++	double count = 0.0;
++	double sum = 0.0;
++	for (int i = Statistics::kYHistogramSize - 1; i >= 0 && count < want; i--) {
++		const double n = std::min<double>(hist[i], want - count);
++		const double y = std::max((i + 0.5) * binWidth - black, 0.0) / (255.0 - black);
++		sum += n * y;
++		count += n;
++	}
++
++	return count > 0.0 ? sum / count : -1.0;
++}
++
++/*
++ * Regulation with an exposure program: the total exposure follows the
++ * error of the metered mean against the target (target curve over the
++ * brightness of the scene, highlights), and is split into exposure time,
++ * analogue and digital gain by the program of the session within the
++ * longest exposure of the moment.
++ */
++void Agc::regulateProgram(IPAContext &context, IPAFrameContext &frameContext,
++			  const Statistics *stats, double metered)
++{
++	const auto &agc = context.configuration.agc;
++	auto &state = context.activeState.agc;
++	const ExposureProgram &prog = programs_[useCase_ == 1 && programs_[1] ? 1 : 0].value();
++
++	const int32_t exposure = frameContext.sensor.exposure;
++	const double again = frameContext.sensor.gain;
++	const double digitalBefore = state.digitalGain;
++	const double dFrame = frameContext.digitalGain > 0.0 ? frameContext.digitalGain : state.digitalGain;
++	const double tFrame = utils::Duration(agc.lineDuration * exposure).get<std::micro>();
++
++	/* The statistics are taken before the digital gain */
++	const double mean = std::max(metered * dFrame, 1e-4);
++	const double base = *exposureTarget_ * std::exp2(exposureValue_);
++	state.levelRatio = mean / *exposureTarget_;
++
++	/* Brightness of the scene */
++	const double bv = std::log2(fNumber_ * fNumber_ / std::max(tFrame * 1e-6, 1e-6)) -
++			  std::log2(std::max(again * dFrame, 1e-3)) - 5.0 +
++			  std::log2(mean / *exposureTarget_);
++	const double offset = interpolate(targetBv_, targetStops_, bv);
++	double target = base * std::exp2(offset);
++
++	/* Highlights, relative to the mean: independent of the exposure */
++	double reduction = 0.0;
++	if (!highlightBv_.empty()) {
++		const double top = highlightLevel(context, stats);
++		const double limit = interpolate(highlightBv_, highlightLimit_, bv) / 255.0;
++		if (top > 0.0 && metered > 0.0 && limit > 0.0) {
++			const double excess = std::log2(top / metered * target / limit);
++			if (excess > 0.0)
++				reduction = std::min(highlightMaxStops_,
++						     highlightStrength_ / (1.0 + highlightStrength_) * excess);
++		}
++		highlightStops_ = 0.5 * highlightStops_ + 0.5 * reduction;
++		target *= std::exp2(-highlightStops_);
++	}
++
++	/* Error in half stops, as the other regulation */
++	const double error = 2.0 * std::log2(target / mean);
++	/*
++	 * The total exposure the frame needed (exact for its own exposure,
++	 * whatever the sensor delays), approached from the regulated one: a
++	 * part the frame could not reach (limits of the preview) stays in it
++	 */
++	const double frameTotal = tFrame * again * dFrame;
++	const double required = frameTotal * target / mean;
++	double total = total_ > 0.0 ? total_ : frameTotal;
++	if (std::abs(error) > tolerance_) {
++		const double stops = std::clamp(*exposureSpeed_ * std::log2(required / total),
++						-maxExposureStep_, maxExposureStep_);
++		total *= std::exp2(stops);
++	}
++
++	/* Longest exposure of the moment, the digital gain of the session */
++	const int32_t limitLines = exposureLimit(context, exposure);
++	const double maxTime = utils::Duration(agc.lineDuration * limitLines).get<std::micro>();
++	const double minTime = utils::Duration(agc.lineDuration * agc.exposureMin).get<std::micro>();
++	const unsigned int top = useCase_ == 2 && programs_[2] ? 2 : useCase_ == 1 && programs_[1] ? 1 : 0;
++	const double dmaxSession = std::max(programs_[top]->maxGain() / agc.againMax, 1.0);
++	const double dmaxFrames = std::max(prog.maxGain() / agc.againMax, 1.0);
++	total = std::clamp(total, minTime * agc.againMin, maxTime * agc.againMax * dmaxSession);
++	total_ = total;
++
++	const ExposureProgram::Split split = prog.split(total, minTime, maxTime, agc.againMin,
++							agc.againMax, dmaxFrames);
++
++	int32_t lines = static_cast<int32_t>(std::lround(split.time / agc.lineDuration.get<std::micro>()));
++	lines = std::clamp(lines, agc.exposureMin, std::max(limitLines, agc.exposureMin));
++	/* The rest of a rounded time goes to the digital gain */
++	const double tLines = utils::Duration(agc.lineDuration * lines).get<std::micro>();
++	double dgain = split.dgain;
++	if (tLines > 0.0 && split.again > 0.0)
++		dgain = std::clamp(total / (tLines * split.again), 1.0, dmaxFrames);
++
++	frameContext.sensor.exposure = lines;
++	frameContext.sensor.gain = std::clamp(split.again, agc.againMin, agc.againMax);
++	state.exposure = frameContext.sensor.exposure;
++	state.again = frameContext.sensor.gain;
++	state.digitalGain = dgain;
++
++	state.converging = frameContext.sensor.exposure != exposure ||
++			   frameContext.sensor.gain != again || state.digitalGain != digitalBefore;
++	const double before = exposure * again * digitalBefore;
++	const double after = frameContext.sensor.exposure * frameContext.sensor.gain * state.digitalGain;
++	state.settled = before > 0.0 && std::abs(after / before - 1.0) < kSettledStep;
++
++	LOG(IPAMtkIsp50Exposure, Debug)
++		<< "zone mean " << mean << " target " << target << " (bv " << bv
++		<< ", offset " << offset << ", highlights -" << highlightStops_
++		<< ") total " << total << " -> exposure " << lines << " (" << tLines
++		<< " us) gain " << frameContext.sensor.gain << " digital gain " << dgain
++		<< " limit " << limitLines;
++}
++
 +void Agc::queueRequest(IPAContext &context, [[maybe_unused]] const uint32_t frame,
 +			[[maybe_unused]] IPAFrameContext &frameContext,
 +			const ControlList &controls)
@@ -3698,13 +3944,19 @@ index 0000000..00b468f
 +		return;
 +	}
 +
-+	if (afFrameRate_)
++	const bool program = programs_[0] && !manualExposure_ && !manualGain_;
++	if (afFrameRate_ && !program)
 +		rebalanceForAf(context, frameContext);
 +
 +	if (zoneMetering_) {
 +		const double metered = zoneMean(context, stats);
 +		if (metered < 0.0)
 +			return;
++
++		if (program) {
++			regulateProgram(context, frameContext, stats, metered);
++			return;
++		}
 +
 +		/* The statistics are taken before the digital gain */
 +		const double mean = std::max(metered * context.activeState.agc.digitalGain, 1e-4);
@@ -3779,7 +4031,21 @@ index 0000000..00b468f
 +void Agc::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
 +		  IPAFrameContext &frameContext, DipFrameParams *params)
 +{
-+	const double digitalGain = context.activeState.agc.digitalGain;
++	double digitalGain = context.activeState.agc.digitalGain;
++
++	/*
++	 * A frame for a still image: the digital gain the still program
++	 * allows beyond the one of the preview (very dark scenes)
++	 */
++	if (params->useCase == static_cast<uint8_t>(UseCase::Still) && programs_[2] && total_ > 0.0 &&
++	    !manualExposure_ && !manualGain_) {
++		const auto &agc = context.configuration.agc;
++		const double t = utils::Duration(agc.lineDuration * context.activeState.agc.exposure).get<std::micro>();
++		const double a = context.activeState.agc.again;
++		const double dmax = std::max(programs_[2]->maxGain() / agc.againMax, 1.0);
++		if (t > 0.0 && a > 0.0)
++			digitalGain = std::clamp(total_ / (t * a), digitalGain, dmax);
++	}
 +
 +	frameContext.digitalGain = digitalGain;
 +	params->totalGain = static_cast<float>(context.activeState.agc.again * digitalGain);
@@ -3794,10 +4060,10 @@ index 0000000..00b468f
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/agc.h b/src/ipa/mtkisp50/algorithms/agc.h
 new file mode 100644
-index 0000000..b961f6b
+index 0000000..df79493
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/agc.h
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,130 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024, Red Hat Inc.
@@ -3809,11 +4075,13 @@ index 0000000..b961f6b
 +
 +#include <array>
 +#include <optional>
++#include <vector>
 +
 +#include <libcamera/base/utils.h>
 +
 +#include <libcamera/control_ids.h>
 +
++#include "mtkisp50/exposure_program.h"
 +#include "mtkisp50/statistics.h"
 +
 +#include "algorithm.h"
@@ -3846,6 +4114,10 @@ index 0000000..b961f6b
 +	void regulate(IPAContext &context, IPAFrameContext &frameContext, double error);
 +	void regulateCascade(IPAContext &context, IPAFrameContext &frameContext, double factor);
 +	void rebalanceForAf(IPAContext &context, IPAFrameContext &frameContext);
++	void regulateProgram(IPAContext &context, IPAFrameContext &frameContext,
++			     const Statistics *stats, double metered);
++	double highlightLevel(const IPAContext &context, const Statistics *stats) const;
++	static double interpolate(const std::vector<double> &x, const std::vector<double> &y, double v);
 +	double stepFactor(double error) const;
 +	double zoneMean(const IPAContext &context, const Statistics *stats) const;
 +	RGB<double> shadingGain(const IPAContext &context, double x, double y) const;
@@ -3886,6 +4158,26 @@ index 0000000..b961f6b
 +	/* Measure after the lens shading correction, and its scale */
 +	bool meteringShading_ = false;
 +	double meteringScale_ = 1.0;
++
++	/*
++	 * Exposure program per use (preview, video, still) and its state:
++	 * the regulated total exposure (us x total gain), the use of the
++	 * session
++	 */
++	std::array<std::optional<ExposureProgram>, 3> programs_;
++	double total_ = 0.0;
++	unsigned int useCase_ = 0;
++	double fNumber_ = 2.0;
++	/* Target over the brightness of the scene: offset in stops over BV */
++	std::vector<double> targetBv_;
++	std::vector<double> targetStops_;
++	/* Highlights: level of the brightest fraction, limit over BV */
++	double highlightFraction_ = 0.01;
++	std::vector<double> highlightBv_;
++	std::vector<double> highlightLimit_;
++	double highlightStrength_ = 0.0;
++	double highlightMaxStops_ = 0.0;
++	double highlightStops_ = 0.0;
 +
 +	/* Controls */
 +	bool aeEnable_ = true;
@@ -3932,10 +4224,10 @@ index 0000000..a957d57
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/awb.cpp b/src/ipa/mtkisp50/algorithms/awb.cpp
 new file mode 100644
-index 0000000..379de8b
+index 0000000..bccba1a
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/awb.cpp
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,513 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024-2026 Red Hat Inc.
@@ -3967,8 +4259,6 @@ index 0000000..379de8b
 +
 +namespace {
 +
-+/* Initial colour temperature of the search along the curve */
-+constexpr double kDefaultColourTemperature = 5000.0;
 +
 +/*
 + * Statistics for the search along the colour temperature curve: the means of
@@ -4025,8 +4315,31 @@ index 0000000..379de8b
 + *
 + * - speed: share of a new result taken per statistics frame (0.0 to 1.0,
 + *   default 1.0), smooths the gains and the colour temperature
-+ * - minMean: smallest mean of a colour channel above the black level, on
-+ *   the 8-bit scale, below which the gains are kept (default 2.0)
++ * - minSnr, lowSnr: confidence of the channel means (curve search). The
++ *   means of the last "window" statistics frames (default 4) are averaged
++ *   per unit of exposure (exposure lines times analogue gain, so that a
++ *   change of exposure or of the split between analogue and digital gain
++ *   within the window does not matter) and compared with their noise:
++ *   "blackError" (default 0.25, 8-bit scale), the uncertainty of the black
++ *   level, and the noise of the samples, "readVariance" plus "shotVariance"
++ *   times the mean (defaults 0.12 and 0.06, 8-bit scale) divided by the
++ *   number of samples. At the signal to noise ratio minSnr (default 4.0) of
++ *   the weakest channel the estimate counts fully; between lowSnr (default
++ *   1.5) and minSnr with a speed reduced in proportion; below lowSnr the last
++ *   estimate is held. The first estimate after the start counts fully.
++ * - minMean: additionally a smallest mean of a colour channel above the black
++ *   level, on the 8-bit scale (default 0.0, none)
++ * - sensitivity: [R/G, B/G] of the module relative to the module the curve
++ *   was made for (calibration data of the module, default [1.0, 1.0]); the
++ *   means are corrected before the search, the gains after it
++ * - startTemperature: colour temperature of the gains before the first
++ *   estimate of the camera (default 5000); later configurations start with
++ *   the last estimate
++ * - preference (curve search, mode auto): the colour that a neutral surface
++ *   keeps under warm light, as output R/G and B/G over the colour
++ *   temperature and the light value (see AwbPreference); "fNumber" (default
++ *   2.0) for the light value. Applied by the Ccm algorithm after the colour
++ *   matrix, without it on the colour gains.
 + * - colourError (curve search): "gains" (default, relative error of the
 + *   corrected means, as rkisp1) or "whitepoint" (distance of the measured
 + *   R/G, B/G from the white point of the curve)
@@ -4043,10 +4356,30 @@ index 0000000..379de8b
 +	context.ctrlMap[&controls::ColourGains] = ControlInfo(0.0f, 8.0f);
 +
 +	speed_ = tuningData["speed"].get<double>(1.0);
-+	minMean_ = tuningData["minMean"].get<double>(2.0);
-+	if (!(speed_ > 0.0 && speed_ <= 1.0) || !(minMean_ >= 0.0)) {
-+		LOG(IPAMtkIsp50Awb, Error) << "Invalid Awb speed or minMean";
++	minMean_ = tuningData["minMean"].get<double>(0.0);
++	minSnr_ = tuningData["minSnr"].get<double>(4.0);
++	lowSnr_ = tuningData["lowSnr"].get<double>(1.5);
++	blackError_ = tuningData["blackError"].get<double>(0.25);
++	readVariance_ = tuningData["readVariance"].get<double>(0.12);
++	shotVariance_ = tuningData["shotVariance"].get<double>(0.06);
++	window_ = tuningData["window"].get<unsigned int>(4);
++	startTemperature_ = tuningData["startTemperature"].get<double>(5000.0);
++	if (!(speed_ > 0.0 && speed_ <= 1.0) || !(minMean_ >= 0.0) ||
++	    !(lowSnr_ >= 0.0 && minSnr_ > lowSnr_) || !(blackError_ >= 0.0) ||
++	    !(readVariance_ >= 0.0) || !(shotVariance_ >= 0.0) || window_ < 1 || window_ > 64 ||
++	    !(startTemperature_ >= 1000.0 && startTemperature_ <= 20000.0)) {
++		LOG(IPAMtkIsp50Awb, Error) << "Invalid Awb speed, minMean, snr, noise, window or startTemperature";
 +		return -EINVAL;
++	}
++
++	if (tuningData.contains("sensitivity")) {
++		auto v = tuningData["sensitivity"].get<std::vector<double>>();
++		if (!v || v->size() != 2 || !((*v)[0] > 0.5 && (*v)[0] < 2.0) ||
++		    !((*v)[1] > 0.5 && (*v)[1] < 2.0)) {
++			LOG(IPAMtkIsp50Awb, Error) << "Invalid Awb sensitivity";
++			return -EINVAL;
++		}
++		sensitivity_ = RGB<double>({ (*v)[0], 1.0, (*v)[1] });
 +	}
 +
 +	const std::string algorithm = tuningData["algorithm"].get<std::string>("grey");
@@ -4090,6 +4423,15 @@ index 0000000..379de8b
 +			whitePoints_.push_back({ 1.0 / g->r(), 1.0 / g->b() });
 +	}
 +
++	if (tuningData.contains("preference")) {
++		preference_ = AwbPreference::fromTuning(tuningData["preference"]);
++		fNumber_ = tuningData["preference"]["fNumber"].get<double>(2.0);
++		if (!preference_ || !(fNumber_ > 0.0)) {
++			LOG(IPAMtkIsp50Awb, Error) << "Invalid Awb preference";
++			return -EINVAL;
++		}
++	}
++
 +	for (const auto &[id, info] : curve_->controls())
 +		context.ctrlMap[id] = info;
 +	context.ctrlMap[&controls::ColourTemperature] = ControlInfo(2000, 10000, 5000);
@@ -4105,14 +4447,22 @@ index 0000000..379de8b
 +	auto &gains = context.activeState.awb.gains;
 +	gains = { { 1.0, 1.0, 1.0 } };
 +	context.activeState.awb.temperatureK = 0;
++	context.activeState.awb.tint = RGB<float>({ 1.0f, 1.0f, 1.0f });
++	samples_.clear();
 +
 +	if (curve_) {
-+		auto start = curve_->gainsFromColourTemperature(kDefaultColourTemperature);
-+		if (start) {
-+			gains = { { static_cast<float>(start->r()), 1.0f,
-+				    static_cast<float>(start->b()) } };
-+			context.activeState.awb.temperatureK = kDefaultColourTemperature;
++		if (haveEstimate_) {
++			/* Where the last stream of the camera ended */
++			gains = lastGains_;
++			context.activeState.awb.temperatureK = lastTemperature_;
++		} else {
++			auto start = curve_->gainsFromColourTemperature(startTemperature_);
++			if (start) {
++				gains = applied(*start);
++				context.activeState.awb.temperatureK = startTemperature_;
++			}
 +		}
++		updateTint(context);
 +	}
 +
 +	return 0;
@@ -4125,6 +4475,8 @@ index 0000000..379de8b
 +{
 +	if (curve_)
 +		curve_->handleControls(controls);
++	if (const auto &v = controls.get(controls::AwbMode))
++		autoMode_ = *v == controls::AwbAuto;
 +
 +	if (const auto &v = controls.get(controls::AwbEnable)) {
 +		enabled_ = *v;
@@ -4142,14 +4494,14 @@ index 0000000..379de8b
 +	if (const auto &v = controls.get(controls::ColourTemperature); v && curve_) {
 +		auto g = curve_->gainsFromColourTemperature(*v);
 +		if (g) {
-+			manualGains_ = RGB<float>({ static_cast<float>(g->r()), 1.0f,
-+						    static_cast<float>(g->b()) });
++			manualGains_ = applied(*g);
 +			manualTemperature_ = *v;
 +		}
 +	}
 +
 +	if (!enabled_ && manualGains_) {
 +		context.activeState.awb.gains = *manualGains_;
++		context.activeState.awb.tint = RGB<float>({ 1.0f, 1.0f, 1.0f });
 +		if (manualTemperature_)
 +			context.activeState.awb.temperatureK = *manualTemperature_;
 +		else
@@ -4167,6 +4519,40 @@ index 0000000..379de8b
 +
 +	frameContext.gains = gains;
 +	params->gains = gains;
++	/* Without a colour matrix the preference goes on the gains */
++	if (!context.ccmEnabled) {
++		const RGB<float> &tint = context.activeState.awb.tint;
++		params->gains = RGB<float>({ gains.r() * tint.r(), gains.g(), gains.b() * tint.b() });
++	}
++}
++
++/* Gains for the module from gains of the curve */
++RGB<float> Awb::applied(const RGB<double> &curveGains) const
++{
++	return RGB<float>({ static_cast<float>(curveGains.r() / sensitivity_.r()), 1.0f,
++			    static_cast<float>(curveGains.b() / sensitivity_.b()) });
++}
++
++/*
++ * Output colour of a neutral surface for the colour temperature of the
++ * moment and the light value of the scene (neutral without a preference,
++ * with fixed gains or another mode than auto)
++ */
++void Awb::updateTint(IPAContext &context) const
++{
++	auto &tint = context.activeState.awb.tint;
++	tint = RGB<float>({ 1.0f, 1.0f, 1.0f });
++	if (!preference_ || !enabled_ || !autoMode_ || !context.activeState.awb.temperatureK)
++		return;
++
++	std::optional<double> lv;
++	const auto &agc = context.activeState.agc;
++	const double t = utils::Duration(context.configuration.agc.lineDuration * agc.exposure).get<std::ratio<1>>();
++	if (agc.valid && t > 0.0 && agc.again > 0.0)
++		lv = lightValue(fNumber_, t, agc.again * agc.digitalGain, agc.levelRatio);
++
++	const RGB<double> p = preference_->tint(context.activeState.awb.temperatureK, lv);
++	tint = RGB<float>({ static_cast<float>(p.r()), 1.0f, static_cast<float>(p.b()) });
 +}
 +
 +/*
@@ -4191,7 +4577,7 @@ index 0000000..379de8b
 +		/* Dark zones are noise, bright ones may be clipped in a channel */
 +		const double lo = std::min({ m.r(), m.g(), m.b() });
 +		const double hi = std::max({ m.r(), m.g(), m.b() });
-+		if (lo < minMean_ || hi > 0.9 * (255.0 - black))
++		if (lo < std::max(minMean_, minSnr_ * blackError_) || hi > 0.9 * (255.0 - black))
 +			continue;
 +
 +		const double r = m.r() / m.g();
@@ -4251,34 +4637,80 @@ index 0000000..379de8b
 +	auto &gains = context.activeState.awb.gains;
 +
 +	if (curve_) {
-+		/* Means on the 8-bit scale, over the sampled pixels */
 +		const double n = std::max<uint64_t>(nPixels, 1);
 +		const RGB<double> means{ { sum.r() / n, sum.g() / n, sum.b() / n } };
 +
-+		if (means.r() < minMean_ || means.g() < minMean_ || means.b() < minMean_) {
-+			LOG(IPAMtkIsp50Awb, Debug) << "Too dark for Awb, means " << means;
-+			return;
++		/*
++		 * Means per unit of exposure, averaged over the window, back in
++		 * the units of this frame
++		 */
++		const double exposure = std::max(frameContext.sensor.exposure * frameContext.sensor.gain, 1e-3);
++		Sample sample;
++		for (unsigned int c = 0; c < 3; c++) {
++			sample.means[c] = means[c] / exposure;
++			sample.randomVariance[c] = (readVariance_ + shotVariance_ * std::max(means[c], 0.0)) /
++						   n / (exposure * exposure);
++		}
++		samples_.push_back(sample);
++		while (samples_.size() > window_)
++			samples_.pop_front();
++
++		RGB<double> avg({ 0.0, 0.0, 0.0 });
++		RGB<double> var({ 0.0, 0.0, 0.0 });
++		for (const Sample &s : samples_) {
++			avg += s.means;
++			var += s.randomVariance;
++		}
++		const double k = static_cast<double>(samples_.size());
++		double snr = 1e9;
++		RGB<double> measured;
++		for (unsigned int c = 0; c < 3; c++) {
++			measured[c] = avg[c] / k * exposure;
++			const double sigma = std::sqrt(blackError_ * blackError_ +
++						       var[c] / (k * k) * exposure * exposure);
++			snr = std::min(snr, sigma > 0.0 ? measured[c] / sigma : 1e9);
++			if (measured[c] < minMean_)
++				snr = 0.0;
 +		}
 +
-+		RGB<double> measured = means;
++		if (snr < lowSnr_) {
++			LOG(IPAMtkIsp50Awb, Debug)
++				<< "Too dark for Awb, means " << means << " window " << measured
++				<< " snr " << snr << ", held";
++			updateTint(context);
++			return;
++		}
++		const double weight = std::min((snr - lowSnr_) / (minSnr_ - lowSnr_), 1.0);
++
 +		unsigned int greyZones = 0;
 +		if (zones_)
 +			greyZones = greyZoneMeans(stats, blackLevel, measured);
 +
++		/* Into the sensitivity of the module of the curve */
++		measured = RGB<double>({ measured.r() / sensitivity_.r(), measured.g(),
++					 measured.b() / sensitivity_.b() });
++
 +		AwbResult result = curve_->calculateAwb(SoftAwbStats(measured, whitePointError_), 0);
-+		const double ct = context.activeState.awb.temperatureK
-+					  ? speed_ * result.colourTemperature +
-+						    (1.0 - speed_) * context.activeState.awb.temperatureK
++		const RGB<float> target = applied(result.gains);
++		/* The first estimate of the camera counts fully */
++		const double speed = haveEstimate_ ? speed_ * weight : 1.0;
++		const double ct = context.activeState.awb.temperatureK && haveEstimate_
++					  ? speed * result.colourTemperature +
++						    (1.0 - speed) * context.activeState.awb.temperatureK
 +					  : result.colourTemperature;
 +		for (unsigned int i = 0; i < 3; i++)
-+			gains[i] = static_cast<float>(speed_ * result.gains[i] +
-+						      (1.0 - speed_) * gains[i]);
++			gains[i] = static_cast<float>(speed * target[i] + (1.0 - speed) * gains[i]);
 +		context.activeState.awb.temperatureK = std::lround(ct);
++		haveEstimate_ = true;
++		lastGains_ = gains;
++		lastTemperature_ = context.activeState.awb.temperatureK;
++		updateTint(context);
 +		LOG(IPAMtkIsp50Awb, Debug)
-+			<< "means " << measured << " (" << greyZones << " grey zones) curve gains "
-+			<< result.gains
++			<< "means " << means << " window " << measured << " snr " << snr
++			<< " (" << greyZones << " grey zones) curve gains " << result.gains
 +			<< " ct " << result.colourTemperature << " -> gains " << gains
-+			<< " ct " << context.activeState.awb.temperatureK;
++			<< " ct " << context.activeState.awb.temperatureK
++			<< " tint " << context.activeState.awb.tint;
 +	} else {
 +		/*
 +		 * Calculate red and blue gains for AWB.
@@ -4311,10 +4743,10 @@ index 0000000..379de8b
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/awb.h b/src/ipa/mtkisp50/algorithms/awb.h
 new file mode 100644
-index 0000000..28fee45
+index 0000000..7ac4227
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/awb.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,97 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024-2025 Red Hat Inc.
@@ -4324,12 +4756,13 @@ index 0000000..28fee45
 +
 +#pragma once
 +
-+#include <optional>
-+
++#include <deque>
 +#include <memory>
++#include <optional>
 +#include <utility>
 +#include <vector>
 +
++#include "mtkisp50/awb_preference.h"
 +#include "mtkisp50/statistics.h"
 +#include "libcamera/internal/vector.h"
 +
@@ -4363,13 +4796,40 @@ index 0000000..28fee45
 +		     ControlList &metadata) override;
 +
 +private:
++	/* Channel means of a statistics frame per unit of exposure (lines x gain) */
++	struct Sample {
++		RGB<double> means;
++		RGB<double> randomVariance;
++	};
++
 +	unsigned int greyZoneMeans(const Statistics *stats, double black,
 +				   RGB<double> &means) const;
++	void updateTint(IPAContext &context) const;
++	RGB<float> applied(const RGB<double> &curveGains) const;
 +
 +	/* Search along the colour temperature curve, nullptr for grey world */
 +	std::unique_ptr<AwbAlgorithm> curve_;
 +	double speed_ = 1.0;
-+	double minMean_ = 2.0;
++	double minMean_ = 0.0;
++	/* Confidence of the channel means: signal to noise ratio */
++	double minSnr_ = 4.0;
++	double lowSnr_ = 1.5;
++	double blackError_ = 0.25;
++	double readVariance_ = 0.12;
++	double shotVariance_ = 0.06;
++	unsigned int window_ = 4;
++	std::deque<Sample> samples_;
++	/* Sensitivity of the module relative to the curve (R/G, B/G) */
++	RGB<double> sensitivity_ = RGB<double>({ 1.0, 1.0, 1.0 });
++	double startTemperature_ = 5000.0;
++	/* Last estimate, kept over configurations of the camera */
++	bool haveEstimate_ = false;
++	RGB<float> lastGains_ = RGB<float>({ 1.0, 1.0, 1.0 });
++	unsigned int lastTemperature_ = 0;
++	/* Rendering of warm light */
++	std::optional<AwbPreference> preference_;
++	double fNumber_ = 2.0;
++	bool autoMode_ = true;
 +	bool whitePointError_ = false;
 +	bool zones_ = false;
 +	double greyDistance_ = 0.02;
@@ -4564,10 +5024,10 @@ index 0000000..5d235a9
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/ccm.cpp b/src/ipa/mtkisp50/algorithms/ccm.cpp
 new file mode 100644
-index 0000000..5cf68e9
+index 0000000..5addc73
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/ccm.cpp
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,138 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024, Ideas On Board
@@ -4577,6 +5037,9 @@ index 0000000..5cf68e9
 + */
 +
 +#include "ccm.h"
++
++#include <algorithm>
++#include <cmath>
 +
 +#include <libcamera/base/log.h>
 +#include <libcamera/base/utils.h>
@@ -4597,6 +5060,18 @@ index 0000000..5cf68e9
 +
 +LOG_DEFINE_CATEGORY(IPAMtkIsp50Ccm)
 +
++/*
++ * Tuning: "ccms", matrices over the colour temperature; optionally
++ * "strength", the share of the matrix over the sensitivity of the frame:
++ * "iso" rising, "value" 0.0 (identity) to 1.0 (the matrix), linear in the
++ * logarithm of the ISO and held beyond the ends, ISO = "isoPerGain" (default
++ * 100) x analogue x digital gain. At high gain a weaker matrix amplifies the
++ * noise and errors of the colour estimate less. The neutral colour stays (the
++ * rows of the matrices sum to one).
++ *
++ * After the matrix the output colour of a neutral surface (Awb preference,
++ * activeState.awb.tint) is applied.
++ */
 +int Ccm::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
 +{
 +	int ret = ccm_.readYaml(tuningData["ccms"], "ct", "ccm");
@@ -4604,6 +5079,24 @@ index 0000000..5cf68e9
 +		LOG(IPAMtkIsp50Ccm, Error)
 +			<< "Failed to parse 'ccm' parameter from tuning file.";
 +		return ret;
++	}
++
++	if (tuningData.contains("strength")) {
++		const ValueNode &st = tuningData["strength"];
++		auto iso = st["iso"].get<std::vector<double>>();
++		auto value = st["value"].get<std::vector<double>>();
++		isoPerGain_ = st["isoPerGain"].get<double>(100.0);
++		bool ok = iso && value && !iso->empty() && iso->size() == value->size() && isoPerGain_ > 0.0;
++		for (unsigned int i = 0; ok && i < iso->size(); i++) {
++			ok = (*iso)[i] > 0.0 && (i == 0 || (*iso)[i] > (*iso)[i - 1]) &&
++			     (*value)[i] >= 0.0 && (*value)[i] <= 1.0;
++		}
++		if (!ok) {
++			LOG(IPAMtkIsp50Ccm, Error) << "Invalid Ccm strength";
++			return -EINVAL;
++		}
++		strengthIso_ = *iso;
++		strengthValue_ = *value;
 +	}
 +
 +	context.ccmEnabled = true;
@@ -4623,9 +5116,40 @@ index 0000000..5cf68e9
 +		lastCt_ = ct;
 +	}
 +
-+	context.activeState.combinedMatrix =
-+		currentCcm_.value() * context.activeState.combinedMatrix;
-+	frameContext.ccm = currentCcm_.value();
++	Matrix<float, 3, 3> m = currentCcm_.value();
++	const float s = strength(context);
++	if (s < 1.0f) {
++		const Matrix<float, 3, 3> identity = Matrix<float, 3, 3>::identity();
++		m = m * s + identity * (1.0f - s);
++	}
++
++	const RGB<float> &tint = context.activeState.awb.tint;
++	for (unsigned int c = 0; c < 3; c++)
++		m[0][c] *= tint.r();
++	for (unsigned int c = 0; c < 3; c++)
++		m[2][c] *= tint.b();
++
++	context.activeState.combinedMatrix = m * context.activeState.combinedMatrix;
++	frameContext.ccm = m;
++}
++
++float Ccm::strength(const IPAContext &context) const
++{
++	if (strengthIso_.empty())
++		return 1.0f;
++
++	const auto &agc = context.activeState.agc;
++	const double iso = isoPerGain_ * std::max(agc.again * agc.digitalGain, 1e-3);
++	if (iso <= strengthIso_.front())
++		return strengthValue_.front();
++	if (iso >= strengthIso_.back())
++		return strengthValue_.back();
++
++	unsigned int i = 0;
++	while (iso > strengthIso_[i + 1])
++		i++;
++	const double w = std::log(iso / strengthIso_[i]) / std::log(strengthIso_[i + 1] / strengthIso_[i]);
++	return static_cast<float>(strengthValue_[i] + w * (strengthValue_[i + 1] - strengthValue_[i]));
 +}
 +
 +void Ccm::process([[maybe_unused]] IPAContext &context,
@@ -4644,10 +5168,10 @@ index 0000000..5cf68e9
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/ccm.h b/src/ipa/mtkisp50/algorithms/ccm.h
 new file mode 100644
-index 0000000..e33f3f2
+index 0000000..8832f44
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/ccm.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,54 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024-2026, Red Hat Inc.
@@ -4662,6 +5186,8 @@ index 0000000..e33f3f2
 +#include "libcamera/internal/matrix.h"
 +
 +#include <libipa/interpolator.h>
++
++#include <vector>
 +
 +#include "algorithm.h"
 +
@@ -4686,7 +5212,13 @@ index 0000000..e33f3f2
 +		     ControlList &metadata) override;
 +
 +private:
++	float strength(const IPAContext &context) const;
++
 +	unsigned int lastCt_;
++	/* Strength of the matrix over the sensitivity (ISO = isoPerGain x gain) */
++	std::vector<double> strengthIso_;
++	std::vector<double> strengthValue_;
++	double isoPerGain_ = 100.0;
 +	Interpolator<Matrix<float, 3, 3>> ccm_;
 +	std::optional<Matrix<float, 3, 3>> currentCcm_;
 +};
@@ -4911,6 +5443,241 @@ index 0000000..52df142
 +    'ccm.cpp',
 +    'dip_tuning.cpp',
 +])
+diff --git a/src/ipa/mtkisp50/awb_preference.cpp b/src/ipa/mtkisp50/awb_preference.cpp
+new file mode 100644
+index 0000000..6f71e13
+--- /dev/null
++++ b/src/ipa/mtkisp50/awb_preference.cpp
+@@ -0,0 +1,160 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Rendering of the white of warm light
++ */
++
++#include "awb_preference.h"
++
++#include <algorithm>
++#include <cmath>
++
++#include <libcamera/base/log.h>
++
++#include "libcamera/internal/value_node.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(IPAMtkIsp50AwbPreference)
++
++namespace ipa::mtkisp50 {
++
++namespace {
++
++std::optional<std::vector<double>> numbers(const ValueNode &node)
++{
++	if (!node.isList())
++		return std::nullopt;
++
++	std::vector<double> out;
++	for (const ValueNode &v : node.asList()) {
++		std::optional<double> d = v.get<double>();
++		if (!d)
++			return std::nullopt;
++		out.push_back(*d);
++	}
++	return out;
++}
++
++bool rising(const std::vector<double> &v)
++{
++	for (unsigned int i = 1; i < v.size(); i++) {
++		if (!(v[i] > v[i - 1]))
++			return false;
++	}
++	return !v.empty();
++}
++
++/* Index of the lower point and weight of the upper one, ends held */
++std::pair<unsigned int, double> locate(const std::vector<double> &x, double v)
++{
++	if (x.size() == 1 || v <= x.front())
++		return { 0, 0.0 };
++	if (v >= x.back())
++		return { static_cast<unsigned int>(x.size() - 2), 1.0 };
++
++	unsigned int i = 0;
++	while (v > x[i + 1])
++		i++;
++	return { i, (v - x[i]) / (x[i + 1] - x[i]) };
++}
++
++} /* namespace */
++
++std::optional<AwbPreference> AwbPreference::fromTuning(const ValueNode &node)
++{
++	AwbPreference p;
++
++	auto ct = numbers(node["ct"]);
++	if (!ct || !rising(*ct) || !((*ct)[0] > 0.0)) {
++		LOG(IPAMtkIsp50AwbPreference, Error) << "preference: ct missing or not rising";
++		return std::nullopt;
++	}
++	p.ct_ = *ct;
++
++	if (node.contains("lv")) {
++		auto lv = numbers(node["lv"]);
++		if (!lv || !rising(*lv)) {
++			LOG(IPAMtkIsp50AwbPreference, Error) << "preference: lv not rising";
++			return std::nullopt;
++		}
++		p.lv_ = *lv;
++	}
++
++	const unsigned int rows = std::max<std::size_t>(p.lv_.size(), 1);
++	auto table = [&](const char *key, std::vector<std::vector<double>> &out) {
++		const ValueNode &n = node[key];
++		if (!n.isList())
++			return false;
++		if (p.lv_.empty()) {
++			auto r = numbers(n);
++			if (!r)
++				return false;
++			out.push_back(*r);
++		} else {
++			for (const ValueNode &row : n.asList()) {
++				auto r = numbers(row);
++				if (!r)
++					return false;
++				out.push_back(*r);
++			}
++		}
++		if (out.size() != rows)
++			return false;
++		for (const auto &r : out) {
++			if (r.size() != p.ct_.size() ||
++			    std::any_of(r.begin(), r.end(), [](double v) { return !(v > 0.05 && v < 20.0); }))
++				return false;
++		}
++		return true;
++	};
++
++	if (!table("rg", p.rg_) || !table("bg", p.bg_)) {
++		LOG(IPAMtkIsp50AwbPreference, Error)
++			<< "preference: rg and bg need one list per lv with one value (0.05..20) per ct";
++		return std::nullopt;
++	}
++
++	return p;
++}
++
++double AwbPreference::value(const std::vector<std::vector<double>> &rows, double temperatureK,
++			    std::optional<double> lightValue) const
++{
++	/* Linear in mired: mired falls with the temperature, use -mired */
++	std::vector<double> negMired;
++	for (double ct : ct_)
++		negMired.push_back(-1e6 / ct);
++	const auto [ci, cw] = locate(negMired, -1e6 / std::max(temperatureK, 1.0));
++
++	auto rowValue = [&](const std::vector<double> &row) {
++		if (row.size() == 1)
++			return std::log(row[0]);
++		return (1.0 - cw) * std::log(row[ci]) + cw * std::log(row[ci + 1]);
++	};
++
++	if (lv_.empty())
++		return std::exp(rowValue(rows[0]));
++
++	/* Without a light value the dimmest row */
++	const auto [li, lw] = lightValue ? locate(lv_, *lightValue)
++					 : std::pair<unsigned int, double>(0, 0.0);
++	const double lo = rowValue(rows[li]);
++	const double hi = rows.size() > 1 ? rowValue(rows[li + 1]) : lo;
++	return std::exp(lo + lw * (hi - lo));
++}
++
++RGB<double> AwbPreference::tint(double temperatureK, std::optional<double> lightValue) const
++{
++	return RGB<double>({ value(rg_, temperatureK, lightValue), 1.0,
++			     value(bg_, temperatureK, lightValue) });
++}
++
++double lightValue(double fNumber, double exposureTime, double gain, double levelRatio)
++{
++	return std::log2(fNumber * fNumber / std::max(exposureTime, 1e-6)) -
++	       std::log2(std::max(gain, 1e-3)) + std::log2(std::max(levelRatio, 1e-6));
++}
++
++} /* namespace ipa::mtkisp50 */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/mtkisp50/awb_preference.h b/src/ipa/mtkisp50/awb_preference.h
+new file mode 100644
+index 0000000..6fee438
+--- /dev/null
++++ b/src/ipa/mtkisp50/awb_preference.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Rendering of the white of warm light
++ */
++
++#pragma once
++
++#include <optional>
++#include <vector>
++
++#include "libcamera/internal/vector.h"
++
++namespace libcamera {
++
++class ValueNode;
++
++namespace ipa::mtkisp50 {
++
++/*
++ * A neutral surface under warm light is not rendered fully neutral: the
++ * colour of the light stays partly visible, more so in dim scenes. The
++ * preference gives the colour a neutral surface keeps, as R/G and B/G of the
++ * output (linear, after the colour matrix), over the colour temperature of the
++ * estimated light and the light value of the scene.
++ */
++class AwbPreference
++{
++public:
++	/*
++	 * Tuning keys: "ct", rising colour temperatures; "rg" and "bg", one
++	 * list per entry of "lv" (rising light values; one list without
++	 * "lv"), one value per colour temperature. Interpolation is linear
++	 * in mired and in the light value, on the logarithm of the values,
++	 * and the ends are held.
++	 */
++	static std::optional<AwbPreference> fromTuning(const ValueNode &node);
++
++	/* Output colour of a neutral surface, R/G and B/G (green 1.0) */
++	RGB<double> tint(double temperatureK, std::optional<double> lightValue) const;
++
++private:
++	AwbPreference() = default;
++
++	double value(const std::vector<std::vector<double>> &rows, double temperatureK,
++		     std::optional<double> lightValue) const;
++
++	std::vector<double> ct_;
++	std::vector<double> lv_;
++	std::vector<std::vector<double>> rg_;
++	std::vector<std::vector<double>> bg_;
++};
++
++/*
++ * Light value of a scene exposed with an exposure time in seconds and a total
++ * gain (ISO 100 at a gain of 1.0), and the ratio of the measured level to the
++ * level the exposure aims at (1.0 when the regulation reached its target):
++ * log2(fNumber^2 / time) - log2(gain) + log2(level ratio)
++ */
++double lightValue(double fNumber, double exposureTime, double gain, double levelRatio = 1.0);
++
++} /* namespace ipa::mtkisp50 */
++
++} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/data/meson.build b/src/ipa/mtkisp50/data/meson.build
 new file mode 100644
 index 0000000..12e7c25
@@ -4949,10 +5716,10 @@ index 0000000..3b6f580
 +...
 diff --git a/src/ipa/mtkisp50/dip_params.cpp b/src/ipa/mtkisp50/dip_params.cpp
 new file mode 100644
-index 0000000..f36ae24
+index 0000000..aeabba0
 --- /dev/null
 +++ b/src/ipa/mtkisp50/dip_params.cpp
-@@ -0,0 +1,1101 @@
+@@ -0,0 +1,1130 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Translation of the frame parameters of the mtkisp50 IPA into MT6785 DIP
@@ -5655,6 +6422,11 @@ index 0000000..f36ae24
 + * flip at the middle between two points. The blocks are not interpolated
 + * between points: they contain switches, selections and curve points with
 + * their slopes, for which a mean is no valid setting.
++ *
++ * Optional sections "video" and "still" hold points of their own (key
++ * "points") for the jobs of video streams and of still images; jobs without
++ * such a set take "points". A module used in any set is sent for every job;
++ * a point without it disables it.
 + */
 +
 +/**
@@ -5673,78 +6445,101 @@ index 0000000..f36ae24
 +		return std::nullopt;
 +	}
 +
-+	const ValueNode &points = node["points"];
++	if (!parsePoints(node["points"], table.sets_[0], table))
++		return std::nullopt;
++
++	/* Optional sets of video and still image jobs */
++	static constexpr const char *names[] = { nullptr, "video", "still" };
++	for (unsigned int set = 1; set < kSets; set++) {
++		if (!node.contains(names[set]))
++			continue;
++		if (!parsePoints(node[names[set]]["points"], table.sets_[set], table))
++			return std::nullopt;
++	}
++
++	return table;
++}
++
++bool QualityTable::parsePoints(const ValueNode &points, std::vector<QualityPoint> &out,
++			       QualityTable &table)
++{
 +	if (!points.isList() || points.asList().begin() == points.asList().end()) {
 +		LOG(IPAMtkIsp50Dip, Error) << "mtk-dip quality: no points";
-+		return std::nullopt;
++		return false;
 +	}
 +
 +	for (const ValueNode &p : points.asList()) {
 +		QualityPoint point;
 +		point.iso = p["iso"].get<double>(0.0);
-+		if (!(point.iso > 0.0) ||
-+		    (!table.points_.empty() && !(point.iso > table.points_.back().iso))) {
++		if (!(point.iso > 0.0) || (!out.empty() && !(point.iso > out.back().iso))) {
 +			LOG(IPAMtkIsp50Dip, Error) << "mtk-dip quality: iso missing or not rising";
-+			return std::nullopt;
++			return false;
 +		}
 +
 +		if (p.contains("ee")) {
 +			point.ee = parseBlock<struct mtk_dip_params_ee>(p["ee"], MTK_DIP_PARAMS_BLOCK_EE,
 +									  kEeFields, "ee");
 +			if (!point.ee)
-+				return std::nullopt;
++				return false;
 +			table.usesEe_ = true;
 +		}
 +		if (p.contains("ycnr")) {
 +			point.ycnr = parseBlock<struct mtk_dip_params_ycnr>(p["ycnr"], MTK_DIP_PARAMS_BLOCK_YCNR,
 +									      kYcnrFields, "ycnr");
 +			if (!point.ycnr)
-+				return std::nullopt;
++				return false;
 +			table.usesYcnr_ = true;
 +		}
 +		if (p.contains("demosaic")) {
 +			point.demosaic = parseBlock<struct mtk_dip_params_demosaic>(
 +				p["demosaic"], MTK_DIP_PARAMS_BLOCK_DEMOSAIC, kDemosaicFields, "demosaic");
 +			if (!point.demosaic)
-+				return std::nullopt;
++				return false;
 +			table.usesDemosaic_ = true;
 +		}
 +		if (p.contains("nbc2")) {
 +			point.nbc2 = parseBlock<struct mtk_dip_params_nbc2>(p["nbc2"], MTK_DIP_PARAMS_BLOCK_NBC2,
 +									      kNbc2Fields, "nbc2");
 +			if (!point.nbc2)
-+				return std::nullopt;
++				return false;
 +			table.usesNbc2_ = true;
 +		}
 +
-+		table.points_.push_back(std::move(point));
++		out.push_back(std::move(point));
 +	}
 +
-+	return table;
++	return true;
 +}
 +
 +/**
 + * \brief Select the point for a frame
 + * \param[in] totalGain Analogue times digital gain of the frame
++ * \param[in] set The set of the job (0 preview, 1 video, 2 still image), the
++ * preview set if the tuning has no such set
 + * \return The point to use
 + */
-+const QualityPoint &QualityTable::select(float totalGain)
++const QualityPoint &QualityTable::select(float totalGain, unsigned int set)
 +{
++	if (!hasSet(set))
++		set = 0;
++
++	const std::vector<QualityPoint> &points = sets_[set];
++	std::optional<unsigned int> &current = current_[set];
 +	const double iso = isoPerGain_ * std::max(totalGain, 1e-3f);
 +	auto distance = [&](unsigned int i) {
-+		return std::abs(std::log2(iso / points_[i].iso));
++		return std::abs(std::log2(iso / points[i].iso));
 +	};
 +
 +	unsigned int best = 0;
-+	for (unsigned int i = 1; i < points_.size(); i++) {
++	for (unsigned int i = 1; i < points.size(); i++) {
 +		if (distance(i) < distance(best))
 +			best = i;
 +	}
 +
-+	if (!current_ || (best != *current_ && distance(*current_) - distance(best) > hysteresis_))
-+		current_ = best;
++	if (!current || (best != *current && distance(*current) - distance(best) > hysteresis_))
++		current = best;
 +
-+	return points_[*current_];
++	return points[*current];
 +}
 +
 +/**
@@ -5752,8 +6547,9 @@ index 0000000..f36ae24
 + */
 +void QualityTable::dropNbc2()
 +{
-+	for (QualityPoint &point : points_)
-+		point.nbc2.reset();
++	for (auto &points : sets_)
++		for (QualityPoint &point : points)
++			point.nbc2.reset();
 +	usesNbc2_ = false;
 +}
 +
@@ -5919,7 +6715,7 @@ index 0000000..f36ae24
 +	 * has, i.e. when the point changes and after reset().
 +	 */
 +	if (quality_) {
-+		const QualityPoint &point = quality_->select(params.totalGain);
++		const QualityPoint &point = quality_->select(params.totalGain, params.useCase);
 +
 +		if (quality_->usesEe())
 +			pending_[MTK_DIP_PARAMS_BLOCK_EE] = qualityBytes(point.ee, MTK_DIP_PARAMS_BLOCK_EE);
@@ -6056,10 +6852,10 @@ index 0000000..f36ae24
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/dip_params.h b/src/ipa/mtkisp50/dip_params.h
 new file mode 100644
-index 0000000..1ae460c
+index 0000000..ae10df0
 --- /dev/null
 +++ b/src/ipa/mtkisp50/dip_params.h
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,241 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Translation of the frame parameters of the mtkisp50 IPA into MT6785 DIP
@@ -6104,6 +6900,11 @@ index 0000000..1ae460c
 +	RGB<float> gains = RGB<float>({ 1.0, 1.0, 1.0 });
 +	/* Analogue times digital gain of the frame, for gain dependent tuning */
 +	float totalGain = 1.0;
++	/*
++	 * What the job of the frame makes (UseCase: preview, video, still
++	 * image), selects the set of the image quality blocks
++	 */
++	uint8_t useCase = 0;
 +
 +	/* Statistics wanted for the coming frames (see StatsConfig) */
 +	uint8_t statsInterval = 0;
@@ -6217,10 +7018,14 @@ index 0000000..1ae460c
 +class QualityTable
 +{
 +public:
++	/* Sets of points: preview (the default), video, still image */
++	static constexpr unsigned int kSets = 3;
++
 +	static std::optional<QualityTable> fromTuning(const ValueNode &node);
 +
-+	const QualityPoint &select(float totalGain);
-+	std::size_t size() const { return points_.size(); }
++	const QualityPoint &select(float totalGain, unsigned int set = 0);
++	std::size_t size() const { return sets_[0].size(); }
++	bool hasSet(unsigned int set) const { return set < kSets && !sets_[set].empty(); }
 +	double isoPerGain() const { return isoPerGain_; }
 +
 +	bool usesEe() const { return usesEe_; }
@@ -6232,10 +7037,14 @@ index 0000000..1ae460c
 +private:
 +	QualityTable() = default;
 +
-+	std::vector<QualityPoint> points_;
++	static bool parsePoints(const ValueNode &points, std::vector<QualityPoint> &out,
++				QualityTable &table);
++
++	/* Points of the sets, the first one is points_ */
++	std::array<std::vector<QualityPoint>, kSets> sets_;
 +	double isoPerGain_ = 100.0;
 +	double hysteresis_ = 0.25;
-+	std::optional<unsigned int> current_;
++	std::array<std::optional<unsigned int>, kSets> current_;
 +	bool usesEe_ = false;
 +	bool usesYcnr_ = false;
 +	bool usesDemosaic_ = false;
@@ -6283,6 +7092,204 @@ index 0000000..1ae460c
 +	float shadowLift_ = 0.0f;
 +	std::optional<LensShading> lensShading_;
 +	std::optional<QualityTable> quality_;
++};
++
++} /* namespace ipa::mtkisp50 */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/mtkisp50/exposure_program.cpp b/src/ipa/mtkisp50/exposure_program.cpp
+new file mode 100644
+index 0000000..3e4af15
+--- /dev/null
++++ b/src/ipa/mtkisp50/exposure_program.cpp
+@@ -0,0 +1,120 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Exposure program: how a total exposure is split into exposure time,
++ * analogue gain and digital gain
++ */
++
++#include "exposure_program.h"
++
++#include <algorithm>
++
++#include <libcamera/base/log.h>
++
++#include "libcamera/internal/value_node.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(IPAMtkIsp50Program)
++
++namespace ipa::mtkisp50 {
++
++namespace {
++
++/* A stage up to 2 % longer than the longest exposure still counts */
++constexpr double kStageTolerance = 1.02;
++
++} /* namespace */
++
++std::optional<ExposureProgram> ExposureProgram::fromStages(std::vector<Stage> stages)
++{
++	if (stages.empty())
++		return std::nullopt;
++
++	for (unsigned int i = 0; i < stages.size(); i++) {
++		const Stage &s = stages[i];
++		if (!(s.time > 0.0) || !(s.gain >= 1.0))
++			return std::nullopt;
++		if (i && (!(s.time > stages[i - 1].time) ||
++			  !(s.time * s.gain > stages[i - 1].time * stages[i - 1].gain)))
++			return std::nullopt;
++	}
++
++	ExposureProgram p;
++	p.stages_ = std::move(stages);
++	return p;
++}
++
++std::optional<ExposureProgram> ExposureProgram::fromTuning(const ValueNode &node)
++{
++	if (!node.isList()) {
++		LOG(IPAMtkIsp50Program, Error) << "Exposure program is not a list";
++		return std::nullopt;
++	}
++
++	std::vector<Stage> stages;
++	for (const ValueNode &p : node.asList()) {
++		auto v = p.get<std::vector<double>>();
++		if (!v || v->size() != 2) {
++			LOG(IPAMtkIsp50Program, Error) << "Exposure program stage is not [time, gain]";
++			return std::nullopt;
++		}
++		stages.push_back({ (*v)[0], (*v)[1] });
++	}
++
++	auto program = fromStages(std::move(stages));
++	if (!program)
++		LOG(IPAMtkIsp50Program, Error)
++			<< "Exposure program: times and time x gain must rise, gains at least 1.0";
++	return program;
++}
++
++ExposureProgram::Split ExposureProgram::split(double total, double minTime, double maxTime,
++					      double againMin, double againMax,
++					      double dgainMax) const
++{
++	againMin = std::max(againMin, 1e-3);
++	againMax = std::max(againMax, againMin);
++	dgainMax = std::max(dgainMax, 1.0);
++	maxTime = std::max(maxTime, minTime);
++
++	double time = maxTime;
++	double prev = 0.0;
++	bool found = false;
++
++	for (const Stage &stage : stages_) {
++		/* A stage just beyond the limit (frame length rounding) takes the limit */
++		if (stage.time > maxTime * kStageTolerance)
++			break;
++		const double t = std::min(stage.time, maxTime);
++		prev = t;
++
++		/* Not yet the time of this stage at the smallest gain */
++		if (total < t * againMin) {
++			time = total / againMin;
++			found = true;
++			break;
++		}
++		if (total <= t * stage.gain) {
++			time = t;
++			found = true;
++			break;
++		}
++	}
++
++	if (!found) {
++		/* Beyond the stages within the limit: their last time, or the limit */
++		time = prev > 0.0 ? prev : maxTime;
++		if (total < time * againMin)
++			time = total / againMin;
++	}
++
++	time = std::clamp(time, minTime, maxTime);
++
++	const double gain = std::clamp(total / time, againMin, againMax * dgainMax);
++	const double again = std::min(gain, againMax);
++	return { time, again, std::max(gain / again, 1.0) };
++}
++
++} /* namespace ipa::mtkisp50 */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/mtkisp50/exposure_program.h b/src/ipa/mtkisp50/exposure_program.h
+new file mode 100644
+index 0000000..0061d86
+--- /dev/null
++++ b/src/ipa/mtkisp50/exposure_program.h
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Exposure program: how a total exposure is split into exposure time,
++ * analogue gain and digital gain
++ */
++
++#pragma once
++
++#include <optional>
++#include <vector>
++
++namespace libcamera {
++
++class ValueNode;
++
++namespace ipa::mtkisp50 {
++
++/*
++ * A list of stages, each an exposure time and the largest total gain
++ * (analogue times digital) used at that time. A total exposure (time in
++ * microseconds times gain) takes the first stage that reaches it: the time
++ * of that stage and the gain the rest needs. Below the first stage the time
++ * shrinks at the smallest gain. Stage times that are multiples of the period
++ * of the mains flicker (10 ms at 50 Hz) keep longer exposures free of it.
++ * The analogue gain is used up first, the digital gain takes the rest.
++ *
++ * A longest exposure time (frame durations of the application, autofocus)
++ * drops the stages beyond it: the time is then that of the last stage within
++ * it (or the limit itself if no stage is), the gain takes the rest. A stage
++ * up to 2 % beyond the limit is shortened to it (the longest frame of a mode
++ * may end just short of a stage).
++ */
++class ExposureProgram
++{
++public:
++	struct Stage {
++		double time;
++		double gain;
++	};
++
++	struct Split {
++		double time;
++		double again;
++		double dgain;
++	};
++
++	/* A list of [time in us, total gain] pairs, times and products rising */
++	static std::optional<ExposureProgram> fromTuning(const ValueNode &node);
++	static std::optional<ExposureProgram> fromStages(std::vector<Stage> stages);
++
++	Split split(double total, double minTime, double maxTime, double againMin,
++		    double againMax, double dgainMax) const;
++
++	/* Largest total gain of the program (the gain of the last stage) */
++	double maxGain() const { return stages_.back().gain; }
++	const std::vector<Stage> &stages() const { return stages_; }
++
++private:
++	ExposureProgram() = default;
++
++	std::vector<Stage> stages_;
 +};
 +
 +} /* namespace ipa::mtkisp50 */
@@ -6470,10 +7477,10 @@ index 0000000..9958d5f
 +} /* namespace libcamera::ipa::mtkisp50 */
 diff --git a/src/ipa/mtkisp50/ipa_context.h b/src/ipa/mtkisp50/ipa_context.h
 new file mode 100644
-index 0000000..64a08a0
+index 0000000..a2bdab8
 --- /dev/null
 +++ b/src/ipa/mtkisp50/ipa_context.h
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,160 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2024-2026 Red Hat, Inc.
@@ -6550,6 +7557,12 @@ index 0000000..64a08a0
 +		int32_t exposureLimit;
 +		/* Shortest frame length of the application, 0 for none */
 +		int32_t minFrameLines;
++		/*
++		 * Measured level over the base target of the last statistics
++		 * frame (1.0 when the regulation reached its base target), for
++		 * the light value of the scene
++		 */
++		double levelRatio = 1.0;
 +	} agc;
 +
 +	struct {
@@ -6561,6 +7574,11 @@ index 0000000..64a08a0
 +	struct {
 +		RGB<float> gains;
 +		unsigned int temperatureK;
++		/*
++		 * Output colour of a neutral surface (R/G, B/G), applied after
++		 * the colour matrix: the preference for warm light
++		 */
++		RGB<float> tint = RGB<float>({ 1.0f, 1.0f, 1.0f });
 +	} awb;
 +
 +	Matrix<float, 3, 3> combinedMatrix;
@@ -6625,10 +7643,10 @@ index 0000000..64a08a0
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/meson.build b/src/ipa/mtkisp50/meson.build
 new file mode 100644
-index 0000000..a28b2e8
+index 0000000..79177bb
 --- /dev/null
 +++ b/src/ipa/mtkisp50/meson.build
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,35 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +subdir('algorithms')
@@ -6637,7 +7655,9 @@ index 0000000..a28b2e8
 +ipa_name = 'ipa_mtkisp50'
 +
 +mtkisp50_ipa_sources = files([
++    'awb_preference.cpp',
 +    'dip_params.cpp',
++    'exposure_program.cpp',
 +    'ipa_context.cpp',
 +    'mtkisp50.cpp',
 +    'statistics.cpp',
@@ -6700,10 +7720,10 @@ index 0000000..e38120a
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/mtkisp50.cpp b/src/ipa/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..7ed86e5
+index 0000000..11038a5
 --- /dev/null
 +++ b/src/ipa/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,619 @@
+@@ -0,0 +1,622 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2023, Linaro Ltd
@@ -6777,7 +7797,8 @@ index 0000000..7ed86e5
 +	void unmapBuffers(const std::vector<unsigned int> &ids) override;
 +
 +	void queueRequest(const uint32_t frame, const ControlList &controls) override;
-+	void computeParams(const uint32_t frame, const uint32_t paramsBufferId) override;
++	void computeParams(const uint32_t frame, const uint32_t paramsBufferId,
++			   const UseCase jobUse) override;
 +	void processStats(const uint32_t frame, const uint32_t statsBufferId,
 +			  const ControlList &sensorControls) override;
 +
@@ -7160,7 +8181,8 @@ index 0000000..7ed86e5
 +		algo->queueRequest(context_, frame, frameContext, controls);
 +}
 +
-+void IPAMtkIsp50::computeParams(const uint32_t frame, const uint32_t paramsBufferId)
++void IPAMtkIsp50::computeParams(const uint32_t frame, const uint32_t paramsBufferId,
++				const UseCase jobUse)
 +{
 +	context_.activeState.combinedMatrix = Matrix<float, 3, 3>::identity();
 +
@@ -7173,6 +8195,7 @@ index 0000000..7ed86e5
 +						    : Statistics::kFramesPerStats;
 +	params_.statsLinePairStep = statsLinePairStep_;
 +	params_.statsBlockStep = statsBlockStep_;
++	params_.useCase = static_cast<uint8_t>(jobUse);
 +	for (const auto &algo : algorithms())
 +		algo->prepare(context_, frame, frameContext, &params_);
 +	params_.combinedMatrix = context_.activeState.combinedMatrix;
@@ -8096,10 +9119,10 @@ index 0000000..0d69354
 +])
 diff --git a/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..2499557
+index 0000000..5ecba84
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,2552 @@
+@@ -0,0 +1,2569 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the MediaTek MT6785 camera subsystem with the ISP pass 2
@@ -8543,6 +9566,12 @@ index 0000000..2499557
 +	Rectangle scalerCrop_;
 +	/* Outputs of the ISP in the configuration (mask) */
 +	unsigned int outputs_ = 0;
++	/*
++	 * The last generated configuration had a video stream; use of the
++	 * configured session (selects tuning sets and exposure program)
++	 */
++	bool videoRoles_ = false;
++	ipa::mtkisp50::UseCase useCase_ = ipa::mtkisp50::UseCase::Preview;
 +	bool rawActive_ = false;
 +	/* runIspJobs() is on the stack */
 +	bool ispRunning_ = false;
@@ -9396,6 +10425,7 @@ index 0000000..2499557
 +	bool haveRaw = false;
 +	bool haveStill = false;
 +	bool haveVideo = false;
++	data->videoRoles_ = false;
 +	for (const StreamRole role : roles) {
 +		const bool raw = role == StreamRole::Raw || !data->ispAvailable_;
 +		if (raw) {
@@ -9414,6 +10444,7 @@ index 0000000..2499557
 +		}
 +		haveStill |= role == StreamRole::StillCapture;
 +		haveVideo |= role == StreamRole::VideoRecording;
++		data->videoRoles_ = haveVideo;
 +	}
 +
 +	/*
@@ -9738,9 +10769,11 @@ index 0000000..2499557
 +	ipaConfig.ispCrop = data->crop_;
 +	ipaConfig.bayerOrder = bayer.order;
 +	ipaConfig.bitDepth = bayer.bitDepth;
-+	ipaConfig.useCase = ipa::mtkisp50::UseCase::Preview;
++	ipaConfig.useCase = data->videoRoles_ ? ipa::mtkisp50::UseCase::Video
++					      : ipa::mtkisp50::UseCase::Preview;
 +	if (outCfg && outCfg->size == data->sensor_->resolution())
 +		ipaConfig.useCase = ipa::mtkisp50::UseCase::Still;
++	data->useCase_ = ipaConfig.useCase;
 +
 +	LOG(MtkIsp50, Debug)
 +		<< "Sensor " << data->sensorFormat_ << ", processed area " << data->crop_
@@ -10251,7 +11284,14 @@ index 0000000..2499557
 +		return;
 +	}
 +
-+	data->ipa_->computeParams(info->id, info->paramsBuffer->cookie());
++	/*
++	 * A job with the still image of a session with still images, the
++	 * others with the preview (or video) tuning
++	 */
++	ipa::mtkisp50::UseCase jobUse = data->useCase_;
++	if (jobUse == ipa::mtkisp50::UseCase::Still && !info->outputBuffer)
++		jobUse = ipa::mtkisp50::UseCase::Preview;
++	data->ipa_->computeParams(info->id, info->paramsBuffer->cookie(), jobUse);
 +}
 +
 +void PipelineHandlerMtkIsp50::ispRawBufferReady(FrameBuffer *buffer)
@@ -14114,6 +15154,351 @@ index 0000000..b8eac90
 +};
 +
 +TEST_REGISTER(MtkIsp50AgcTest)
+diff --git a/test/mtkisp50/awb.cpp b/test/mtkisp50/awb.cpp
+new file mode 100644
+index 0000000..08b7a58
+--- /dev/null
++++ b/test/mtkisp50/awb.cpp
+@@ -0,0 +1,339 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * mtkisp50 IPA: white balance in dark scenes and the rendering of warm light
++ */
++
++#include <cmath>
++#include <cstring>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <unistd.h>
++
++#include <libcamera/base/file.h>
++#include <libcamera/base/memfd.h>
++
++#include <libcamera/control_ids.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "mtkisp50/algorithms/awb.h"
++#include "mtkisp50/algorithms/ccm.h"
++#include "mtkisp50/awb_preference.h"
++#include "mtkisp50/ipa_context.h"
++
++#include "test.h"
++
++using namespace std::literals::chrono_literals;
++using namespace libcamera;
++using namespace libcamera::ipa::mtkisp50;
++
++namespace {
++
++/* A curve, a preference and identity matrices: values for the test only */
++const char *kTuning = R"(%YAML 1.1
++---
++Awb:
++  algorithm: bayes
++  speed: 0.5
++  colourGains:
++    - ct: 2500
++      gains: [ 1.0, 3.0 ]
++    - ct: 4000
++      gains: [ 1.5, 2.0 ]
++    - ct: 6500
++      gains: [ 2.0, 1.5 ]
++  priors:
++    - lux: 0
++      ct: [ 2000, 8000 ]
++      probability: [ 1.0, 1.0 ]
++  AwbMode:
++    AwbAuto:
++      lo: 2500
++      hi: 6500
++  transversePos: 0.02
++  transverseNeg: 0.02
++  colourError: whitepoint
++  preference:
++    ct: [ 2500, 4000 ]
++    lv: [ 5.0, 10.0 ]
++    rg: [ [ 1.3, 1.0 ], [ 1.1, 1.0 ] ]
++    bg: [ [ 0.6, 1.0 ], [ 0.8, 1.0 ] ]
++    fNumber: 2.0
++AwbModule:
++  algorithm: bayes
++  colourGains:
++    - ct: 2500
++      gains: [ 1.0, 3.0 ]
++    - ct: 4000
++      gains: [ 1.5, 2.0 ]
++    - ct: 6500
++      gains: [ 2.0, 1.5 ]
++  priors:
++    - lux: 0
++      ct: [ 2000, 8000 ]
++      probability: [ 1.0, 1.0 ]
++  AwbMode:
++    AwbAuto:
++      lo: 2500
++      hi: 6500
++  colourError: whitepoint
++  sensitivity: [ 1.1, 0.9 ]
++Ccm:
++  ccms:
++    - ct: 2500
++      ccm: [ 1.5, -0.25, -0.25, -0.25, 1.5, -0.25, -0.25, -0.25, 1.5 ]
++    - ct: 6500
++      ccm: [ 1.5, -0.25, -0.25, -0.25, 1.5, -0.25, -0.25, -0.25, 1.5 ]
++  strength:
++    iso: [ 800, 3200 ]
++    value: [ 1.0, 0.5 ]
++)";
++
++constexpr uint8_t kBlack = 16;
++constexpr uint32_t kSamples = 50000;
++
++class Sim
++{
++public:
++	Sim()
++		: ctx_(16), stats_(std::make_unique<Statistics>())
++	{
++	}
++
++	int init(const char *awbKey = "Awb")
++	{
++		UniqueFD fd = MemFd::create("mtkisp50-awb-tuning", 0);
++		if (!fd.isValid() || write(fd.get(), kTuning, strlen(kTuning)) < 0)
++			return -EIO;
++		File file("/proc/self/fd/" + std::to_string(fd.get()));
++		if (!file.open(File::OpenModeFlag::ReadOnly))
++			return -EIO;
++		tuning_ = YamlParser::parse(file);
++		if (!tuning_)
++			return -EINVAL;
++
++		int ret = ccm_.init(ctx_, (*tuning_)["Ccm"]);
++		if (ret)
++			return ret;
++		return awb_.init(ctx_, (*tuning_)[awbKey]);
++	}
++
++	int configure()
++	{
++		ctx_.configuration = {};
++		ctx_.activeState = {};
++		ctx_.activeState.blc.level = kBlack;
++		ctx_.configuration.agc.lineDuration = 10.0us;
++		/* A dim scene: 66 ms at a gain of 32, light value about 0 */
++		ctx_.activeState.agc.exposure = 6600;
++		ctx_.activeState.agc.again = 16.0;
++		ctx_.activeState.agc.digitalGain = 2.0;
++		ctx_.activeState.agc.valid = true;
++		IPAConfigInfo config{};
++		return awb_.configure(ctx_, config);
++	}
++
++	/* A frame with the channel means above the black level (8-bit scale) */
++	void frame(const RGB<double> &means, int32_t exposure = 6600, double gain = 16.0)
++	{
++		IPAFrameContext fc{};
++		DipFrameParams params{};
++		awb_.prepare(ctx_, frame_, fc, &params);
++		fc.sensor.exposure = exposure;
++		fc.sensor.gain = gain;
++
++		Statistics &s = *stats_;
++		s.valid = true;
++		s.yHistogram.fill(0);
++		s.yHistogram[10] = kSamples;
++		for (unsigned int c = 0; c < 3; c++)
++			s.sum_[c] = static_cast<uint64_t>(std::llround((kBlack + means[c]) * kSamples));
++		for (unsigned int i = 0; i < Statistics::kZones * Statistics::kZones; i++) {
++			s.zoneCount[i] = 0;
++		}
++
++		ControlList metadata(controls::controls);
++		awb_.process(ctx_, frame_, fc, stats_.get(), metadata);
++		frame_++;
++	}
++
++	void queue(const ControlList &controls)
++	{
++		IPAFrameContext fc{};
++		awb_.queueRequest(ctx_, frame_, fc, controls);
++	}
++
++	Matrix<float, 3, 3> matrix()
++	{
++		IPAFrameContext fc{};
++		DipFrameParams params{};
++		ctx_.activeState.combinedMatrix = Matrix<float, 3, 3>::identity();
++		ccm_.prepare(ctx_, frame_, fc, &params);
++		return ctx_.activeState.combinedMatrix;
++	}
++
++	IPAContext &ctx() { return ctx_; }
++
++private:
++	IPAContext ctx_;
++	std::unique_ptr<ValueNode> tuning_;
++	algorithms::Awb awb_;
++	algorithms::Ccm ccm_;
++	std::unique_ptr<Statistics> stats_;
++	uint32_t frame_ = 0;
++};
++
++/* Means of a grey surface under a light of the curve at 2500 K */
++RGB<double> warm(double green)
++{
++	return RGB<double>({ green * 1.0, green, green / 3.0 });
++}
++
++} /* namespace */
++
++class MtkIsp50AwbTest : public Test
++{
++protected:
++	int fail(const std::string &what)
++	{
++		std::cerr << what << std::endl;
++		return TestFail;
++	}
++
++	int testDark()
++	{
++		Sim sim;
++		if (sim.init() || sim.configure())
++			return fail("init");
++		auto &awb = sim.ctx().activeState.awb;
++
++		/* Blue mean 0.6: below the old fixed threshold, above the noise */
++		for (unsigned int i = 0; i < 8; i++)
++			sim.frame(warm(1.8));
++		if (awb.temperatureK > 2800)
++			return fail("dark warm scene: " + std::to_string(awb.temperatureK) + " K");
++		const unsigned int ct = awb.temperatureK;
++		const RGB<float> gains = awb.gains;
++
++		/* The same scene with half the analogue gain and the rest digital */
++		for (unsigned int i = 0; i < 8; i++)
++			sim.frame(warm(0.9), 6600, 8.0);
++		if (std::abs(static_cast<int>(awb.temperatureK) - static_cast<int>(ct)) > 60)
++			return fail("other gain split: " + std::to_string(awb.temperatureK) + " K");
++
++		/* Darker than the noise: the last estimate is held, not the start */
++		for (unsigned int i = 0; i < 20; i++)
++			sim.frame(warm(0.2));
++		if (std::abs(static_cast<int>(awb.temperatureK) - static_cast<int>(ct)) > 60 ||
++		    std::abs(awb.gains.b() / gains.b() - 1.0f) > 0.05f)
++			return fail("held estimate: " + std::to_string(awb.temperatureK) + " K");
++
++		/* A new configuration starts where the last stream ended */
++		if (sim.configure() || std::abs(static_cast<int>(awb.temperatureK) - static_cast<int>(ct)) > 60)
++			return fail("start after configuration: " + std::to_string(awb.temperatureK) + " K");
++
++		/* Never estimated: the start value of the tuning, until an estimate comes */
++		Sim fresh;
++		if (fresh.init() || fresh.configure())
++			return fail("init 2");
++		for (unsigned int i = 0; i < 6; i++)
++			fresh.frame(warm(0.2));
++		if (fresh.ctx().activeState.awb.temperatureK != 5000)
++			return fail("start value: " + std::to_string(fresh.ctx().activeState.awb.temperatureK));
++		/* The first estimate, even a weak one, counts fully (window of 4) */
++		for (unsigned int i = 0; i < 4; i++)
++			fresh.frame(warm(1.3));
++		if (fresh.ctx().activeState.awb.temperatureK > 2800)
++			return fail("first estimate: " + std::to_string(fresh.ctx().activeState.awb.temperatureK));
++
++		return TestPass;
++	}
++
++	int testPreference()
++	{
++		Sim sim;
++		if (sim.init() || sim.configure())
++			return fail("init");
++		for (unsigned int i = 0; i < 12; i++)
++			sim.frame(warm(20.0));
++
++		auto &awb = sim.ctx().activeState.awb;
++		/* Light value about 0: the dim row, at 2500 K */
++		if (std::abs(awb.tint.r() - 1.3f) > 0.03f || std::abs(awb.tint.b() - 0.6f) > 0.03f)
++			return fail("tint " + std::to_string(awb.tint.r()) + " " + std::to_string(awb.tint.b()) +
++				    " at " + std::to_string(awb.temperatureK) + " K");
++
++		/* After the matrix: rows of red and blue scaled, weaker at ISO 3200 */
++		const Matrix<float, 3, 3> m = sim.matrix();
++		const float s = 0.5f;
++		const float diag = 1.0f + (1.5f - 1.0f) * s;
++		if (std::abs(m[0][0] - awb.tint.r() * diag) > 1e-3f ||
++		    std::abs(m[2][2] - awb.tint.b() * diag) > 1e-3f ||
++		    std::abs(m[1][1] - diag) > 1e-3f || std::abs(m[1][0] + 0.25f * s) > 1e-3f)
++			return fail("matrix " + m.toString());
++
++		/* Interpolation: in mired, ends held, light value rows */
++		AwbPreference p = *AwbPreference::fromTuning((*tuningNode())["Awb"]["preference"]);
++		const RGB<double> mid = p.tint(1e6 / ((1e6 / 2500 + 1e6 / 4000) / 2), 7.5);
++		const double want = std::exp((std::log(1.3) + std::log(1.1)) / 4);
++		if (std::abs(mid.r() - want) > 1e-6 || std::abs(p.tint(8000, 12.0).b() - 1.0) > 1e-9 ||
++		    std::abs(p.tint(2000, std::nullopt).b() - 0.6) > 1e-9)
++			return fail("interpolation");
++
++		/* A fixed colour temperature: no preference */
++		ControlList c(controls::controls);
++		c.set(controls::AwbEnable, false);
++		c.set(controls::ColourTemperature, 3000);
++		sim.queue(c);
++		if (awb.tint.r() != 1.0f || awb.tint.b() != 1.0f)
++			return fail("tint with fixed gains");
++
++		return TestPass;
++	}
++
++	int testSensitivity()
++	{
++		Sim sim;
++		if (sim.init("AwbModule") || sim.configure())
++			return fail("init");
++		/* The module sees 10 % more red and 10 % less blue */
++		for (unsigned int i = 0; i < 12; i++)
++			sim.frame(RGB<double>({ 1.1 * 20.0, 20.0, 0.9 * 20.0 / 3.0 }));
++		auto &awb = sim.ctx().activeState.awb;
++		if (awb.temperatureK > 2600 || std::abs(awb.gains.r() - 1.0f / 1.1f) > 0.03f ||
++		    std::abs(awb.gains.b() - 3.0f / 0.9f) > 0.1f)
++			return fail("module: " + std::to_string(awb.temperatureK) + " K, gains " +
++				    std::to_string(awb.gains.r()) + " " + std::to_string(awb.gains.b()));
++		return TestPass;
++	}
++
++	int run() override
++	{
++		int ret = testDark();
++		if (ret != TestPass)
++			return ret;
++		ret = testPreference();
++		if (ret != TestPass)
++			return ret;
++		return testSensitivity();
++	}
++
++private:
++	std::unique_ptr<ValueNode> &tuningNode()
++	{
++		if (!tuning_) {
++			UniqueFD fd = MemFd::create("mtkisp50-awb-tuning2", 0);
++			if (write(fd.get(), kTuning, strlen(kTuning)) > 0) {
++				File file("/proc/self/fd/" + std::to_string(fd.get()));
++				if (file.open(File::OpenModeFlag::ReadOnly))
++					tuning_ = YamlParser::parse(file);
++			}
++		}
++		return tuning_;
++	}
++
++	std::unique_ptr<ValueNode> tuning_;
++};
++
++TEST_REGISTER(MtkIsp50AwbTest)
 diff --git a/test/mtkisp50/frames.cpp b/test/mtkisp50/frames.cpp
 new file mode 100644
 index 0000000..42b7cdc
@@ -14553,10 +15938,10 @@ index 0000000..42b7cdc
 +TEST_REGISTER(MtkIsp50FramesTest)
 diff --git a/test/mtkisp50/meson.build b/test/mtkisp50/meson.build
 new file mode 100644
-index 0000000..6634a84
+index 0000000..002e1d8
 --- /dev/null
 +++ b/test/mtkisp50/meson.build
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,106 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +if 'mtkisp50' not in pipelines
@@ -14617,6 +16002,34 @@ index 0000000..6634a84
 +        '../../src/ipa/mtkisp50/algorithms/af.cpp',
 +        '../../src/ipa/mtkisp50/algorithms/af_search.cpp',
 +        '../../src/ipa/mtkisp50/algorithms/agc.cpp',
++        '../../src/ipa/mtkisp50/exposure_program.cpp',
++        '../../src/ipa/mtkisp50/ipa_context.cpp',
++    ],
++    'ipa': true,
++}
++
++# The exposure program (stages, flicker steps, limits) and the regulation with it
++mtkisp50_tests += {
++    'name': 'mtkisp50-program',
++    'sources': [
++        'program.cpp',
++        '../../src/ipa/mtkisp50/algorithms/af.cpp',
++        '../../src/ipa/mtkisp50/algorithms/af_search.cpp',
++        '../../src/ipa/mtkisp50/algorithms/agc.cpp',
++        '../../src/ipa/mtkisp50/exposure_program.cpp',
++        '../../src/ipa/mtkisp50/ipa_context.cpp',
++    ],
++    'ipa': true,
++}
++
++# White balance in dark scenes and the rendering of warm light
++mtkisp50_tests += {
++    'name': 'mtkisp50-awb',
++    'sources': [
++        'awb.cpp',
++        '../../src/ipa/mtkisp50/algorithms/awb.cpp',
++        '../../src/ipa/mtkisp50/algorithms/ccm.cpp',
++        '../../src/ipa/mtkisp50/awb_preference.cpp',
 +        '../../src/ipa/mtkisp50/ipa_context.cpp',
 +    ],
 +    'ipa': true,
@@ -14934,6 +16347,479 @@ index 0000000..8100615
 +};
 +
 +TEST_REGISTER(MtkIsp50PdTest)
+diff --git a/test/mtkisp50/program.cpp b/test/mtkisp50/program.cpp
+new file mode 100644
+index 0000000..e084550
+--- /dev/null
++++ b/test/mtkisp50/program.cpp
+@@ -0,0 +1,467 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * mtkisp50 IPA: exposure program
++ */
++
++#include <cmath>
++#include <cstring>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <unistd.h>
++
++#include <linux/v4l2-controls.h>
++
++#include <libcamera/base/file.h>
++#include <libcamera/base/memfd.h>
++
++#include <libcamera/control_ids.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "mtkisp50/algorithms/af.h"
++#include "mtkisp50/algorithms/agc.h"
++#include "mtkisp50/exposure_program.h"
++#include "mtkisp50/frame_length.h"
++#include "mtkisp50/ipa_context.h"
++
++#include "test.h"
++
++using namespace std::literals::chrono_literals;
++using namespace libcamera;
++using namespace libcamera::ipa::mtkisp50;
++
++namespace {
++
++/*
++ * Regulation as tuned for the main camera (zone metering, speed, frame length
++ * extension by a factor of two from a gain of 8, the frame rate kept while
++ * the autofocus searches); the autofocus continuous.
++ */
++const char *kTuning = R"(%YAML 1.1
++---
++Agc:
++  maxExposureFactor: 3.0
++  exposureTarget: 0.18
++  exposureSpeed: 0.6
++  metering: zones
++  colourGains: false
++  afFrameRate: true
++  fNumber: 2.0
++  program:
++    preview: [ [ 10000, 2.0 ], [ 20000, 4.0 ], [ 30000, 8.0 ], [ 40000, 16.0 ], [ 60000, 32.0 ], [ 100000, 120.0 ] ]
++    video: [ [ 10000, 2.0 ], [ 20000, 3.0 ], [ 30000, 16.0 ], [ 40000, 64.0 ] ]
++    still: [ [ 10000, 2.0 ], [ 20000, 4.0 ], [ 30000, 8.0 ], [ 40000, 16.0 ], [ 60000, 32.0 ], [ 100000, 240.0 ] ]
++Af:
++  map: [ 0.1, 468, 10.0, 775 ]
++  default: 0.4
++  range: [ -0.8, 10.5 ]
++  step: 1.25
++  settleFrames: 2
++)";
++
++/* A sensor mode: lines, line duration, VBLANK range (step 2) */
++struct Mode {
++	int32_t defaultLines;
++	int32_t exposureMax;
++	utils::Duration line;
++	int32_t vblankDefault;
++	int32_t vblankMax;
++};
++
++/* Full resolution mode: 4102 lines of 8.124 us, 33.3 ms */
++const Mode kFull = { 4102, 4070, 8124.0ns, 4102 - 3472, 0xffffe8 - 3472 };
++/* Binned mode: 6000 lines of 5.555 us, 33.3 ms */
++const Mode kBinned = { 6000, 5968, 5555.0ns, 6000 - 1728, 0xffffe8 - 1728 };
++
++constexpr int32_t kBlack = 16;
++
++/*
++ * Exposure regulation and autofocus between a simulated sensor without
++ * delays and a dark scene: the image level above the black level is
++ * brightness * exposure lines * analogue gain (8 bit scale), the focus grid
++ * has a small contrast at that level.
++ */
++class Sim
++{
++public:
++	Sim()
++		: ctx_(16), stats_(std::make_unique<Statistics>())
++	{
++	}
++
++	int init()
++	{
++		UniqueFD fd = MemFd::create("mtkisp50-program-tuning", 0);
++		if (!fd.isValid() || write(fd.get(), kTuning, strlen(kTuning)) < 0)
++			return -EIO;
++
++		File file("/proc/self/fd/" + std::to_string(fd.get()));
++		if (!file.open(File::OpenModeFlag::ReadOnly))
++			return -EIO;
++
++		tuning_ = YamlParser::parse(file);
++		if (!tuning_)
++			return -EINVAL;
++
++		ControlInfoMap::Map map;
++		map.emplace(&focusId_, ControlInfo(0, 1023, 0));
++		ctx_.lensControls = ControlInfoMap(std::move(map), lensIdMap_);
++
++		int ret = agc_.init(ctx_, (*tuning_)["Agc"]);
++		if (ret)
++			return ret;
++		return af_.init(ctx_, (*tuning_)["Af"]);
++	}
++
++	/* A new configuration in a mode, as IPAMtkIsp50::configure() */
++	int configure(const Mode &mode, UseCase use = UseCase::Preview)
++	{
++		mode_ = mode;
++		ctx_.configuration = {};
++		ctx_.activeState = {};
++		ctx_.activeState.blc.level = kBlack;
++		ctx_.activeState.agc.digitalGain = 1.0;
++		ctx_.activeState.awb.gains = RGB<float>({ 1.0f, 1.0f, 1.0f });
++		ctx_.sensorInfo.minFrameLength = mode.defaultLines;
++		ctx_.sensorInfo.outputSize = Size(2304, 1728);
++
++		auto &agc = ctx_.configuration.agc;
++		agc.lineDuration = mode.line;
++		agc.exposureMin = 16;
++		agc.exposureMax = mode.exposureMax;
++		agc.againMin = 1.0;
++		agc.againMax = 15.5;
++		agc.again10 = 1.0;
++		agc.againMinStep = 0.02;
++
++		ControlInfoMap::Map map;
++		map.emplace(&vblankId_, ControlInfo(mode.vblankDefault, mode.vblankMax, mode.vblankDefault));
++		IPAConfigInfo config{};
++		config.useCase = use;
++		config.sensorControls = ControlInfoMap(std::move(map), sensorIdMap_);
++
++		int ret = agc_.configure(ctx_, config);
++		if (ret)
++			return ret;
++		ret = af_.configure(ctx_, config);
++		if (ret)
++			return ret;
++
++		exposure_ = mode.exposureMax / 2;
++		gain_ = 1.0;
++		frame_ = 0;
++		return 0;
++	}
++
++	ControlList frame(const ControlList *request = nullptr)
++	{
++		const uint32_t n = frame_++;
++		IPAFrameContext fc{};
++		if (request) {
++			agc_.queueRequest(ctx_, n, fc, *request);
++			af_.queueRequest(ctx_, n, fc, *request);
++		}
++
++		DipFrameParams params{};
++		agc_.prepare(ctx_, n, fc, &params);
++		af_.prepare(ctx_, n, fc, &params);
++
++		/* The sensor applies what it was given */
++		fc.sensor.exposure = exposure_;
++		fc.sensor.gain = gain_;
++		frameLines = ctx_.configuration.agc.vblankEnabled
++				     ? mode_.defaultLines + vblank_ - mode_.vblankDefault
++				     : mode_.defaultLines;
++
++		const double level = std::min(brightness * exposure_ * gain_, 255.0 - kBlack);
++		Statistics &s = *stats_;
++		s.valid = true;
++		for (unsigned int i = 0; i < Statistics::kZones * Statistics::kZones; i++) {
++			const uint64_t v = static_cast<uint64_t>((kBlack + level) * 100);
++			s.zoneSum[i] = RGB<uint64_t>({ v, v, v });
++			s.zoneCount[i] = 100;
++		}
++		s.afGridValid = true;
++		s.afGridWidth = 16;
++		s.afGridHeight = 12;
++		s.afCellSize = 16;
++		s.afCellSamples = 64;
++		for (unsigned int y = 0; y < 12; y++)
++			for (unsigned int x = 0; x < 16; x++)
++				s.afGrid[y * 16 + x] = static_cast<uint32_t>(
++					64 * (kBlack + level * ((x + y) & 1 ? 1.1 : 0.9)));
++
++		ControlList metadata(controls::controls);
++		agc_.process(ctx_, n, fc, stats_.get(), metadata);
++		af_.process(ctx_, n, fc, stats_.get(), metadata);
++		ctx_.activeState.af.update = false;
++
++		/* Controls for the next frame, as IPAMtkIsp50::processStats() */
++		exposure_ = fc.sensor.exposure;
++		gain_ = fc.sensor.gain;
++		const auto &agc = ctx_.configuration.agc;
++		if (agc.vblankEnabled) {
++			vblank_ = agc.frame.vblankFor(exposure_, ctx_.activeState.agc.minFrameLines);
++			/* The driver: steps of two lines from the default up */
++			vblank_ = mode_.vblankDefault +
++				  (vblank_ - mode_.vblankDefault + 1) / 2 * 2;
++		}
++
++		return metadata;
++	}
++
++	IPAContext &ctx() { return ctx_; }
++	double digitalGain() const { return ctx_.activeState.agc.digitalGain; }
++
++	/* Digital gain of the frame of a still image */
++	double stillDigitalGain()
++	{
++		IPAFrameContext fc{};
++		DipFrameParams params{};
++		params.useCase = static_cast<uint8_t>(UseCase::Still);
++		agc_.prepare(ctx_, frame_, fc, &params);
++		return fc.digitalGain;
++	}
++	int32_t exposure() const { return exposure_; }
++	double gain() const { return gain_; }
++
++	double brightness = 0.0;
++	/* Frame length of the last frame, in lines */
++	int32_t frameLines = 0;
++
++private:
++	ControlId vblankId_{ V4L2_CID_VBLANK, "Vertical Blanking", "v4l2",
++			     ControlTypeInteger32, ControlId::Direction::In };
++	ControlIdMap sensorIdMap_{ { V4L2_CID_VBLANK, &vblankId_ } };
++	ControlId focusId_{ V4L2_CID_FOCUS_ABSOLUTE, "Focus, Absolute", "v4l2",
++			    ControlTypeInteger32, ControlId::Direction::In };
++	ControlIdMap lensIdMap_{ { V4L2_CID_FOCUS_ABSOLUTE, &focusId_ } };
++	IPAContext ctx_;
++	std::unique_ptr<ValueNode> tuning_;
++	algorithms::Agc agc_;
++	algorithms::Af af_;
++	std::unique_ptr<Statistics> stats_;
++	Mode mode_{};
++	int32_t exposure_ = 0;
++	double gain_ = 1.0;
++	int32_t vblank_ = 0;
++	uint32_t frame_ = 0;
++};
++
++ControlList limits(int64_t minUs, int64_t maxUs)
++{
++	ControlList c(controls::controls);
++	c.set(controls::FrameDurationLimits, Span<const int64_t, 2>({ minUs, maxUs }));
++	return c;
++}
++
++} /* namespace */
++
++class MtkIsp50ProgramTest : public Test
++{
++protected:
++	int fail(const std::string &what)
++	{
++		std::cerr << what << std::endl;
++		return TestFail;
++	}
++
++	/* Times of the stages are multiples of 10 ms (50 Hz) from 10 ms on */
++	static bool flickerFree(double time)
++	{
++		if (time < 9999.0)
++			return true;
++		const double k = std::round(time / 10000.0);
++		return std::abs(time - k * 10000.0) < 1.0;
++	}
++
++	int testSplit()
++	{
++		using Stage = ExposureProgram::Stage;
++		auto p = ExposureProgram::fromStages({ Stage{ 10000, 2.0 }, Stage{ 20000, 4.0 },
++						       Stage{ 30000, 8.0 }, Stage{ 40000, 16.0 },
++						       Stage{ 60000, 32.0 }, Stage{ 100000, 120.0 } });
++		if (!p)
++			return fail("program refused");
++
++		/* Rising times and rising products only */
++		if (ExposureProgram::fromStages({ Stage{ 20000, 2.0 }, Stage{ 10000, 8.0 } }) ||
++		    ExposureProgram::fromStages({ Stage{ 10000, 8.0 }, Stage{ 20000, 2.0 } }))
++			return fail("invalid program accepted");
++
++		struct Case {
++			double total;
++			double time;
++			double again;
++			double dgain;
++		};
++		const Case cases[] = {
++			/* Bright: the time shrinks at the smallest gain */
++			{ 500.0, 500.0, 1.0, 1.0 },
++			{ 10000.0, 10000.0, 1.0, 1.0 },
++			{ 15000.0, 10000.0, 1.5, 1.0 },
++			/* The next stage: 20 ms, the gain falls back */
++			{ 25000.0, 20000.0, 1.25, 1.0 },
++			{ 200000.0, 30000.0, 200.0 / 30.0, 1.0 },
++			{ 400000.0, 40000.0, 10.0, 1.0 },
++			/* The analogue gain first, then the digital one */
++			{ 60000.0 * 20.0, 60000.0, 15.5, 20.0 / 15.5 },
++			{ 100000.0 * 100.0, 100000.0, 15.5, 100.0 / 15.5 },
++			/* Beyond the program: the device limit */
++			{ 100000.0 * 200.0, 100000.0, 15.5, 8.0 },
++		};
++		for (const Case &c : cases) {
++			const auto s = p->split(c.total, 10.0, 100000.0, 1.0, 15.5, 8.0);
++			if (std::abs(s.time - c.time) > 0.5 || std::abs(s.again - c.again) > 1e-3 ||
++			    std::abs(s.dgain - c.dgain) > 1e-3)
++				return fail("split " + std::to_string(c.total) + ": " + std::to_string(s.time) +
++					    " us " + std::to_string(s.again) + " x " + std::to_string(s.dgain));
++		}
++
++		/* Every total: flicker free times, the analogue gain before the digital one */
++		for (double total = 50.0; total < 2e7; total *= 1.05) {
++			const auto s = p->split(total, 10.0, 100000.0, 1.0, 15.5, 8.0);
++			if (!flickerFree(s.time) || (s.dgain > 1.0 + 1e-9 && s.again < 15.5 - 1e-9) ||
++			    std::abs(s.time * s.again * s.dgain - std::min(total, 100000.0 * 15.5 * 8.0)) > 1e-6 * total)
++				return fail("split " + std::to_string(total) + ": " + std::to_string(s.time) +
++					    " us " + std::to_string(s.again) + " x " + std::to_string(s.dgain));
++		}
++
++		/* A longest exposure of 33.3 ms: the stage of 30 ms, the gain takes the rest */
++		const auto s = p->split(60000.0 * 20.0, 10.0, 33333.0, 1.0, 15.5, 8.0);
++		if (std::abs(s.time - 30000.0) > 0.5 || std::abs(s.again * s.dgain - 40.0) > 1e-3)
++			return fail("split within 33.3 ms: " + std::to_string(s.time));
++		/* A limit below the first stage: the limit itself */
++		const auto t = p->split(60000.0, 10.0, 8000.0, 1.0, 15.5, 8.0);
++		if (std::abs(t.time - 8000.0) > 0.5 || std::abs(t.again - 7.5) > 1e-3)
++			return fail("split within 8 ms: " + std::to_string(t.time));
++
++		return TestPass;
++	}
++
++	/* Regulation of a dark scene with the program */
++	int testRegulation()
++	{
++		Sim sim;
++		if (sim.init() || sim.configure(kFull))
++			return fail("init");
++		const auto &agc = sim.ctx().configuration.agc;
++		const double line = agc.lineDuration.get<std::micro>();
++
++		/* Needs 60 ms at a total gain of 20 for the target */
++		sim.brightness = (0.18 * (255.0 - kBlack)) / (60000.0 / line * 20.0);
++		for (unsigned int i = 0; i < 600; i++)
++			sim.frame();
++
++		const double time = sim.exposure() * line;
++		const double total = time * sim.gain() * sim.digitalGain();
++		if (std::abs(time - 60000.0) > line || sim.gain() < 15.5 - 1e-6 ||
++		    std::abs(total / (60000.0 * 20.0) - 1.0) > 0.08)
++			return fail("dark scene: " + std::to_string(time) + " us, gain " +
++				    std::to_string(sim.gain()) + " x " + std::to_string(sim.digitalGain()));
++
++		/* Darker: 100 ms, as far as the frame length extension reaches */
++		sim.brightness /= 4.0;
++		for (unsigned int i = 0; i < 600; i++)
++			sim.frame();
++		/* The longest exposure of the mode ends just short of 100 ms */
++		const double longest = std::min(100000.0, sim.ctx().activeState.agc.exposureLimit * line);
++		const double time2 = sim.exposure() * line;
++		if (std::abs(time2 - longest) > line || sim.gain() < 15.5 - 1e-6)
++			return fail("darker scene: " + std::to_string(time2) + " us, limit " +
++				    std::to_string(sim.ctx().activeState.agc.exposureLimit) + " busy " +
++				    std::to_string(sim.ctx().activeState.af.busy) + ", gain " +
++				    std::to_string(sim.gain()) + " x " + std::to_string(sim.digitalGain()));
++
++		/* 30 fps from the application: the stage of 30 ms */
++		ControlList fps = limits(33333, 33333);
++		sim.frame(&fps);
++		for (unsigned int i = 0; i < 300; i++)
++			sim.frame();
++		const double time3 = sim.exposure() * line;
++		if (std::abs(time3 - 30000.0) > line || sim.gain() < 15.5 - 1e-6)
++			return fail("30 fps: " + std::to_string(time3) + " us, gain " +
++				    std::to_string(sim.gain()) + " x " + std::to_string(sim.digitalGain()));
++
++		/*
++		 * Back to the longest frames: the time goes back to the stages,
++		 * the analogue gain stays at its limit while digital gain is
++		 * used (the autofocus searched in between)
++		 */
++		ControlList slow = limits(33333, 100000);
++		sim.frame(&slow);
++		for (unsigned int i = 0; i < 600; i++) {
++			sim.frame();
++			if (sim.digitalGain() > 1.0 + 1e-6 && sim.gain() < 15.5 - 1e-6)
++				return fail("digital gain " + std::to_string(sim.digitalGain()) +
++					    " with analogue gain " + std::to_string(sim.gain()));
++			if (!flickerFree(sim.exposure() * line) &&
++			    std::abs(sim.exposure() * line - longest) > line &&
++			    std::abs(sim.exposure() * line - 10000.0 * std::round(sim.exposure() * line / 10000.0)) > line)
++				return fail("exposure " + std::to_string(sim.exposure() * line) + " us not in 10 ms steps");
++		}
++		const double time4 = sim.exposure() * line;
++		if (std::abs(time4 - longest) > line)
++			return fail("longest frames: " + std::to_string(time4) + " us");
++
++		return TestPass;
++	}
++
++	/* Video: the video program, a stage of 40 ms at most */
++	int testVideo()
++	{
++		Sim sim;
++		if (sim.init() || sim.configure(kFull, UseCase::Video))
++			return fail("video init");
++		const auto &agc = sim.ctx().configuration.agc;
++		const double line = agc.lineDuration.get<std::micro>();
++		sim.brightness = (0.18 * (255.0 - kBlack)) / (100000.0 / line * 30.0);
++		for (unsigned int i = 0; i < 600; i++)
++			sim.frame();
++		const double time = sim.exposure() * line;
++		if (std::abs(time - 40000.0) > line || sim.gain() < 15.5 - 1e-6)
++			return fail("video: " + std::to_string(time) + " us, gain " +
++				    std::to_string(sim.gain()) + " x " + std::to_string(sim.digitalGain()));
++		return TestPass;
++	}
++
++	/* Still images: more digital gain than the preview in a very dark scene */
++	int testStill()
++	{
++		Sim sim;
++		if (sim.init() || sim.configure(kFull, UseCase::Still))
++			return fail("still init");
++		const auto &agc = sim.ctx().configuration.agc;
++		const double line = agc.lineDuration.get<std::micro>();
++		/* Needs a total gain of 200 at 100 ms */
++		sim.brightness = (0.18 * (255.0 - kBlack)) / (100000.0 / line * 200.0);
++		for (unsigned int i = 0; i < 800; i++)
++			sim.frame();
++		const double preview = sim.digitalGain();
++
++		const double still = sim.stillDigitalGain();
++		if (preview > 120.0 / 15.5 + 1e-3)
++			return fail("preview digital gain " + std::to_string(preview) + " beyond its program");
++		if (std::abs(still * 15.5 - 200.0) > 200.0 * 0.08)
++			return fail("still digital gain " + std::to_string(still) + ", preview " +
++				    std::to_string(preview));
++		return TestPass;
++	}
++
++	int run() override
++	{
++		int ret = testSplit();
++		if (ret != TestPass)
++			return ret;
++		ret = testRegulation();
++		if (ret != TestPass)
++			return ret;
++		ret = testVideo();
++		if (ret != TestPass)
++			return ret;
++		return testStill();
++	}
++};
++
++TEST_REGISTER(MtkIsp50ProgramTest)
 diff --git a/test/mtkisp50/raw_stats.cpp b/test/mtkisp50/raw_stats.cpp
 new file mode 100644
 index 0000000..bb16fec
