@@ -1,22 +1,25 @@
 From: pocket-debs
-Date: Thu, 19 Nov 2026 04:30:46 +0100
-Subject: [PATCH] ipa: libipa: camera_sensor_helper: Add OV64B40 and OV16A1Q
+Date: Sun, 22 Nov 2026 12:00:00 +0100
+Subject: [PATCH] ipa: libipa: camera_sensor_helper: Add OV64B40, OV16A1Q and S5K5E9
 Description:
  Add camera sensor helpers and static sensor properties for the OmniVision
- OV64B40 (64 MP quad Bayer, rear camera of the Motorola Moto G60s) and the
- OV16A1Q (16 MP, front camera of the same phone).
+ OV64B40 (64 MP quad Bayer, rear camera of the Motorola Moto G60s), the
+ OV16A1Q (16 MP, front camera of the same phone) and the S5K5E9 (5 MP, macro
+ camera of the same phone).
  .
- Both sensors take a linear analogue gain code with 0x100 = 1x up to 0xf80
- (15.5x), as programmed by the vendor kernel drivers. The black level of 16 at
- 8 bits (4096 at 16 bits) was measured on the device. The sensor delays follow
+ The OmniVision sensors take a linear analogue gain code with 0x100 = 1x up
+ to 0xf80 (15.5x), as programmed by the vendor kernel drivers; the S5K5E9 a
+ linear code with 0x20 = 1x up to 0x200 (16x). The black level of 16 at
+ 8 bits (4096 at 16 bits) was measured on the device for all three sensors.
+ The sensor delays (two frames for all three) follow
  the group hold the kernel drivers use for exposure, gain and frame length
  updates while streaming.
 Forwarded: no
 License: LGPL-2.1-or-later (as the patched files)
-Last-Update: 2026-11-19
+Last-Update: 2026-11-22
 ---
 diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
-index 9457d62..d9ae3da 100644
+index 9457d62..9fde81b 100644
 --- a/src/ipa/libipa/camera_sensor_helper.cpp
 +++ b/src/ipa/libipa/camera_sensor_helper.cpp
 @@ -791,6 +791,19 @@ public:
@@ -39,7 +42,7 @@ index 9457d62..d9ae3da 100644
  class CameraSensorHelperOv8858 : public CameraSensorHelper
  {
  public:
-@@ -827,6 +840,19 @@ public:
+@@ -827,6 +840,32 @@ public:
  };
  REGISTER_CAMERA_SENSOR_HELPER("ov13858", CameraSensorHelperOv13858)
  
@@ -56,11 +59,24 @@ index 9457d62..d9ae3da 100644
 +};
 +REGISTER_CAMERA_SENSOR_HELPER("ov16a1q", CameraSensorHelperOv16a1q)
 +
++class CameraSensorHelperS5k5e9 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k5e9()
++	{
++		/* 16 at 8 bits, measured on a dark frame. */
++		blackLevel_ = 4096;
++		/* 0x20 is 1x, up to 0x200 (16x). */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k5e9", CameraSensorHelperS5k5e9)
++
  class CameraSensorHelperVd55g1 : public CameraSensorHelper
  {
  public:
 diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
-index 2804315..c944e4f 100644
+index 2804315..0adc1dc 100644
 --- a/src/libcamera/sensor/camera_sensor_properties.cpp
 +++ b/src/libcamera/sensor/camera_sensor_properties.cpp
 @@ -446,6 +446,24 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
@@ -88,7 +104,7 @@ index 2804315..c944e4f 100644
  		{ "ov7251", {
  			.unitCellSize = { 3000, 3000 },
  			.testPatternModes =  { },
-@@ -503,6 +521,24 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+@@ -503,6 +521,37 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
  			},
  			.sensorDelays = { },
  		} },
@@ -102,6 +118,19 @@ index 2804315..c944e4f 100644
 +				 * 2: "Color Bars (vendor)", 3: "Random",
 +				 * 4: "Squares", 5: "Color Bars with Vertical Ramp"
 +				 */
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
++		{ "s5k5e9", {
++			.unitCellSize = { 1120, 1120 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeColorBars, 1 },
 +			},
 +			.sensorDelays = {
 +				.exposureDelay = 2,
