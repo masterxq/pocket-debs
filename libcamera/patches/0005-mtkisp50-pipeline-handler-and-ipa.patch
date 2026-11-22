@@ -54,6 +54,14 @@ Description:
    single frame; failed frames and unusable alignments fall out, without a
    blend the base frame alone; a capture that times out goes on with the
    frames back; a stop during the series returns everything.
+ - Calibration of the single camera module: the tuning holds the values
+   of a reference module, an optional file <sensor>-unit.yaml in
+   ipa/mtkisp50 below localstatedir/lib/libcamera (or the directory of
+   LIBCAMERA_MTKISP50_UNIT_DIR) the values of the module (version 1, a
+   list of algorithms); its keys replace the top level keys of the
+   algorithms of the same name, algorithms the tuning does not have are
+   left out. Without the file, with an invalid one or with values the
+   algorithms refuse the tuning alone; the log names the keys taken.
  - Pipeline handler: capture by sensor, seninf and CAMSV into an internal
    raw pool or the raw stream, DIP job by DMABUF (raw, parameters, NV12
    main output, YUYV scaled output), CPU statistics (copy of the software
@@ -105,7 +113,9 @@ Description:
    programs and the regulation with them, white balance in dim light and
    the preference, the temporal noise reduction (restarts, settings
    between the sensitivities, parameter buffers, fallback), the frames of
-   a series per sensitivity and the plan of its blends; CPU
+   a series per sensitivity and the plan of its blends, the calibration
+   of the camera module over the tuning (keys replaced, missing, broken
+   and unknown files, algorithms the tuning does not have); CPU
    statistics against the software ISP statistics frame by frame.
  .
  Applies on top of 0001, 0003 and 0004.
@@ -1034,6 +1044,29 @@ index 20baacc..f8d1af4 100644
              'rkisp1',
              'rpi/pisp',
              'rpi/vc4',
+diff --git a/src/ipa/meson.build b/src/ipa/meson.build
+index eb7846e..479307b 100644
+--- a/src/ipa/meson.build
++++ b/src/ipa/meson.build
+@@ -12,12 +12,18 @@ config_h.set('IPA_CONFIG_DIR',
+              '"' + get_option('prefix') / ipa_sysconf_dir +
+              ':' + get_option('prefix') / ipa_data_dir + '"')
+ 
++# Data an IPA keeps per device, such as the calibration of a camera module
++config_h.set('IPA_STATE_DIR',
++             '"' + get_option('prefix') / get_option('localstatedir') /
++             'lib' / 'libcamera' / 'ipa' + '"')
++
+ config_h.set('IPA_MODULE_DIR',
+              '"' + get_option('prefix') / ipa_install_dir + '"')
+ 
+ summary({
+          'IPA_CONFIG_DIR' : config_h.get('IPA_CONFIG_DIR'),
+          'IPA_MODULE_DIR' : config_h.get('IPA_MODULE_DIR'),
++         'IPA_STATE_DIR' : config_h.get('IPA_STATE_DIR'),
+          }, section : 'Paths')
+ 
+ subdir('libipa')
 diff --git a/src/ipa/mtkisp50/algorithms/adjust.cpp b/src/ipa/mtkisp50/algorithms/adjust.cpp
 new file mode 100644
 index 0000000..c33ffef
@@ -8981,10 +9014,10 @@ index 0000000..4ca4a04
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/meson.build b/src/ipa/mtkisp50/meson.build
 new file mode 100644
-index 0000000..ea99d73
+index 0000000..0270fb6
 --- /dev/null
 +++ b/src/ipa/mtkisp50/meson.build
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,37 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +subdir('algorithms')
@@ -9000,6 +9033,7 @@ index 0000000..ea99d73
 +    'mtkisp50.cpp',
 +    'statistics.cpp',
 +    'temporal_nr.cpp',
++    'unit_tuning.cpp',
 +])
 +
 +mtkisp50_ipa_sources += mtkisp50_ipa_algorithms
@@ -9059,10 +9093,10 @@ index 0000000..e38120a
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/mtkisp50.cpp b/src/ipa/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..202b46c
+index 0000000..d1adfde
 --- /dev/null
 +++ b/src/ipa/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,813 @@
+@@ -0,0 +1,829 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2023, Linaro Ltd
@@ -9107,6 +9141,7 @@ index 0000000..202b46c
 +#include "dip_params.h"
 +#include "module.h"
 +#include "statistics.h"
++#include "unit_tuning.h"
 +
 +namespace libcamera {
 +
@@ -9258,7 +9293,22 @@ index 0000000..202b46c
 +		return -EINVAL;
 +	}
 +
++	/*
++	 * The calibration of the single camera module over the reference
++	 * values; values of it the algorithms refuse leave the tuning alone.
++	 */
++	const UnitTuning unit = UnitTuning::apply(*data, UnitTuning::file(settings.sensorModel));
++
 +	int ret = createAlgorithms(context_, (*data)["algorithms"]);
++	if (ret && unit.status == UnitTuning::Status::Applied) {
++		LOG(IPAMtkIsp50, Warning)
++			<< "Algorithms refuse the unit calibration, tuning alone";
++		file.seek(0);
++		data = YamlParser::parse(file);
++		if (!data)
++			return -EINVAL;
++		ret = createAlgorithms(context_, (*data)["algorithms"]);
++	}
 +	if (ret)
 +		return ret;
 +
@@ -10279,6 +10329,294 @@ index 0000000..b7d7880
 +	Limits limits_;
 +	std::optional<State> last_;
 +	unsigned int remaining_ = 0;
++};
++
++} /* namespace ipa::mtkisp50 */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/mtkisp50/unit_tuning.cpp b/src/ipa/mtkisp50/unit_tuning.cpp
+new file mode 100644
+index 0000000..2ecd683
+--- /dev/null
++++ b/src/ipa/mtkisp50/unit_tuning.cpp
+@@ -0,0 +1,226 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Calibration of the single camera module over the tuning
++ */
++
++#include "unit_tuning.h"
++
++#include <errno.h>
++#include <memory>
++#include <string.h>
++#include <sys/stat.h>
++
++#include <libcamera/base/file.h>
++#include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(IPAMtkIsp50Unit)
++
++namespace ipa::mtkisp50 {
++
++namespace {
++
++/* The only version of the file so far */
++constexpr uint32_t kUnitVersion = 1;
++
++std::unique_ptr<ValueNode> copyNode(const ValueNode &node)
++{
++	auto copy = std::make_unique<ValueNode>();
++
++	if (node.isValue()) {
++		copy->set(node.get<std::string>(""));
++	} else if (node.isList()) {
++		for (const ValueNode &child : node.asList())
++			copy->add(copyNode(child));
++	} else if (node.isDictionary()) {
++		for (const auto &[key, child] : node.asDict())
++			copy->add(key, copyNode(child));
++	}
++
++	return copy;
++}
++
++/* The algorithms of the file, or nullptr when the file is not valid */
++const ValueNode *unitAlgorithms(const ValueNode &unit, std::string *error)
++{
++	if (!unit.isDictionary()) {
++		*error = "not a dictionary";
++		return nullptr;
++	}
++
++	std::optional<uint32_t> version = unit["version"].get<uint32_t>();
++	if (!version) {
++		*error = "no version";
++		return nullptr;
++	}
++	if (*version != kUnitVersion) {
++		*error = "unknown version " + unit["version"].get<std::string>("");
++		return nullptr;
++	}
++
++	const ValueNode &algorithms = unit["algorithms"];
++	if (!algorithms.isList()) {
++		*error = "no list of algorithms";
++		return nullptr;
++	}
++
++	for (const ValueNode &algo : algorithms.asList()) {
++		if (!algo.isDictionary() || algo.size() != 1) {
++			*error = "an algorithm entry is not a single dictionary key";
++			return nullptr;
++		}
++
++		const auto &[name, params] = *algo.asDict().begin();
++		if (!params.isDictionary()) {
++			*error = "the parameters of " + name + " are not a dictionary";
++			return nullptr;
++		}
++	}
++
++	return &algorithms;
++}
++
++/*
++ * The parameters of an algorithm with the keys of the file in place of its
++ * own, in the order of the tuning, keys only the file has at the end
++ */
++std::unique_ptr<ValueNode> mergeParams(const ValueNode &params, const ValueNode &unit)
++{
++	auto merged = std::make_unique<ValueNode>();
++
++	for (const auto &[key, value] : params.asDict())
++		merged->add(key, copyNode(unit.contains(key) ? unit[key] : value));
++
++	for (const auto &[key, value] : unit.asDict()) {
++		if (!params.contains(key))
++			merged->add(key, copyNode(value));
++	}
++
++	return merged;
++}
++
++} /* namespace */
++
++/**
++ * \brief The path of the file of the camera module with sensor \a sensorModel
++ *
++ * The file is <sensor>-unit.yaml in the directory of the IPA below the state
++ * directory of libcamera (var/lib/libcamera/ipa/mtkisp50), or in the directory
++ * named by the environment variable LIBCAMERA_MTKISP50_UNIT_DIR.
++ */
++std::string UnitTuning::file(const std::string &sensorModel)
++{
++	std::string dir = IPA_STATE_DIR "/mtkisp50";
++
++	const char *env = utils::secure_getenv("LIBCAMERA_MTKISP50_UNIT_DIR");
++	if (env && *env != '\0')
++		dir = env;
++
++	return dir + "/" + sensorModel + "-unit.yaml";
++}
++
++/**
++ * \brief Lay the file at \a path over the algorithms of \a tuning
++ *
++ * A missing file leaves the tuning as it is, as does a file that is not
++ * valid as a whole (syntax, version, structure); the camera works with the
++ * tuning alone then. An algorithm the tuning does not have is left out with a
++ * warning, the others are applied.
++ */
++UnitTuning UnitTuning::apply(ValueNode &tuning, const std::string &path)
++{
++	UnitTuning result;
++
++	struct stat st;
++	if (stat(path.c_str(), &st) && errno == ENOENT) {
++		LOG(IPAMtkIsp50Unit, Info) << "No unit calibration " << path;
++		return result;
++	}
++
++	result.status = Status::Invalid;
++
++	File file(path);
++	if (!file.open(File::OpenModeFlag::ReadOnly)) {
++		LOG(IPAMtkIsp50Unit, Warning)
++			<< "Unit calibration " << path << " not readable: "
++			<< strerror(-file.error()) << ", tuning alone";
++		return result;
++	}
++
++	std::unique_ptr<ValueNode> unit = YamlParser::parse(file);
++	if (!unit) {
++		LOG(IPAMtkIsp50Unit, Warning)
++			<< "Unit calibration " << path << " not valid YAML, tuning alone";
++		return result;
++	}
++
++	std::string error;
++	const ValueNode *unitAlgos = unitAlgorithms(*unit, &error);
++	ValueNode *algorithms = tuning.at("algorithms");
++	if (!unitAlgos || !algorithms || !algorithms->isList()) {
++		LOG(IPAMtkIsp50Unit, Warning)
++			<< "Unit calibration " << path << " not used: "
++			<< (unitAlgos ? "tuning without a list of algorithms" : error)
++			<< ", tuning alone";
++		return result;
++	}
++
++	result.status = Status::Applied;
++
++	std::string applied;
++	for (const ValueNode &unitAlgo : unitAlgos->asList()) {
++		const auto &[name, unitParams] = *unitAlgo.asDict().begin();
++		bool found = false;
++
++		for (std::size_t i = 0; i < algorithms->size(); i++) {
++			ValueNode *entry = algorithms->at(i);
++			if (!entry->isDictionary() || !entry->contains(name))
++				continue;
++
++			const ValueNode &params = (*entry)[name];
++			if (!params.isDictionary() && !params.isEmpty() &&
++			    !(params.isValue() && params.get<std::string>("").empty())) {
++				LOG(IPAMtkIsp50Unit, Warning)
++					<< "Parameters of " << name
++					<< " in the tuning are not a dictionary, unit calibration left out";
++				found = true;
++				continue;
++			}
++
++			std::unique_ptr<ValueNode> merged = mergeParams(params, unitParams);
++			const std::string key{ name };
++			entry->erase(key);
++			entry->add(key, std::move(merged));
++			found = true;
++		}
++
++		if (!found) {
++			LOG(IPAMtkIsp50Unit, Warning)
++				<< "Unit calibration " << path << ": algorithm " << name
++				<< " not in the tuning, left out";
++			result.unknown.push_back(name);
++			continue;
++		}
++
++		std::string keys;
++		for (const auto &[key, value] : unitParams.asDict()) {
++			result.keys.push_back(name + "." + key);
++			keys += (keys.empty() ? "" : ", ") + key;
++		}
++		applied += (applied.empty() ? "" : ", ") + name + " (" + keys + ")";
++	}
++
++	LOG(IPAMtkIsp50Unit, Info)
++		<< "Unit calibration " << path << ": "
++		<< (applied.empty() ? "nothing applied" : applied);
++
++	return result;
++}
++
++} /* namespace ipa::mtkisp50 */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/mtkisp50/unit_tuning.h b/src/ipa/mtkisp50/unit_tuning.h
+new file mode 100644
+index 0000000..76300e4
+--- /dev/null
++++ b/src/ipa/mtkisp50/unit_tuning.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Calibration of the single camera module over the tuning
++ */
++
++#pragma once
++
++#include <string>
++#include <vector>
++
++#include "libcamera/internal/value_node.h"
++
++namespace libcamera {
++
++namespace ipa::mtkisp50 {
++
++/*
++ * The tuning file holds the values of a reference module. A file per camera
++ * module next to it (written on the device, outside the tuning directories)
++ * holds the values calibrated for the single module:
++ *
++ *   version: 1
++ *   algorithms:
++ *     - Awb:
++ *         colourGains: ...
++ *
++ * Each key of an algorithm there replaces the key of the same name at the top
++ * level of that algorithm in the tuning; other keys and algorithms stay. An
++ * algorithm the tuning does not have is not added.
++ */
++struct UnitTuning {
++	enum class Status {
++		Missing,
++		Invalid,
++		Applied,
++	};
++
++	Status status = Status::Missing;
++	/* "Algorithm.key" for every key taken from the file */
++	std::vector<std::string> keys;
++	/* Algorithms of the file the tuning does not have */
++	std::vector<std::string> unknown;
++
++	static std::string file(const std::string &sensorModel);
++	static UnitTuning apply(ValueNode &tuning, const std::string &path);
 +};
 +
 +} /* namespace ipa::mtkisp50 */
@@ -21788,10 +22126,10 @@ index 0000000..42b7cdc
 +TEST_REGISTER(MtkIsp50FramesTest)
 diff --git a/test/mtkisp50/meson.build b/test/mtkisp50/meson.build
 new file mode 100644
-index 0000000..4ad185a
+index 0000000..2ea9f33
 --- /dev/null
 +++ b/test/mtkisp50/meson.build
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,139 @@
 +# SPDX-License-Identifier: CC0-1.0
 +
 +if 'mtkisp50' not in pipelines
@@ -21904,6 +22242,16 @@ index 0000000..4ad185a
 +    'sources': [
 +        'multi_frame.cpp',
 +        '../../src/ipa/mtkisp50/dip_params.cpp',
++    ],
++    'ipa': true,
++}
++
++# The calibration of the camera module over the tuning
++mtkisp50_tests += {
++    'name': 'mtkisp50-unit-tuning',
++    'sources': [
++        'unit_tuning.cpp',
++        '../../src/ipa/mtkisp50/unit_tuning.cpp',
 +    ],
 +    'ipa': true,
 +}
@@ -24080,3 +24428,334 @@ index 0000000..b5652fe
 +};
 +
 +TEST_REGISTER(MtkIsp50TemporalNrTest)
+diff --git a/test/mtkisp50/unit_tuning.cpp b/test/mtkisp50/unit_tuning.cpp
+new file mode 100644
+index 0000000..79a8e48
+--- /dev/null
++++ b/test/mtkisp50/unit_tuning.cpp
+@@ -0,0 +1,325 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * The calibration of the single camera module over the tuning of mtkisp50:
++ * single keys replaced, missing, broken and unknown files, algorithms the
++ * tuning does not have
++ */
++
++#include <cstring>
++#include <fstream>
++#include <iostream>
++#include <memory>
++#include <stdlib.h>
++#include <string>
++#include <unistd.h>
++#include <vector>
++
++#include <libcamera/base/file.h>
++#include <libcamera/base/memfd.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "unit_tuning.h"
++
++#include "test.h"
++
++using namespace libcamera;
++using namespace libcamera::ipa::mtkisp50;
++
++namespace {
++
++/* Round values of our own, no values of a device */
++const char *kTuning = R"(
++version: 1
++algorithms:
++  - BlackLevel:
++  - Awb:
++      colourGains: [1.0, 1.0]
++      sensitivity: [1.0, 1.0, 1.0]
++      speed: 0.5
++  - LensShadingCorrection:
++      grid: [4, 4]
++      sets:
++        - ct: 3000
++          r: [1, 2, 3, 4]
++  - Ccm:
++      ccms:
++        - ct: 5000
++          ccm: [1, 0, 0, 0, 1, 0, 0, 0, 1]
++)";
++
++const char *kUnit = R"(
++version: 1
++source: 0123456789abcdef
++algorithms:
++  - Awb:
++      colourGains: [2.0, 1.5]
++      offset: 7
++  - LensShadingCorrection:
++      sets:
++        - ct: 4000
++          r: [5, 6, 7, 8]
++)";
++
++/* Broken files, each of them leaves the tuning as it is */
++const std::vector<std::pair<const char *, const char *>> kBroken = {
++	{ "syntax", "version: 1\nalgorithms: [ { Awb: { colourGains: [2.0, 1.5 } } ]\n" },
++	{ "empty", "" },
++	{ "list", "- version: 1\n" },
++	{ "no version", "algorithms:\n  - Awb:\n      colourGains: [2.0, 1.5]\n" },
++	{ "version 2", "version: 2\nalgorithms:\n  - Awb:\n      colourGains: [2.0, 1.5]\n" },
++	{ "version text", "version: one\nalgorithms:\n  - Awb:\n      colourGains: [2.0, 1.5]\n" },
++	{ "no algorithms", "version: 1\n" },
++	{ "algorithms no list", "version: 1\nalgorithms:\n  Awb:\n    colourGains: [2.0, 1.5]\n" },
++	{ "two keys", "version: 1\nalgorithms:\n  - Awb: { colourGains: [2.0, 1.5] }\n    Ccm: { ccms: [] }\n" },
++	{ "params no dictionary", "version: 1\nalgorithms:\n  - Awb: [2.0, 1.5]\n" },
++	/* A valid first algorithm does not get through with a broken second one */
++	{ "second broken", "version: 1\nalgorithms:\n  - Awb: { colourGains: [2.0, 1.5] }\n  - Ccm: 3\n" },
++};
++
++/* The tree as text, to compare whole tunings */
++void dump(const ValueNode &node, std::string &out)
++{
++	if (node.isValue()) {
++		out += "'" + node.get<std::string>("") + "'";
++	} else if (node.isList()) {
++		out += "[";
++		for (const ValueNode &child : node.asList()) {
++			dump(child, out);
++			out += ",";
++		}
++		out += "]";
++	} else if (node.isDictionary()) {
++		out += "{";
++		for (const auto &[key, child] : node.asDict()) {
++			out += key + ":";
++			dump(child, out);
++			out += ",";
++		}
++		out += "}";
++	} else {
++		out += "~";
++	}
++}
++
++std::string dump(const ValueNode &node)
++{
++	std::string out;
++	dump(node, out);
++	return out;
++}
++
++const ValueNode &algorithm(const ValueNode &tuning, const std::string &name)
++{
++	static const ValueNode empty;
++
++	for (const ValueNode &algo : tuning["algorithms"].asList()) {
++		if (algo.contains(name))
++			return algo[name];
++	}
++	return empty;
++}
++
++} /* namespace */
++
++class MtkIsp50UnitTuningTest : public Test
++{
++protected:
++	int init() override
++	{
++		char dir[] = "/tmp/libcamera.mtkisp50.XXXXXX";
++		if (!mkdtemp(dir))
++			return TestFail;
++		dir_ = dir;
++		tuning_ = parse(kTuning);
++		return tuning_ ? TestPass : TestFail;
++	}
++
++	int run() override
++	{
++		if (testFile() != TestPass || testApply() != TestPass ||
++		    testMissing() != TestPass || testBroken() != TestPass ||
++		    testUnknown() != TestPass)
++			return TestFail;
++		return TestPass;
++	}
++
++	void cleanup() override
++	{
++		unlink(path().c_str());
++		rmdir(dir_.c_str());
++	}
++
++private:
++	std::unique_ptr<ValueNode> parse(const char *text)
++	{
++		UniqueFD fd = MemFd::create("mtkisp50-unit-tuning", 0);
++		if (!fd.isValid() || write(fd.get(), text, strlen(text)) < 0)
++			return nullptr;
++		File file("/proc/self/fd/" + std::to_string(fd.get()));
++		if (!file.open(File::OpenModeFlag::ReadOnly))
++			return nullptr;
++		return YamlParser::parse(file);
++	}
++
++	std::string path() const
++	{
++		return dir_ + "/sensor-unit.yaml";
++	}
++
++	bool writeUnit(const char *text)
++	{
++		std::ofstream out(path(), std::ios::trunc);
++		out << text;
++		return out.good();
++	}
++
++	int testFile()
++	{
++		setenv("LIBCAMERA_MTKISP50_UNIT_DIR", dir_.c_str(), 1);
++		if (UnitTuning::file("sensor") != path())
++			return fail("directory of the environment not used: " +
++				    UnitTuning::file("sensor"));
++
++		unsetenv("LIBCAMERA_MTKISP50_UNIT_DIR");
++		const std::string def = UnitTuning::file("sensor");
++		if (def.find("/libcamera/ipa/mtkisp50/sensor-unit.yaml") == std::string::npos)
++			return fail("default path " + def);
++
++		return TestPass;
++	}
++
++	int testApply()
++	{
++		std::unique_ptr<ValueNode> tuning = parse(kTuning);
++		if (!tuning || !writeUnit(kUnit))
++			return fail("test data");
++
++		UnitTuning r = UnitTuning::apply(*tuning, path());
++		if (r.status != UnitTuning::Status::Applied || !r.unknown.empty())
++			return fail("valid file not applied");
++
++		const std::vector<std::string> keys = {
++			"Awb.colourGains", "Awb.offset", "LensShadingCorrection.sets",
++		};
++		if (r.keys != keys)
++			return fail("wrong list of keys");
++
++		/* Replaced keys */
++		const ValueNode &awb = algorithm(*tuning, "Awb");
++		if (awb["colourGains"].get<std::vector<double>>() != std::vector<double>{ 2.0, 1.5 })
++			return fail("colourGains not replaced");
++		const ValueNode &lsc = algorithm(*tuning, "LensShadingCorrection");
++		if (lsc["sets"].size() != 1 || lsc["sets"][0]["ct"].get<int>(0) != 4000 ||
++		    lsc["sets"][0]["r"].get<std::vector<int>>() != std::vector<int>{ 5, 6, 7, 8 })
++			return fail("sets not replaced as a whole");
++
++		/* A key only the file has */
++		if (awb["offset"].get<int>(0) != 7)
++			return fail("key of the file missing");
++
++		/* Keys and algorithms the file does not name */
++		if (awb["sensitivity"].get<std::vector<double>>() != std::vector<double>{ 1.0, 1.0, 1.0 } ||
++		    awb["speed"].get<double>(0.0) != 0.5 ||
++		    lsc["grid"].get<std::vector<int>>() != std::vector<int>{ 4, 4 })
++			return fail("key the file does not name changed");
++		if (dump(algorithm(*tuning, "Ccm")) != dump(algorithm(*tuning_, "Ccm")) ||
++		    dump(algorithm(*tuning, "BlackLevel")) != dump(algorithm(*tuning_, "BlackLevel")))
++			return fail("algorithm the file does not name changed");
++
++		/* Order of the algorithms and of the keys kept, one key per entry */
++		const char *order[] = { "BlackLevel", "Awb", "LensShadingCorrection", "Ccm" };
++		const ValueNode &algorithms = (*tuning)["algorithms"];
++		if (algorithms.size() != 4)
++			return fail("number of algorithms changed");
++		for (unsigned int i = 0; i < 4; i++) {
++			if (algorithms[i].size() != 1 || !algorithms[i].contains(order[i]))
++				return fail("order of the algorithms changed");
++		}
++		std::string awbKeys;
++		for (const auto &[key, value] : awb.asDict())
++			awbKeys += key + " ";
++		if (awbKeys != "colourGains sensitivity speed offset ")
++			return fail("order of the keys: " + awbKeys);
++
++		/* The same file once more gives the same tuning */
++		const std::string once = dump(*tuning);
++		UnitTuning::apply(*tuning, path());
++		if (dump(*tuning) != once)
++			return fail("second application differs");
++
++		return TestPass;
++	}
++
++	int testMissing()
++	{
++		std::unique_ptr<ValueNode> tuning = parse(kTuning);
++		unlink(path().c_str());
++
++		UnitTuning r = UnitTuning::apply(*tuning, path());
++		if (r.status != UnitTuning::Status::Missing || dump(*tuning) != dump(*tuning_))
++			return fail("missing file changed the tuning");
++
++		return TestPass;
++	}
++
++	int testBroken()
++	{
++		for (const auto &[what, text] : kBroken) {
++			std::unique_ptr<ValueNode> tuning = parse(kTuning);
++			if (!tuning || !writeUnit(text))
++				return fail("test data");
++
++			UnitTuning r = UnitTuning::apply(*tuning, path());
++			if (r.status != UnitTuning::Status::Invalid)
++				return fail(std::string("broken file accepted: ") + what);
++			if (dump(*tuning) != dump(*tuning_))
++				return fail(std::string("broken file changed the tuning: ") + what);
++		}
++
++		/* A directory in place of the file */
++		std::unique_ptr<ValueNode> tuning = parse(kTuning);
++		UnitTuning r = UnitTuning::apply(*tuning, dir_);
++		if (r.status != UnitTuning::Status::Invalid || dump(*tuning) != dump(*tuning_))
++			return fail("directory accepted");
++
++		return TestPass;
++	}
++
++	int testUnknown()
++	{
++		std::unique_ptr<ValueNode> tuning = parse(kTuning);
++		if (!tuning || !writeUnit("version: 1\n"
++					  "algorithms:\n"
++					  "  - Foo:\n"
++					  "      bar: 3\n"
++					  "  - Awb:\n"
++					  "      speed: 0.25\n"))
++			return fail("test data");
++
++		UnitTuning r = UnitTuning::apply(*tuning, path());
++		if (r.status != UnitTuning::Status::Applied ||
++		    r.unknown != std::vector<std::string>{ "Foo" } ||
++		    r.keys != std::vector<std::string>{ "Awb.speed" })
++			return fail("unknown algorithm not left out");
++
++		if ((*tuning)["algorithms"].size() != 4 || algorithm(*tuning, "Foo"))
++			return fail("unknown algorithm added");
++		if (algorithm(*tuning, "Awb")["speed"].get<double>(0.0) != 0.25)
++			return fail("known algorithm next to an unknown one not applied");
++
++		return TestPass;
++	}
++
++	int fail(const std::string &what)
++	{
++		std::cerr << what << std::endl;
++		return TestFail;
++	}
++
++	std::string dir_;
++	/* The tuning as read, to compare */
++	std::unique_ptr<ValueNode> tuning_;
++};
++
++TEST_REGISTER(MtkIsp50UnitTuningTest)
