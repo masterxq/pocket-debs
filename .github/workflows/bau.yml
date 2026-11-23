@@ -150,21 +150,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/apt-repo"
           cp -a "$PAKETE_OUT/repo/dists" "$PAKETE_OUT/repo/pool" "$PAKETE_OUT/repo/stand" "$RUNNER_TEMP/apt-repo/"
           { echo '```'; ./bau.sh liste; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      # Publishes to the public APT registry codeberg.org/moblix (suite testing, component main) with registry.sh:
-      # only from main and never a run that was started with additional draft packages. A version that is already
-      # there is left as it is; then the signed index of the registry is checked against the files of this run and
-      # older versions of our source packages are removed, so the registry holds one version per package.
-      - name: publish
-        if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && inputs.pakete == '' }}
-        env:
-          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
-        run: |
-          set -eu
-          ./registry.sh hochladen "$RUNNER_TEMP/ergebnis"
-          ./registry.sh pruefen "$RUNNER_TEMP/ergebnis"
-          ./registry.sh aufraeumen "$RUNNER_TEMP/ergebnis"
       - uses: actions/upload-artifact@v7
         with:
           name: apt-repo
           path: ${{ runner.temp }}/apt-repo/
           retention-days: 30
+
+  # Publishes to the public APT registry codeberg.org/moblix: only from main and never a run that was started
+  # with additional draft packages (what the registry holds ends up in the images and on the phones).
+  registry:
+    needs: bau
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && inputs.pakete == '' }}
+    uses: ./.github/workflows/registry.yml
+    with:
+      artefakte: '*_*'
+    secrets:
+      CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}

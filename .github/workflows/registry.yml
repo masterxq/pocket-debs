@@ -1,0 +1,54 @@
+# Reusable workflow: publishes the Debian packages of the calling run to the public APT registry
+# codeberg.org/moblix (suite testing, component main) with registry.sh of this repository: upload, check of the
+# signed index against the files of the run, removal of older versions of the same source packages. Used by the
+# workflow bau of this repository and by forks that build their own package (e.g. omacam):
+#
+#   registry:
+#     needs: <build job>
+#     if: ${{ github.ref == 'refs/heads/<main branch>' }}
+#     uses: masterxq/pocket-debs/.github/workflows/registry.yml@main
+#     with:
+#       artefakte: '<name>_*'
+#     secrets:
+#       CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+#
+# The caller decides when to publish (only its main branch). The artifacts must hold all packages of the source
+# packages the run built: what is older than the run and belongs to these sources is removed from the registry.
+name: registry
+
+on:
+  workflow_call:
+    inputs:
+      artefakte:
+        description: 'Name pattern of the artifacts of the calling run that hold the .deb files'
+        type: string
+        required: true
+    secrets:
+      CODEBERG_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  registry:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      # registry.sh always comes from main of pocket-debs, also when another repository calls this workflow
+      - uses: actions/checkout@v7
+        with:
+          repository: masterxq/pocket-debs
+          ref: main
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ${{ inputs.artefakte }}
+          path: ${{ runner.temp }}/ergebnis
+      - name: publish
+        env:
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+        run: |
+          set -eu
+          ./registry.sh hochladen "$RUNNER_TEMP/ergebnis"
+          ./registry.sh pruefen "$RUNNER_TEMP/ergebnis"
+          ./registry.sh aufraeumen "$RUNNER_TEMP/ergebnis"
