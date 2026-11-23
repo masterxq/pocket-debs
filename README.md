@@ -80,13 +80,19 @@ yet; `--trotzdem` takes it anyway) and puts it into `$PAKETE_OUT/repo` like a lo
 
 Every run on `main` publishes its packages to the public APT registry of the organisation
 [moblix on Codeberg](https://codeberg.org/moblix/-/packages), suite `testing`, component `main` (runs for pull
-requests and runs with additional draft packages do not publish; debug symbol packages are left out). A version
+requests and runs with additional draft packages do not publish; debug symbol, test and example packages such as
+`gtk-4-tests` are left out, see `REG_OHNE` in `registry.sh`). A version
 that is already there is not replaced, so a changed package needs a new `REVISION`. As in the Debian archive the
 registry holds one version per package: after publishing, `registry.sh aufraeumen` removes older versions of the
 source packages of this repository and binary packages a source no longer builds. Packages that other repositories
 publish to the same registry are not touched.
 Forgejo rebuilds the index only on upload, so after removing packages the script removes and uploads again the
 smallest package of the run for each affected architecture; otherwise the index would keep listing removed files.
+
+Publishing is the reusable workflow `.github/workflows/registry.yml`. A fork that builds its own Debian package
+(e.g. `omacam`) calls it from its workflow for pushes to its main branch, so its package reaches the registry without
+a build in this repository; the cleanup then keeps one version of that package as well. The header of the workflow
+shows the call.
 
 Codeberg signs the index (`InRelease`) with the key of the registry; apt verifies it and, through the checksums in
 the index, every package. The packages themselves carry no signature (as in Debian). `registry.sh pruefen` checks

@@ -1,13 +1,16 @@
 #!/bin/sh
 # Veroeffentlicht die gebauten Pakete in der APT-Registry (Forgejo, codeberg.org/moblix) und haelt sie sauber.
 #
-#   ./registry.sh hochladen <ordner>            alle *.deb unter <ordner> hochladen (ohne *-dbgsym)
+#   ./registry.sh hochladen <ordner>            alle *.deb unter <ordner> hochladen (ohne die Pakete aus REG_OHNE)
 #   ./registry.sh pruefen <ordner>              Index der Registry gegen die Dateien unter <ordner> pruefen (sha256)
 #   ./registry.sh aufraeumen <ordner> [--probe] aeltere Fassungen unserer Quellpakete aus der Registry loeschen
 #   ./registry.sh auffrischen <ordner> <arch>   Index einer Architektur neu erzeugen lassen (siehe unten)
 #
 # <ordner> ist der Ergebnisordner eines Laufs (CI: alle Artefakte <quelle>_<fassung>), er muss ALLE Pakete des
-# Laufs enthalten. Umgebung: CODEBERG_TOKEN (hochladen, aufraeumen), REGISTRY, REG_SUITE, REG_KOMPONENTE.
+# Laufs enthalten. Umgebung: CODEBERG_TOKEN (hochladen, aufraeumen), REGISTRY, REG_SUITE, REG_KOMPONENTE, REG_OHNE.
+#
+# REG_OHNE: Muster von Paketnamen, die nicht in die Registry kommen (Debug-Symbole, Test- und Beispielprogramme:
+# gross und am Telefon nicht gebraucht). Liegt so ein Paket einer unserer Quellen noch dort, loescht aufraeumen es.
 #
 # Signatur: Den Index (InRelease) signiert die Registry mit ihrem eigenen Schluessel, apt prueft ihn und ueber die
 # sha256 im Index jede Datei. Die Pakete selbst werden nicht signiert (wie bei Debian). "pruefen" stellt sicher,
@@ -29,12 +32,22 @@ set -eu
 REGISTRY=${REGISTRY:-https://codeberg.org/api/packages/moblix/debian}
 REG_SUITE=${REG_SUITE:-testing}
 REG_KOMPONENTE=${REG_KOMPONENTE:-main}
+REG_OHNE=${REG_OHNE:-*-dbgsym *-tests *-examples}
 
 ende() { echo "registry.sh: $*" >&2; exit 1; }
 zeile() { [ -z "${GITHUB_STEP_SUMMARY:-}" ] || echo "$*" >> "$GITHUB_STEP_SUMMARY"; }
 meldung() { if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::$1::$2"; else echo "$1: $2" >&2; fi; }
 
-debs() { find "$1" -name '*.deb' ! -name '*-dbgsym_*' | sort; }
+# $1 = Paketname: wahr, wenn er auf ein Muster aus REG_OHNE passt
+ausgenommen() {
+	set -f; for m in $REG_OHNE; do set +f; case $1 in $m) return 0 ;; esac; done; set +f
+	return 1
+}
+debs() {
+	find "$1" -name '*.deb' | sort | while read -r d; do
+		n=${d##*/}; ausgenommen "${n%%_*}" || echo "$d"
+	done
+}
 
 # Dateien des Laufs: <paket> <fassung> <architektur> <quelle> <sha256> <datei>
 stand() {
@@ -128,7 +141,7 @@ aufraeumen)
 		grenze=$(awk -v p="$p" -v a="$a" '$1 == p && $3 == a {print $2}' "$T/lauf")
 		[ -n "$grenze" ] || grenze=$(awk -v q="$q" '$1 == q {print $2}' "$T/quellen")
 		[ -n "$grenze" ] || continue   # Quelle gehoert nicht zu diesem Lauf
-		dpkg --compare-versions "$v" lt "$grenze" || continue
+		ausgenommen "$p" || dpkg --compare-versions "$v" lt "$grenze" || continue
 		n=$((n + 1))
 		if [ "$PROBE" = --probe ]; then echo "wuerde loeschen: $p $v $a (aktuell $grenze)"; continue; fi
 		code=$(curl -sS -m 120 -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: token $CODEBERG_TOKEN" \
