@@ -72,6 +72,17 @@ cache).
 - **Expiry.** Cache entries unused for 7 days and artifacts after 90 days (`apt-repo` after 30) are deleted by
   GitHub. The weekly run keeps the cache in use. A missing cache entry simply means the package is built again.
 
+### Following Debian
+
+`.github/workflows/nachziehen.yml` runs once a week (and on request). For every active package whose Debian version
+in the suite is newer than the base of the recipe it runs `./bau.sh nachziehen <source> --uebernehmen` and builds the
+result. If the patches apply and the build succeeds, the changed recipe (`DEBIAN`, `DSC_SHA256`, `REVISION=1`,
+refreshed patches) is committed to `main` and the workflow `bau` is started; it finds the build in the cache and
+publishes it. If not, `main` and the published version stay as they are and an issue `nachziehen: <source> <debian
+version>` is opened, once per Debian version; the run that later moves the package closes it. A second kind of issue
+reports a patch that was dropped because Debian already contains the change: then the package may no longer be
+needed. Drafts are not moved. "Run workflow" with `probe` tries everything without the commit and without issues.
+
 Fetch the CI results instead of building (needs an authenticated GitHub CLI `gh`):
 
     ./bau.sh holen <source...>|alle|image   # newest unexpired artifact from main, checks SHA256SUMS and the key
