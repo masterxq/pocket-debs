@@ -1,0 +1,130 @@
+From: pocket-debs
+Date: Mon, 23 Nov 2026 23:00:00 +0100
+Subject: [PATCH] v4l2codecs: mpeg2: Reset the quantisation matrices on every sequence header
+Description:
+ A sequence header redefines the quantisation matrices, and a quant
+ matrix extension overwrites them until the next sequence header. The
+ base class does not call new_sequence() for a sequence header that
+ equals the previous one, but it does forget the quant matrix extension
+ there. The element only reset its matrices in new_sequence() and
+ otherwise only applied the matrices loaded by an extension, so after a
+ repeated sequence header the matrices of an earlier extension stayed in
+ the quantisation control and the following pictures were dequantised
+ with them (seen with the conformance streams sony-ct1 and sony-ct2).
+ .
+ Keep the matrices of the sequence header and build the quantisation
+ control for every picture from them and the quant matrix extension the
+ base class passes with the slice, as the VA decoder does. The control is
+ only sent when it changed. A loaded luma matrix also sets the chroma
+ matrix of the same kind, as in the sequence header.
+Forwarded: no
+License: LGPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-23
+---
+diff --git a/sys/v4l2codecs/gstv4l2codecmpeg2dec.c b/sys/v4l2codecs/gstv4l2codecmpeg2dec.c
+index 268f290..19ad999 100644
+--- a/sys/v4l2codecs/gstv4l2codecmpeg2dec.c
++++ b/sys/v4l2codecs/gstv4l2codecmpeg2dec.c
+@@ -114,6 +114,8 @@ struct _GstV4l2CodecMpeg2Dec
+   struct v4l2_ctrl_mpeg2_sequence v4l2_sequence;
+   struct v4l2_ctrl_mpeg2_picture v4l2_picture;
+   struct v4l2_ctrl_mpeg2_quantisation v4l2_quantisation;
++  /* matrices of the sequence header, the quant matrix extensions apply on top */
++  struct v4l2_ctrl_mpeg2_quantisation seq_quantisation;
+ 
+   GstV4l2CodecAllocator *sink_allocator;
+   GstV4l2CodecAllocator *src_allocator;
+@@ -520,14 +522,21 @@ gst_v4l2_codec_mpeg2_dec_new_sequence (GstMpeg2Decoder * decoder,
+ 
+   /* copy quantiser from the sequence header,
+    * if none is provided this will copy the default ones
+-   * added by the parser
++   * added by the parser, the chroma matrices are the same
+    */
+-  memcpy (self->v4l2_quantisation.intra_quantiser_matrix,
++  memcpy (self->seq_quantisation.intra_quantiser_matrix,
+       seq->intra_quantizer_matrix,
+-      sizeof (self->v4l2_quantisation.intra_quantiser_matrix));;
+-  memcpy (self->v4l2_quantisation.non_intra_quantiser_matrix,
++      sizeof (self->seq_quantisation.intra_quantiser_matrix));
++  memcpy (self->seq_quantisation.non_intra_quantiser_matrix,
+       seq->non_intra_quantizer_matrix,
+-      sizeof (self->v4l2_quantisation.non_intra_quantiser_matrix));;
++      sizeof (self->seq_quantisation.non_intra_quantiser_matrix));
++  memcpy (self->seq_quantisation.chroma_intra_quantiser_matrix,
++      seq->intra_quantizer_matrix,
++      sizeof (self->seq_quantisation.chroma_intra_quantiser_matrix));
++  memcpy (self->seq_quantisation.chroma_non_intra_quantiser_matrix,
++      seq->non_intra_quantizer_matrix,
++      sizeof (self->seq_quantisation.chroma_non_intra_quantiser_matrix));
++  self->v4l2_quantisation = self->seq_quantisation;
+ 
+   /* *INDENT-OFF* */
+   self->v4l2_sequence = (struct v4l2_ctrl_mpeg2_sequence) {
+@@ -629,6 +638,7 @@ gst_v4l2_codec_mpeg2_dec_start_picture (GstMpeg2Decoder * decoder,
+     GstMpeg2Picture * prev_picture, GstMpeg2Picture * next_picture)
+ {
+   GstV4l2CodecMpeg2Dec *self = GST_V4L2_CODEC_MPEG2_DEC (decoder);
++  struct v4l2_ctrl_mpeg2_quantisation quantisation;
+ 
+   /* FIXME base class should not call us if negotiation failed */
+   if (!self->sink_allocator)
+@@ -664,29 +674,43 @@ gst_v4l2_codec_mpeg2_dec_start_picture (GstMpeg2Decoder * decoder,
+     memcpy (&self->v4l2_picture.f_code, slice->pic_ext->f_code,
+         sizeof (self->v4l2_picture.f_code));
+ 
+-  /* overwrite the sequence ones if needed, see 6.1.1.6 for reference */
++  /* The quant matrix extensions since the last sequence header overwrite the
++   * matrices of the sequence header, see 6.1.1.6 and 6.3.11 for reference.
++   * Start from the sequence header for every picture: a repeated sequence
++   * header resets the matrices even when it equals the previous one, and
++   * new_sequence() is not called for it. */
++  quantisation = self->seq_quantisation;
+   if (slice->quant_matrix) {
+-    if (slice->quant_matrix->load_intra_quantiser_matrix)
+-      memcpy (self->v4l2_quantisation.intra_quantiser_matrix,
++    if (slice->quant_matrix->load_intra_quantiser_matrix) {
++      memcpy (quantisation.intra_quantiser_matrix,
+           slice->quant_matrix->intra_quantiser_matrix,
+-          sizeof (self->v4l2_quantisation.intra_quantiser_matrix));
+-    if (slice->quant_matrix->load_non_intra_quantiser_matrix)
+-      memcpy (self->v4l2_quantisation.non_intra_quantiser_matrix,
++          sizeof (quantisation.intra_quantiser_matrix));
++      memcpy (quantisation.chroma_intra_quantiser_matrix,
++          slice->quant_matrix->intra_quantiser_matrix,
++          sizeof (quantisation.chroma_intra_quantiser_matrix));
++    }
++    if (slice->quant_matrix->load_non_intra_quantiser_matrix) {
++      memcpy (quantisation.non_intra_quantiser_matrix,
+           slice->quant_matrix->non_intra_quantiser_matrix,
+-          sizeof (self->v4l2_quantisation.non_intra_quantiser_matrix));
++          sizeof (quantisation.non_intra_quantiser_matrix));
++      memcpy (quantisation.chroma_non_intra_quantiser_matrix,
++          slice->quant_matrix->non_intra_quantiser_matrix,
++          sizeof (quantisation.chroma_non_intra_quantiser_matrix));
++    }
+     if (slice->quant_matrix->load_chroma_intra_quantiser_matrix)
+-      memcpy (self->v4l2_quantisation.chroma_intra_quantiser_matrix,
++      memcpy (quantisation.chroma_intra_quantiser_matrix,
+           slice->quant_matrix->chroma_intra_quantiser_matrix,
+-          sizeof (self->v4l2_quantisation.chroma_intra_quantiser_matrix));
++          sizeof (quantisation.chroma_intra_quantiser_matrix));
+     if (slice->quant_matrix->load_chroma_non_intra_quantiser_matrix)
+-      memcpy (self->v4l2_quantisation.chroma_non_intra_quantiser_matrix,
++      memcpy (quantisation.chroma_non_intra_quantiser_matrix,
+           slice->quant_matrix->chroma_non_intra_quantiser_matrix,
+-          sizeof (self->v4l2_quantisation.chroma_non_intra_quantiser_matrix));
++          sizeof (quantisation.chroma_non_intra_quantiser_matrix));
++  }
+ 
+-    self->need_quantiser |= (slice->quant_matrix->load_intra_quantiser_matrix ||
+-        slice->quant_matrix->load_non_intra_quantiser_matrix ||
+-        slice->quant_matrix->load_chroma_intra_quantiser_matrix ||
+-        slice->quant_matrix->load_chroma_non_intra_quantiser_matrix);
++  if (memcmp (&quantisation, &self->v4l2_quantisation,
++          sizeof (quantisation)) != 0) {
++    self->v4l2_quantisation = quantisation;
++    self->need_quantiser = TRUE;
+   }
+ 
+   return GST_FLOW_OK;
