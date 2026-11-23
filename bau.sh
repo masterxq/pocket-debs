@@ -25,7 +25,9 @@
 #   PAKETE_STRENG=1 (gleiche Fassung mit anderem Inhalt ist ein Fehler statt einer Warnung),
 #   PAKETE_GPG_KEY (Schluessel zum Signieren des Repos) mit PAKETE_GNUPGHOME (Standard $GNUPGHOME bzw. ~/.gnupg),
 #   PAKETE_TIMEOUT (Sekunden je Containerlauf, Standard 21600), NICE (Standard 10),
-#   PAKETE_CCACHE=0 (ohne Compiler-Cache bauen), PAKETE_CCACHE_MAX (Obergrenze je Paket, Standard 2G).
+#   PAKETE_CCACHE=0 (ohne Compiler-Cache bauen), PAKETE_CCACHE_MAX (Obergrenze je Paket, Standard 2G),
+#   PAKETE_TEST=<commit> (Testbau: Fassung <debian>+pd<n>~test.<7 Zeichen des Commits>; sie sortiert vor der Fassung
+#   aus main, apt ersetzt einen Testbau also durch den spaeteren Bau aus main. Geht nicht in den Schluessel ein.)
 # Compiler-Cache: $PAKETE_OUT/ccache/<quelle>/ (ccache), bleibt ueber Bauten erhalten; geht nicht in den Schluessel ein,
 #   weil ein Treffer dieselbe Objektdatei liefert wie der Compiler.
 # Rueckgabe: 0 gut, 1 Fehler, 2 Aufruf, 3 neuere Debian-Fassung (pruefen) bzw. Patch-Konflikt (nachziehen).
@@ -68,7 +70,7 @@ lade_conf() {   # lade_conf <quelle>: Variablen aus <quelle>/paket.conf
 	[ "$QUELLE" = "$q" ] || fehler "$q/paket.conf: QUELLE=$QUELLE passt nicht zum Ordner"
 	[ -n "$REVISION" ] || fehler "$q/paket.conf: REVISION fehlt"
 	OHNE_EPOCHE=${DEBIAN#*:}
-	FASSUNG=$DEBIAN+$VERSION_TAG$REVISION
+	FASSUNG=$DEBIAN+$VERSION_TAG$REVISION${PAKETE_TEST:+~test.${PAKETE_TEST:0:7}}
 	FASSUNG_DATEI=${FASSUNG#*:}
 	export QUELLE DEBIAN FASSUNG OPTIONEN PROFILE BAUART MAINTAINER SUITE CHANGELOG DATEIEN_KOPF FEHLT_ERLAUBT
 	POOL=$(pool "$QUELLE")

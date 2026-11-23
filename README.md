@@ -60,6 +60,10 @@ cache).
 - **Every run carries all packages.** Each run uploads one artifact per package, named `<source>_<version>`
   (`.deb` files, source package, `STAND` with version and key, `BUILDINFO`, `SHA256SUMS`, patch and comparison
   results), and `apt-repo` with the complete repository (`dists/`, `pool/`, `stand/`).
+- **Test builds.** In a pull request and on other branches than `main` a package that is built gets the version
+  `<debian version>+pd<n>~test.<commit>` (`PAKETE_TEST`). It sorts before the version `main` builds later, so apt
+  replaces a test build on a device once the build of `main` is in the APT repository. A package the pull request
+  does not change comes from the cache and keeps the version of `main`.
 - **Compiler cache.** Builds run through ccache. Locally the cache lives in `$PAKETE_OUT/ccache/<source>/`
   (`PAKETE_CCACHE=0` builds without it, `PAKETE_CCACHE_MAX` caps it per package, default 2G); in CI each built
   package restores the newest `ccache-<source>-*` entry and saves the updated one, so rebuilding the same package
