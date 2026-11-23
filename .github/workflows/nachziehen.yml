@@ -1,0 +1,213 @@
+# Follows Debian: once a week every active package whose Debian version in the suite is newer than the base of
+# our recipe is moved to that version (./bau.sh nachziehen --uebernehmen applies and refreshes the patches) and
+# built. Only when the patches apply and the build succeeds the changed recipe is committed to main; the workflow
+# bau is then started, takes the build from the cache and publishes it. Nothing is built twice.
+#
+# When the patches do not apply or the build fails, main and the published version stay as they are and an issue
+# "nachziehen: <source> <debian version>" is opened (once per version, not every week). It is closed by the run
+# that moves the package. An issue is also opened when a patch is dropped because Debian already contains the
+# change: the package may no longer be needed.
+#
+# "Run workflow" with probe: everything except the commit to main, the start of bau and the issues.
+name: nachziehen
+
+on:
+  schedule:
+    - cron: '23 0 * * 1'
+  workflow_dispatch:
+    inputs:
+      probe:
+        description: 'Only try: no commit to main, no issues'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nachziehen
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: plan
+        run: |
+          set -eu
+          export PAKETE_OUT=$RUNNER_TEMP/out
+          rc=0; ./bau.sh pruefen > pruefen.txt 2> pruefen.err || rc=$?
+          cat pruefen.txt
+          [ $rc = 0 ] || [ $rc = 3 ] || { cat pruefen.err; echo "::error::bau.sh pruefen failed"; exit 1; }
+          # only active packages; drafts are moved by hand
+          aktiv=" $(./bau.sh namen alle | tr '\n' ' ') "
+          qs=$(awk '/NEUER:/ {print $1}' pruefen.txt | while read -r q; do case $aktiv in *" $q "*) echo "$q" ;; esac; done)
+          matrix=$(printf '%s\n' $qs | jq -Rsc 'split("\n") | map(select(length > 0) | {quelle: .})')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          { echo '```'; cat pruefen.txt; echo '```'; echo "to move: ${qs:-nothing}"; } >> "$GITHUB_STEP_SUMMARY"
+
+  nachziehen:
+    needs: plan
+    if: ${{ needs.plan.outputs.matrix != '[]' }}
+    name: ${{ matrix.quelle }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 355
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      Q: ${{ matrix.quelle }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: paths
+        run: |
+          echo "PAKETE_OUT=$RUNNER_TEMP/out" >> "$GITHUB_ENV"
+          echo "PAKETE_ERGEBNIS=$RUNNER_TEMP/ergebnis" >> "$GITHUB_ENV"
+      - name: apply the patches to the new Debian version
+        id: nz
+        run: |
+          set -eu
+          rc=0; ./bau.sh nachziehen "$Q" --uebernehmen > "$RUNNER_TEMP/nz.txt" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/nz.txt"
+          ziel=$(sed -n 's/.* -> Debian \([^ ]*\) .*/\1/p' "$RUNNER_TEMP/nz.txt" | head -1)
+          echo "ziel=${ziel:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "entfaellt=$(grep -c ': entfaellt$' "$RUNNER_TEMP/nz.txt" || true)" >> "$GITHUB_OUTPUT"
+          case $rc in
+            0) echo "stand=ok" >> "$GITHUB_OUTPUT" ;;
+            3) echo "stand=konflikt" >> "$GITHUB_OUTPUT"; echo "::error::$Q: the patches do not apply to Debian $ziel"; exit 1 ;;
+            *) echo "stand=fehler" >> "$GITHUB_OUTPUT"; exit 1 ;;
+          esac
+      - name: ccache restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/out/ccache/${{ matrix.quelle }}
+          key: ccache-${{ matrix.quelle }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-${{ matrix.quelle }}-
+      - name: build
+        env:
+          PAKETE_TIMEOUT: '20400'
+          PAKETE_CCACHE_MAX: 1500M
+        run: ./bau.sh bau "$Q" --neu
+      - name: ccache save
+        if: ${{ always() && steps.nz.outputs.stand == 'ok' }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/out/ccache/${{ matrix.quelle }}
+          key: ccache-${{ matrix.quelle }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: check
+        id: check
+        run: |
+          set -eu
+          E=$PAKETE_ERGEBNIS/$Q
+          K=$(./bau.sh schluessel "$Q" | sed -n 's/^schluessel=//p')
+          grep -qx "schluessel=$K" "$E/STAND" || { echo "::error::$Q: key in STAND differs from $K"; exit 1; }
+          (cd "$E" && sha256sum -c --quiet SHA256SUMS)
+          echo "schluessel=$K" >> "$GITHUB_OUTPUT"
+          # the changed recipe as a patch for the job that commits it
+          mkdir -p "$RUNNER_TEMP/rezept"
+          git add -A "$Q"
+          git diff --cached --binary > "$RUNNER_TEMP/rezept/$Q.patch"
+          { echo "ziel=${{ steps.nz.outputs.ziel }}"; echo "fassung=$(sed -n 's/^fassung=//p' "$E/STAND")"
+            grep ': entfaellt$' "$RUNNER_TEMP/nz.txt" | sed 's/^ */entfaellt=/; s/: entfaellt$//' || true; } > "$RUNNER_TEMP/rezept/$Q.txt"
+          { echo "### $Q: Debian ${{ steps.nz.outputs.ziel }}"; echo '```'; cat "$RUNNER_TEMP/nz.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # the workflow bau finds the build under the same key and does not build again
+      - uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/ergebnis/${{ matrix.quelle }}
+          key: paket-${{ matrix.quelle }}-${{ steps.check.outputs.schluessel }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rezept-${{ matrix.quelle }}
+          path: ${{ runner.temp }}/rezept/
+          if-no-files-found: error
+          retention-days: 7
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: log-${{ matrix.quelle }}
+          path: |
+            ${{ runner.temp }}/nz.txt
+            ${{ runner.temp }}/out/bau/${{ matrix.quelle }}/
+            ${{ runner.temp }}/out/nachziehen/${{ matrix.quelle }}/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: issues
+        if: ${{ always() && !inputs.probe }}
+        env:
+          ZIEL: ${{ steps.nz.outputs.ziel }}
+          STAND: ${{ steps.nz.outputs.stand }}
+          ENTFAELLT: ${{ steps.nz.outputs.entfaellt }}
+          ERFOLG: ${{ job.status == 'success' }}
+          LAUF: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          offen() { gh issue list --state open --limit 200 --json number,title --jq ".[] | select(.title | startswith(\"$1\")) | .number"; }
+          auszug() { echo '```'; tail -40 "$RUNNER_TEMP/nz.txt" 2>/dev/null || true; echo '```'; }
+          if [ "$ERFOLG" = true ]; then
+            for n in $(offen "nachziehen: $Q "); do
+              gh issue close "$n" --comment "Moved to Debian $ZIEL by $LAUF."
+            done
+            if [ "${ENTFAELLT:-0}" != 0 ] && [ -z "$(offen "$Q $ZIEL: ")" ]; then
+              { echo "The run $LAUF moved \`$Q\` to Debian $ZIEL. Debian already contains the change of at least one patch, so the patch was dropped. Check whether the package is still needed in this repository."; echo; auszug; } \
+                | gh issue create --title "$Q $ZIEL: a patch is no longer needed" --body-file -
+            fi
+          else
+            titel="nachziehen: $Q $ZIEL"
+            [ -z "$(offen "$titel")" ] || { echo "issue \"$titel\" is already open"; exit 0; }
+            if [ "$STAND" = konflikt ]; then was="The patches do not apply to Debian $ZIEL."; elif [ "$STAND" = ok ]; then was="The patches apply to Debian $ZIEL, but the build failed."; else was="Moving to the new Debian version failed."; fi
+            { echo "$was The recipe on main and the published version are unchanged. Log: $LAUF"; echo
+              echo "By hand: \`./bau.sh nachziehen $Q\`, adapt the patches, \`./bau.sh nachziehen $Q --uebernehmen\`, build, push."; echo; auszug; } \
+              | gh issue create --title "$titel" --body-file -
+          fi
+
+  uebernehmen:
+    needs: nachziehen
+    if: ${{ always() && needs.nachziehen.result != 'skipped' && !inputs.probe }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: rezept-*
+          path: ${{ runner.temp }}/rezept
+          merge-multiple: true
+      - name: commit the moved recipes to main and start bau
+        run: |
+          set -eu
+          ls "$RUNNER_TEMP"/rezept/*.patch > /dev/null 2>&1 || { echo "nothing was moved"; exit 0; }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          for p in "$RUNNER_TEMP"/rezept/*.patch; do
+            q=$(basename "$p" .patch); t=$RUNNER_TEMP/rezept/$q.txt
+            # main may have moved while the packages were built: a recipe changed in the meantime is left alone
+            git apply --index "$p" || { echo "::warning::$q: the recipe on main changed in the meantime, not committed"; git reset -q --hard; continue; }
+            weg=$(sed -n 's/^entfaellt=//p' "$t" | tr '\n' ' ')
+            git commit -q -m "$q: Debian $(sed -n 's/^ziel=//p' "$t")" \
+              -m "Moved by the workflow nachziehen: patches applied to the new Debian version and built as $(sed -n 's/^fassung=//p' "$t").${weg:+ Dropped, Debian contains the change: $weg}"
+            echo "- $q: $(sed -n 's/^fassung=//p' "$t")" >> "$GITHUB_STEP_SUMMARY"
+          done
+          [ -n "$(git log --oneline origin/main..HEAD)" ] || exit 0
+          git push origin HEAD:main || { git pull -q --rebase origin main; git push origin HEAD:main; }
+          # a push with the token of the workflow does not start other workflows
+          gh workflow run bau.yml --ref main
