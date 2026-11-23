@@ -76,4 +76,24 @@ Fetch the CI results instead of building (needs an authenticated GitHub CLI `gh`
 yet; `--trotzdem` takes it anyway) and puts it into `$PAKETE_OUT/repo` like a local build, so a following
 `./bau.sh bau` skips it. If no artifact is left, start a CI run or build locally.
 
+## APT repository
+
+Every run on `main` publishes its packages to the public APT registry of the organisation
+[moblix on Codeberg](https://codeberg.org/moblix/-/packages), suite `testing`, component `main` (runs for pull
+requests and runs with additional draft packages do not publish; debug symbol packages are left out). A version
+that is already there is not replaced, so a changed package needs a new `REVISION`. Codeberg signs the index with
+the key of the registry:
+
+    sudo curl -o /etc/apt/keyrings/forgejo-moblix.asc https://codeberg.org/api/packages/moblix/debian/repository.key
+    echo "deb [signed-by=/etc/apt/keyrings/forgejo-moblix.asc] https://codeberg.org/api/packages/moblix/debian testing main" \
+        | sudo tee /etc/apt/sources.list.d/moblix.list
+
+The packages are built against Debian `forky` and are test builds for development, not a stable release.
+
+## License
+
+The build scripts, the workflow and the documentation of this repository are under the GNU General Public License,
+version 3 or (at your option) any later version, see `LICENSE`. Every patch and every file under `<source>/dateien/`
+is under the license of the source package it changes (named in its header).
+
 This repository was developed with heavy AI assistance; review and release on the device are done by a human.
