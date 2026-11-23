@@ -4,6 +4,7 @@
 #   ./registry.sh hochladen <ordner>            alle *.deb unter <ordner> hochladen (ohne *-dbgsym)
 #   ./registry.sh pruefen <ordner>              Index der Registry gegen die Dateien unter <ordner> pruefen (sha256)
 #   ./registry.sh aufraeumen <ordner> [--probe] aeltere Fassungen unserer Quellpakete aus der Registry loeschen
+#   ./registry.sh auffrischen <ordner> <arch>   Index einer Architektur neu erzeugen lassen (siehe unten)
 #
 # <ordner> ist der Ergebnisordner eines Laufs (CI: alle Artefakte <quelle>_<fassung>), er muss ALLE Pakete des
 # Laufs enthalten. Umgebung: CODEBERG_TOKEN (hochladen, aufraeumen), REGISTRY, REG_SUITE, REG_KOMPONENTE.
@@ -17,6 +18,12 @@
 # Laufs: eine aeltere Fassung desselben Pakets, oder ein Paket, das die Quelle nicht mehr baut (z. B. nach einem
 # Wechsel des Bibliotheksnamens). Neuere Fassungen und Pakete anderer Quellen (andere Repos, die in dieselbe
 # Registry liefern) bleiben unberuehrt. Ein Quellpaket, das es hier gar nicht mehr gibt, raeumt niemand auf.
+#
+# auffrischen: Forgejo erzeugt den Index nur beim Hochladen neu. Nach dem Loeschen der letzten Datei einer Fassung
+# fuehrt der Index sie weiter auf, obwohl die Datei fehlt (beobachtet am 23.11.2026 auf codeberg.org). Deshalb
+# loescht aufraeumen danach je betroffener Architektur das kleinste Paket dieses Laufs und laedt es sofort wieder
+# hoch; das Hochladen erzeugt den Index dieser Architektur neu. Schlaegt das Hochladen fehl, fehlt dieses eine
+# Paket bis zum naechsten Lauf, der es wieder hochlaedt.
 set -eu
 
 REGISTRY=${REGISTRY:-https://codeberg.org/api/packages/moblix/debian}
@@ -52,7 +59,21 @@ index() {
 		END { aus() }'
 }
 
-[ $# -ge 2 ] || ende "Aufruf: registry.sh hochladen|pruefen|aufraeumen <ordner> [--probe]"
+# Index der Architektur $2 neu erzeugen lassen: kleinstes Paket des Laufs ($1 = Standdatei) loeschen und hochladen
+auffrischen() {
+	set -- "$1" "$2" $(awk -v a="$2" '$3 == a {print $1, $2, $6}' "$1" | while read -r p v d; do
+		echo "$(stat -c %s "$d") $p $v $d"; done | sort -n | head -1)
+	[ $# = 6 ] || { echo "auffrischen $2: kein Paket dieser Architektur im Lauf, Index bleibt"; return 0; }
+	code=$(curl -sS -m 120 -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: token $CODEBERG_TOKEN" \
+		"$REGISTRY/pool/$REG_SUITE/$REG_KOMPONENTE/$4/$5/$2") || code=000
+	case $code in 204|404) ;; *) meldung error "auffrischen $2: loeschen von $4 HTTP $code"; return 1 ;; esac
+	code=$(curl -sS -m 600 --retry 3 -o /dev/null -w '%{http_code}' -H "Authorization: token $CODEBERG_TOKEN" \
+		--upload-file "$6" "$REGISTRY/pool/$REG_SUITE/$REG_KOMPONENTE/upload") || code=000
+	[ "$code" = 201 ] || { meldung error "auffrischen $2: hochladen von $4 HTTP $code"; return 1; }
+	echo "Index $2 aufgefrischt (ueber $4 $5)"
+}
+
+[ $# -ge 2 ] || ende "Aufruf: registry.sh hochladen|pruefen|aufraeumen|auffrischen <ordner> [--probe|<arch>]"
 B=$1 O=$2 PROBE=${3:-}
 [ -d "$O" ] || ende "$O ist kein Ordner"
 [ -n "$(debs "$O")" ] || ende "keine Pakete unter $O"
@@ -102,7 +123,7 @@ aufraeumen)
 		echo "$q $m"
 	done > "$T/quellen"
 	zeile ''; zeile '| removed from the registry | version |'; zeile '|---|---|'
-	fehler=0 n=0
+	fehler=0 n=0; : > "$T/archs"
 	while read -r p v a q h; do
 		grenze=$(awk -v p="$p" -v a="$a" '$1 == p && $3 == a {print $2}' "$T/lauf")
 		[ -n "$grenze" ] || grenze=$(awk -v q="$q" '$1 == q {print $2}' "$T/quellen")
@@ -112,11 +133,29 @@ aufraeumen)
 		if [ "$PROBE" = --probe ]; then echo "wuerde loeschen: $p $v $a (aktuell $grenze)"; continue; fi
 		code=$(curl -sS -m 120 -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: token $CODEBERG_TOKEN" \
 			"$REGISTRY/pool/$REG_SUITE/$REG_KOMPONENTE/$p/$v/$a") || code=000
-		if [ "$code" = 204 ]; then echo "geloescht: $p $v $a"; zeile "| $p ($a) | $v |"
-		else fehler=1; meldung error "$p $v $a: loeschen HTTP $code"; fi
+		# 404: Datei ist schon weg, nur der Index fuehrt sie noch (siehe auffrischen)
+		case $code in
+		204) echo "geloescht: $p $v $a"; zeile "| $p ($a) | $v |"; echo "$a" >> "$T/archs" ;;
+		404) echo "nur noch im Index: $p $v $a"; echo "$a" >> "$T/archs" ;;
+		*) fehler=1; meldung error "$p $v $a: loeschen HTTP $code" ;;
+		esac
 	done < "$T/index"
 	[ $n != 0 ] || { echo "nichts aufzuraeumen"; zeile '| (nothing) | |'; }
+	for a in $(sort -u "$T/archs"); do auffrischen "$T/lauf" "$a" || fehler=1; done
+	if [ -s "$T/archs" ] && [ $fehler = 0 ]; then
+		index > "$T/index2"
+		while read -r p v a q s d; do
+			awk -v p="$p" -v v="$v" -v a="$a" '$1 == p && $2 == v && $3 == a {f = 1} END {exit !f}' "$T/index2" \
+				|| { fehler=1; meldung error "$p $v $a fehlt nach dem Aufraeumen im Index"; }
+		done < "$T/lauf"
+	fi
 	exit $fehler
+	;;
+auffrischen)
+	[ -n "${CODEBERG_TOKEN:-}" ] || ende "CODEBERG_TOKEN ist nicht gesetzt"
+	[ -n "$PROBE" ] || ende "Aufruf: registry.sh auffrischen <ordner> <arch>"
+	stand "$O" > "$T/lauf"
+	auffrischen "$T/lauf" "$PROBE"
 	;;
 *) ende "unbekannter Befehl $B" ;;
 esac

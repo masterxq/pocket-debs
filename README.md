@@ -85,6 +85,8 @@ that is already there is not replaced, so a changed package needs a new `REVISIO
 registry holds one version per package: after publishing, `registry.sh aufraeumen` removes older versions of the
 source packages of this repository and binary packages a source no longer builds. Packages that other repositories
 publish to the same registry are not touched.
+Forgejo rebuilds the index only on upload, so after removing packages the script removes and uploads again the
+smallest package of the run for each affected architecture; otherwise the index would keep listing removed files.
 
 Codeberg signs the index (`InRelease`) with the key of the registry; apt verifies it and, through the checksums in
 the index, every package. The packages themselves carry no signature (as in Debian). `registry.sh pruefen` checks
