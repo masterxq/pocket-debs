@@ -85,7 +85,13 @@ Description:
    blend the base frame alone; a capture that times out goes on with the
    frames back; a stop during the series returns everything. The
    handler takes the memory of a series only for a camera whose tuning
-   has the block (the IPA offers draft::NoiseReductionMode then).
+   has the block (the IPA offers draft::NoiseReductionMode then). A
+   configuration is one of still images when the sensor runs its largest
+   mode and the main output takes the whole processed area, which may be
+   a few columns narrower than the mode (the ultra wide camera: 3234 of
+   3264); the MFB rounds such a width up to a multiple of four within the
+   stride, and the base frame and weight map inputs of the DIP get the
+   size and stride of the still images.
  - Faster multi-frame still images: the earliest preview frame not yet
    captured takes the still image (requests with controls keep their own
    frame) and the preview frames on their way join the series; each frame
@@ -228,7 +234,7 @@ Forwarded: no
 License: LGPL-2.1-or-later (as the files it derives from; the alignment
  module src/libcamera/pipeline/mtkisp50/align/ is LGPL-2.1-or-later as
  well); GPL-2.0-or-later for the tests
-Last-Update: 2026-11-22
+Last-Update: 2026-11-23
 ---
 diff --git a/include/libcamera/internal/mtkisp50/stats.h b/include/libcamera/internal/mtkisp50/stats.h
 new file mode 100644
@@ -14914,10 +14920,10 @@ index 0000000..52a2778
 +libcamera_deps += declare_dependency(link_whole : mtkisp50_align)
 diff --git a/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..49a1c8d
+index 0000000..c650677
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,3992 @@
+@@ -0,0 +1,4020 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the MediaTek MT6785 camera subsystem with the ISP pass 2
@@ -17001,7 +17007,14 @@ index 0000000..49a1c8d
 +	ipaConfig.bitDepth = bayer.bitDepth;
 +	ipaConfig.useCase = data->videoRoles_ ? ipa::mtkisp50::UseCase::Video
 +					      : ipa::mtkisp50::UseCase::Preview;
-+	if (outCfg && outCfg->size == data->sensor_->resolution())
++	/*
++	 * Still images: the main output takes the whole processed area of the
++	 * largest sensor mode. That area may be a few columns narrower than
++	 * the mode, where the tile computation of the DIP cannot serve its
++	 * width (see MtkIsp50CameraConfiguration::validate()).
++	 */
++	if (outCfg && rawFormat.size == data->sensor_->resolution() &&
++	    outCfg->size == data->crop_.size())
 +		ipaConfig.useCase = ipa::mtkisp50::UseCase::Still;
 +	data->useCase_ = ipaConfig.useCase;
 +
@@ -18431,6 +18444,27 @@ index 0000000..49a1c8d
 +	int ret = dip_.raw_->setFormat(&format);
 +	if (!ret && (format.size != cfg.size || format.planes[0].bpl != cfg.stride))
 +		ret = -EINVAL;
++	/*
++	 * The base frame and the weight map of the blend have the size of
++	 * the NV12 input (the driver starts them at the largest one, the size
++	 * of the main camera's still images)
++	 */
++	if (!ret) {
++		V4L2DeviceFormat base = format;
++		ret = dip_.base_->setFormat(&base);
++		if (!ret && (base.size != cfg.size || base.planes[0].bpl != cfg.stride))
++			ret = -EINVAL;
++	}
++	if (!ret) {
++		V4L2DeviceFormat weight;
++		weight.fourcc = V4L2PixelFormat(V4L2_PIX_FMT_GREY);
++		weight.size = cfg.size;
++		weight.planesCount = 1;
++		weight.planes[0].bpl = cfg.stride;
++		ret = dip_.weight_->setFormat(&weight);
++		if (!ret && (weight.size != cfg.size || weight.planes[0].bpl != cfg.stride))
++			ret = -EINVAL;
++	}
 +	if (!ret)
 +		ret = dip_.raw_->importBuffers(4);
 +	if (ret >= 0)
@@ -18912,10 +18946,10 @@ index 0000000..49a1c8d
 +} /* namespace libcamera */
 diff --git a/src/libcamera/pipeline/mtkisp50/multi_frame.cpp b/src/libcamera/pipeline/mtkisp50/multi_frame.cpp
 new file mode 100644
-index 0000000..adf5c91
+index 0000000..ee93026
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/multi_frame.cpp
-@@ -0,0 +1,833 @@
+@@ -0,0 +1,846 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Multi-frame still images of the mtkisp50 pipeline: the multi-frame
@@ -19053,13 +19087,26 @@ index 0000000..adf5c91
 +	if (ret)
 +		return ret;
 +
-+	if (f.fmt.pix_mp.width != width || f.fmt.pix_mp.height != height ||
++	/*
++	 * The MFB works on widths of a multiple of four pixels and rounds the
++	 * width up (3234 columns of the ultra wide camera become 3236). The
++	 * extra columns lie in the padding of the lines, within the stride:
++	 * the block blends them there, out of the image.
++	 */
++	const unsigned int w = f.fmt.pix_mp.width;
++	const bool widthOk = w == width || (w > width && w - width < 4 && w <= stride);
++
++	if (!widthOk || f.fmt.pix_mp.height != height ||
 +	    f.fmt.pix_mp.pixelformat != fourcc || f.fmt.pix_mp.plane_fmt[0].bytesperline != stride) {
 +		LOG(MtkIsp50, Error)
 +			<< kMfbEntities[node] << ": format " << f.fmt.pix_mp.width << "x"
 +			<< f.fmt.pix_mp.height << " stride " << f.fmt.pix_mp.plane_fmt[0].bytesperline;
 +		return -EINVAL;
 +	}
++
++	if (w != width)
++		LOG(MtkIsp50, Debug)
++			<< kMfbEntities[node] << ": width " << width << " processed as " << w;
 +
 +	*size = f.fmt.pix_mp.plane_fmt[0].sizeimage;
 +	return 0;
