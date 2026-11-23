@@ -1,0 +1,67 @@
+From: pocket-debs
+Date: Mon, 23 Nov 2026 23:00:00 +0100
+Subject: [PATCH] codecs: mpeg2decoder: Keep matrices of earlier quant matrix extensions
+Description:
+ A quant matrix extension only replaces the matrices it loads, the others
+ keep the value they had, which can come from an earlier quant matrix
+ extension after the last sequence header (ISO/IEC 13818-2, 6.3.11).
+ The decoder replaced the whole stored extension instead, so a matrix
+ loaded by a previous extension was lost when a later one loaded a
+ different matrix.
+ .
+ Merge the loaded matrices into the stored extension. A loaded luma
+ matrix also replaces the chroma matrix of the same kind unless the
+ extension loads that one too, so the chroma load flag is cleared in
+ that case.
+Forwarded: no
+License: LGPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-23
+---
+diff --git a/gst-libs/gst/codecs/gstmpeg2decoder.c b/gst-libs/gst/codecs/gstmpeg2decoder.c
+index e9d2b76..f787729 100644
+--- a/gst-libs/gst/codecs/gstmpeg2decoder.c
++++ b/gst-libs/gst/codecs/gstmpeg2decoder.c
+@@ -684,7 +684,42 @@ gst_mpeg2_decoder_handle_quant_matrix_ext (GstMpeg2Decoder * decoder,
+     return GST_FLOW_ERROR;
+   }
+ 
+-  priv->quant_matrix = matrix_ext;
++  if (!_quant_matrix_ext_is_valid (&priv->quant_matrix)) {
++    priv->quant_matrix = matrix_ext;
++    return GST_FLOW_OK;
++  }
++
++  /* 6.3.11 Quant matrix extension
++     A matrix that is not loaded keeps the value it had, which may come from
++     an earlier quant matrix extension after the last sequence header. A
++     loaded luma matrix also replaces the chroma one, unless that is loaded
++     as well. */
++  if (matrix_ext.load_intra_quantiser_matrix) {
++    priv->quant_matrix.load_intra_quantiser_matrix = 1;
++    priv->quant_matrix.load_chroma_intra_quantiser_matrix = 0;
++    memcpy (priv->quant_matrix.intra_quantiser_matrix,
++        matrix_ext.intra_quantiser_matrix,
++        sizeof (matrix_ext.intra_quantiser_matrix));
++  }
++  if (matrix_ext.load_non_intra_quantiser_matrix) {
++    priv->quant_matrix.load_non_intra_quantiser_matrix = 1;
++    priv->quant_matrix.load_chroma_non_intra_quantiser_matrix = 0;
++    memcpy (priv->quant_matrix.non_intra_quantiser_matrix,
++        matrix_ext.non_intra_quantiser_matrix,
++        sizeof (matrix_ext.non_intra_quantiser_matrix));
++  }
++  if (matrix_ext.load_chroma_intra_quantiser_matrix) {
++    priv->quant_matrix.load_chroma_intra_quantiser_matrix = 1;
++    memcpy (priv->quant_matrix.chroma_intra_quantiser_matrix,
++        matrix_ext.chroma_intra_quantiser_matrix,
++        sizeof (matrix_ext.chroma_intra_quantiser_matrix));
++  }
++  if (matrix_ext.load_chroma_non_intra_quantiser_matrix) {
++    priv->quant_matrix.load_chroma_non_intra_quantiser_matrix = 1;
++    memcpy (priv->quant_matrix.chroma_non_intra_quantiser_matrix,
++        matrix_ext.chroma_non_intra_quantiser_matrix,
++        sizeof (matrix_ext.chroma_non_intra_quantiser_matrix));
++  }
+ 
+   return GST_FLOW_OK;
+ }

@@ -1,0 +1,42 @@
+From: pocket-debs
+Date: Mon, 23 Nov 2026 23:00:00 +0100
+Subject: [PATCH] v4l2codecs: h264: Wait for the second field before outputting a pair
+Description:
+ A field pair is decoded with two requests that share one capture
+ buffer: the first field is queued with V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF
+ and the second field uses a sub-request. The picture handed to
+ output_picture() is the first field, and only its request was waited
+ for. When the request of the second field was still pending, which
+ happens for the last pair at the end of the stream (drain), the capture
+ buffer was pushed downstream while the driver was still writing the
+ second field into it, and the lines of that field came out wrong from
+ time to time.
+ .
+ Wait for the request of the second field instead. The pending requests
+ are completed in queue order, so this also completes the request of the
+ first field, and the capture buffer is dequeued with the second one.
+Forwarded: no
+License: LGPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-23
+---
+diff --git a/sys/v4l2codecs/gstv4l2codech264dec.c b/sys/v4l2codecs/gstv4l2codech264dec.c
+index 6d7f09a..542b2a8 100644
+--- a/sys/v4l2codecs/gstv4l2codech264dec.c
++++ b/sys/v4l2codecs/gstv4l2codech264dec.c
+@@ -1136,6 +1136,16 @@ gst_v4l2_codec_h264_dec_output_picture (GstH264Decoder * decoder,
+   GST_DEBUG_OBJECT (self, "Output picture %u",
+       codec_picture->system_frame_number);
+ 
++  /* The first field of a pair holds the capture buffer, the picture is only
++   * complete once the request of the second field is done. */
++  if (!picture->second_field && picture->other_field) {
++    GstV4l2Request *second_request =
++        gst_h264_picture_get_user_data (picture->other_field);
++
++    if (second_request)
++      request = second_request;
++  }
++
+   ret = gst_v4l2_request_set_done (request);
+   if (ret == 0) {
+     GST_ELEMENT_ERROR (self, STREAM, DECODE,
