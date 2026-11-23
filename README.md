@@ -9,7 +9,6 @@ the Motorola Moto G60s ("lisbon"); device specific parts keep the device name (e
 | callaudiod | EnableSpeaker selects the voice call profile with the speaker port, only while a call is active; the call is tracked also when WirePlumber does the routing (speaker off and microphone unmuted after a call) | with one sink per UCM device the earpiece sink has no speaker port, the speaker button of the call UI did nothing; a speaker-off request at the end of a call brought the voice call profile back and the card stayed in it, the speaker setting carried over into the next call |
 | libfprint | adds the driver `lisbonfpc` (Moto G60s) | fingerprint sensor of the phone, reached through a local bridge service to the TEE |
 | libcamera | sensor helpers and properties for OV64B40 and OV16A1Q; simple IPA AGC with tunable step size and frame length extension; MediaTek MT6785 ISP (DIP) as debayer backend of the software ISP, contrast autofocus, zone metering and AWB along a colour temperature curve | correct gain, black level and delays for the Moto G60s cameras with the software ISP; exposure control that settles quickly and reaches indoor brightness; hardware image processing for the main camera when the DIP driver is present (`software_isp.mode: mtk-dip`), software ISP otherwise |
-| kf6-kirigami | upstream fix 0810418b (KDE bug 523866, in KF 6.31); a build-only CMake lookup order change | rapid taps in ColumnView pages got lost; the lookup change works around cmake sporadically missing Qt6QmlIntegration under qemu-user |
 | gtk4 | upstream fix d4fa0b3b (GTK issue 8456): the GStreamer media backend marks the EGL display as foreign on Wayland | GStreamer terminated the EGL display GTK renders with when the first GtkMediaFile was released; GNOME Snapshot crashed on the second picture (shutter sound) |
 | mesa | panfrost: mark a BO shared when its KMS handle is exported (draft) | an exported buffer must not be recycled from the BO cache (not tested on a device yet) |
 
@@ -101,6 +100,8 @@ that is already there is not replaced, so a changed package needs a new `REVISIO
 registry holds one version per package: after publishing, `registry.sh aufraeumen` removes older versions of the
 source packages of this repository and binary packages a source no longer builds. Packages that other repositories
 publish to the same registry are not touched.
+A source package that is removed from this repository altogether is removed from the registry by hand:
+`./registry.sh entfernen <folder> <source>` (the folder holds the packages of a current run, for the index).
 Forgejo rebuilds the index only on upload, so after removing packages the script removes and uploads again the
 smallest package of the run for each affected architecture; otherwise the index would keep listing removed files.
 
