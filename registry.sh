@@ -5,6 +5,7 @@
 #   ./registry.sh pruefen <ordner>              Index der Registry gegen die Dateien unter <ordner> pruefen (sha256)
 #   ./registry.sh aufraeumen <ordner> [--probe] aeltere Fassungen unserer Quellpakete aus der Registry loeschen
 #   ./registry.sh auffrischen <ordner> <arch>   Index einer Architektur neu erzeugen lassen (siehe unten)
+#   ./registry.sh entfernen <ordner> <quelle>   alle Pakete eines Quellpakets loeschen, das es hier nicht mehr gibt
 #
 # <ordner> ist der Ergebnisordner eines Laufs (CI: alle Artefakte <quelle>_<fassung>), er muss ALLE Pakete des
 # Laufs enthalten. Umgebung: CODEBERG_TOKEN (hochladen, aufraeumen), REGISTRY, REG_SUITE, REG_KOMPONENTE, REG_OHNE.
@@ -27,6 +28,9 @@
 # loescht aufraeumen danach je betroffener Architektur das kleinste Paket dieses Laufs und laedt es sofort wieder
 # hoch; das Hochladen erzeugt den Index dieser Architektur neu. Schlaegt das Hochladen fehl, fehlt dieses eine
 # Paket bis zum naechsten Lauf, der es wieder hochlaedt.
+# Hat der Lauf kein Paket der Architektur (z. B. das letzte arch:all-Paket wurde entfernt), hilft ein Hilfspaket
+# moblix-index in zwei Architekturen: Forgejo erzeugt den Index auch dann neu, wenn eine Datei geloescht wird und
+# die Fassung noch eine zweite Datei hat. Das Hilfspaket wird danach ganz geloescht.
 set -eu
 
 REGISTRY=${REGISTRY:-https://codeberg.org/api/packages/moblix/debian}
@@ -86,7 +90,42 @@ auffrischen() {
 	echo "Index $2 aufgefrischt (ueber $4 $5)"
 }
 
-[ $# -ge 2 ] || ende "Aufruf: registry.sh hochladen|pruefen|aufraeumen|auffrischen <ordner> [--probe|<arch>]"
+# Index der Architektur $1 neu erzeugen lassen, wenn der Lauf kein Paket dieser Architektur hat; $2 = zweite
+# Architektur, deren Index danach mit auffrischen erneuert werden muss
+auffrischen_leer() {
+	v=0.$(date +%s)
+	for x in "$2" "$1"; do
+		rm -rf "$T/h"; mkdir -p "$T/h/DEBIAN"
+		printf 'Package: moblix-index\nVersion: %s\nArchitecture: %s\nMaintainer: moblix <noreply@codeberg.org>\nDescription: temporary package, rebuilds the index of the registry\n' "$v" "$x" > "$T/h/DEBIAN/control"
+		dpkg-deb --root-owner-group -b "$T/h" "$T/moblix-index_${v}_$x.deb" > /dev/null
+		code=$(curl -sS -m 120 -o /dev/null -w '%{http_code}' -H "Authorization: token $CODEBERG_TOKEN" \
+			--upload-file "$T/moblix-index_${v}_$x.deb" "$REGISTRY/pool/$REG_SUITE/$REG_KOMPONENTE/upload") || code=000
+		[ "$code" = 201 ] || { meldung error "auffrischen $1: Hilfspaket ($x) hochladen HTTP $code"; return 1; }
+	done
+	for x in "$1" "$2"; do
+		code=$(curl -sS -m 120 -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: token $CODEBERG_TOKEN" \
+			"$REGISTRY/pool/$REG_SUITE/$REG_KOMPONENTE/moblix-index/$v/$x") || code=000
+		[ "$code" = 204 ] || { meldung error "auffrischen $1: Hilfspaket ($x) loeschen HTTP $code"; return 1; }
+	done
+	echo "Index $1 aufgefrischt (ueber Hilfspaket, Index $2 folgt)"
+}
+
+# Indizes aller Architekturen aus Datei $2 erneuern; $1 = Standdatei des Laufs
+index_erneuern() {
+	: > "$2.dazu"
+	for a in $(sort -u "$2"); do
+		awk -v a="$a" '$3 == a {f = 1} END {exit !f}' "$1" && continue
+		z=arm64; [ "$a" != arm64 ] || z=all
+		auffrischen_leer "$a" "$z" || return 1
+		echo "$z" >> "$2.dazu"
+	done
+	for a in $(cat "$2" "$2.dazu" | sort -u); do
+		if awk -v a="$a" '$3 == a {f = 1} END {exit !f}' "$1"; then auffrischen "$1" "$a" || return 1
+		elif grep -qx "$a" "$2.dazu"; then meldung warning "Index $a fuehrt noch das Hilfspaket moblix-index (kein Paket dieser Architektur im Lauf)"; fi
+	done
+}
+
+[ $# -ge 2 ] || ende "Aufruf: registry.sh hochladen|pruefen|aufraeumen|auffrischen|entfernen <ordner> [--probe|<arch>|<quelle>]"
 B=$1 O=$2 PROBE=${3:-}
 [ -d "$O" ] || ende "$O ist kein Ordner"
 [ -n "$(debs "$O")" ] || ende "keine Pakete unter $O"
@@ -154,7 +193,7 @@ aufraeumen)
 		esac
 	done < "$T/index"
 	[ $n != 0 ] || { echo "nichts aufzuraeumen"; zeile '| (nothing) | |'; }
-	for a in $(sort -u "$T/archs"); do auffrischen "$T/lauf" "$a" || fehler=1; done
+	index_erneuern "$T/lauf" "$T/archs" || fehler=1
 	if [ -s "$T/archs" ] && [ $fehler = 0 ]; then
 		index > "$T/index2"
 		while read -r p v a q s d; do
@@ -162,6 +201,27 @@ aufraeumen)
 				|| { fehler=1; meldung error "$p $v $a fehlt nach dem Aufraeumen im Index"; }
 		done < "$T/lauf"
 	fi
+	exit $fehler
+	;;
+entfernen)
+	[ -n "${CODEBERG_TOKEN:-}" ] || ende "CODEBERG_TOKEN ist nicht gesetzt"
+	[ -n "$PROBE" ] || ende "Aufruf: registry.sh entfernen <ordner> <quelle>"
+	stand "$O" > "$T/lauf"; index > "$T/index"
+	! awk -v q="$PROBE" '$4 == q {f = 1} END {exit !f}' "$T/lauf" || ende "$PROBE gehoert zu den Paketen unter $O: erst das Rezept entfernen"
+	fehler=0 n=0; : > "$T/archs"
+	while read -r p v a q h; do
+		[ "$q" = "$PROBE" ] || continue
+		n=$((n + 1))
+		code=$(curl -sS -m 120 -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: token $CODEBERG_TOKEN" \
+			"$REGISTRY/pool/$REG_SUITE/$REG_KOMPONENTE/$p/$v/$a") || code=000
+		case $code in
+		204|404) echo "geloescht: $p $v $a"; echo "$a" >> "$T/archs" ;;
+		*) fehler=1; meldung error "$p $v $a: loeschen HTTP $code" ;;
+		esac
+	done < "$T/index"
+	[ $n != 0 ] || ende "kein Paket der Quelle $PROBE im Index"
+	index_erneuern "$T/lauf" "$T/archs" || fehler=1
+	[ $fehler != 0 ] || { index > "$T/index2"; ! awk -v q="$PROBE" '$4 == q {f = 1} END {exit !f}' "$T/index2" || { fehler=1; meldung error "$PROBE steht noch im Index"; }; }
 	exit $fehler
 	;;
 auffrischen)
