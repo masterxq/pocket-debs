@@ -1,0 +1,44 @@
+From: pocket-debs
+Date: Mon, 23 Nov 2026 23:00:00 +0100
+Subject: [PATCH] v4l2codecs: h264: Wait for the second field before outputting a pair
+Description:
+ A field pair is decoded with two requests that share one capture
+ buffer: the first field is queued with V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF
+ and the second field uses a sub-request. The picture handed to
+ output_picture() is the first field, and only its own request was
+ waited for. When the request of the second field was still pending,
+ which happens for the last pair at the end of the stream (drain), the
+ capture buffer was pushed downstream while the driver was still writing
+ the second field into it, and the lines of that field came out wrong
+ from time to time.
+ .
+ Let the first field track the last request of the second field when
+ that one is queued, as the picture already tracks its last sub-request
+ in slice mode. output_picture() then waits for it; the pending requests
+ are completed in queue order, so this also completes the request of the
+ first field, and the capture buffer is dequeued with the last one. The
+ second field cannot be looked up at output time, the first field does
+ not hold a reference on it.
+Forwarded: no
+License: LGPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-24
+---
+diff --git a/sys/v4l2codecs/gstv4l2codech264dec.c b/sys/v4l2codecs/gstv4l2codech264dec.c
+index 6d7f09a..cfdb543 100644
+--- a/sys/v4l2codecs/gstv4l2codech264dec.c
++++ b/sys/v4l2codecs/gstv4l2codech264dec.c
+@@ -1327,6 +1327,14 @@ gst_v4l2_codec_h264_dec_submit_bitstream (GstV4l2CodecH264Dec * self,
+     goto done;
+   }
+ 
++  /* The first field of a pair is the picture that gets output and holds the
++   * capture buffer, which is complete only once the last request of the
++   * second field is done: let the first field track that request. */
++  if (picture->second_field && picture->other_field)
++    gst_h264_picture_set_user_data (picture->other_field,
++        gst_v4l2_request_ref (request),
++        (GDestroyNotify) gst_v4l2_request_unref);
++
+   gst_h264_picture_set_user_data (picture, g_steal_pointer (&request),
+       (GDestroyNotify) gst_v4l2_request_unref);
+   ret = TRUE;
