@@ -141,6 +141,18 @@ Description:
    result of the full scan where their level matches the scan samples
    within 5 %, the check after the scan compares with the sample of the
    result.
+ - Noise of the focus grid: measured from two grids at the same lens
+   position (variance of a cell per level and analogue gain); a search
+   compares the sharpness less its noise share and finds no peak when its
+   samples differ by less than a part of the noise. No peak, or a scene
+   too dark to measure: the lens goes to the rest position (key default,
+   best the hyperfocal distance). Continuous mode reports Scanning while
+   a search is due; Focused and Failed come with the first frame taken at
+   the result. A search asked for or on an AfWindows rectangle waits for
+   the exposure to settle.
+ - Key targetedRange of Af: the range of LensPosition and of a search on
+   an AfWindows rectangle (may reach closer than range, which the
+   continuous search over the centre keeps to).
  - Streams: NV12 on the main output (a crop of the sensor mode, as
    before), YUYV on the scaled output (1/2 to 1/16 of the processed area,
    for instance 1920x1080 video from 16:9 of the whole large mode). With
@@ -191,8 +203,10 @@ Description:
    statistics (synthetic frames, optional real frames against reference
    results, averages over frames), pairing of PD and raw frames,
    autofocus with PD (also dim scenes over the average, a subject
-   without PD, a lens held during a series), the contrast scan over a
-   curve recorded in dim light, exposure
+   without PD, a lens held during a series, a scene too dark), the
+   contrast scan over a curve recorded in dim light, continuous autofocus
+   in scenes with the noise of the device, the closer range on a window,
+   exposure
    programs and the regulation with them, the limit of the exposure time
    by hand and its steps, the hysteresis of the steps, a sensor that takes
    new values two frames late, spot metering, the sensor controls in
@@ -1544,10 +1558,10 @@ index 0000000..d3a5751
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/af.cpp b/src/ipa/mtkisp50/algorithms/af.cpp
 new file mode 100644
-index 0000000..ec69bd1
+index 0000000..67279a3
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/af.cpp
-@@ -0,0 +1,1417 @@
+@@ -0,0 +1,1574 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast detect autofocus for the software ISP
@@ -1598,10 +1612,16 @@ index 0000000..ec69bd1
 + * Tuning parameters:
 + * - map: pairs of dioptres and lens positions (driver units), at least two,
 + *   ascending; positions outside are extrapolated from the end segments
-+ * - default: lens position in dioptres used in manual mode until a
-+ *   LensPosition is set, at start and when a scan fails (default 0)
++ * - default: rest position of the lens in dioptres, best the hyperfocal
++ *   distance: in manual mode until a LensPosition is set, at start, when a
++ *   search finds no peak and when the scene stays too dark to measure
++ *   (default 0)
 + * - range: dioptres scanned by the search, [min, max]; min may be negative
 + *   to cover module tolerances beyond infinity (default the map ends)
++ * - targetedRange: dioptres for a manual LensPosition and for a search on an
++ *   AfWindows rectangle (a point the user chose), [min, max]; it may reach
++ *   closer than range, which the continuous search over the centre keeps to
++ *   (default range); phase detection on the rectangle as well.
 + * - step: coarse scan step in dioptres (default 1.0)
 + * - search: "climb" (default) from the current position with a probe to
 + *   either side, or "scan" of the whole range; climbStep: its step in
@@ -1661,6 +1681,16 @@ index 0000000..ec69bd1
 + * reliable result in focus keeps the contrast watch from starting a search.
 + * Without reliable PD the contrast search and watch work as without PD.
 + *
++ * The sharpness of a dim scene is mostly the noise of the focus grid, which
++ * rises as the level falls (also with the lens position: the level falls
++ * towards the macro end). The noise is measured from two grids of frames at
++ * the same lens position (the variance of a cell per level and analogue
++ * gain); a search compares the sharpness less the noise share and ends at
++ * the rest position when its samples do not differ by a part of the noise.
++ * In continuous mode the state is Scanning while a search is due (start, a
++ * scene change) and from its start; Focused and Failed are reported from
++ * the first frame taken after the lens reached the result.
++ *
 + * While waiting for a steady scene and while searching the focus grid is
 + * requested on every frame (DipFrameParams::afEveryFrame). AfMetering Windows
 + * with AfWindows moves the region to the first rectangle, otherwise it is
@@ -1707,6 +1737,15 @@ index 0000000..ec69bd1
 +	} else {
 +		rangeMin_ = map_.front().first;
 +		rangeMax_ = map_.back().first;
++	}
++	auto targetedRange = tuningData["targetedRange"].get<std::vector<double>>();
++	if (targetedRange && targetedRange->size() == 2 &&
++	    (*targetedRange)[0] < (*targetedRange)[1]) {
++		targetedMin_ = (*targetedRange)[0];
++		targetedMax_ = (*targetedRange)[1];
++	} else {
++		targetedMin_ = rangeMin_;
++		targetedMax_ = rangeMax_;
 +	}
 +	step_ = tuningData["step"].get<double>(1.0);
 +	climbStep_ = tuningData["climbStep"].get<double>(step_);
@@ -1784,7 +1823,7 @@ index 0000000..ec69bd1
 +		return -EINVAL;
 +	}
 +
-+	const double maxDioptres = std::max(std::min(toDioptres(lensMax_), rangeMax_), 0.0);
++	const double maxDioptres = std::max(std::min(toDioptres(lensMax_), targetedMax_), 0.0);
 +	const double defDioptres = std::clamp(defaultDioptres_, 0.0, maxDioptres);
 +
 +	context.ctrlMap[&controls::AfMode] =
@@ -1807,6 +1846,7 @@ index 0000000..ec69bd1
 +	LOG(IPAMtkIsp50Af, Info)
 +		<< "Af: lens " << lensMin_ << "-" << lensMax_
 +		<< ", scan " << toCode(rangeMin_) << "-" << toCode(rangeMax_)
++		<< " (on a window " << toCode(targetedMin_) << "-" << toCode(targetedMax_) << ")"
 +		<< " step " << step_ << " dpt, default " << toCode(defaultDioptres_)
 +		<< (pdTuned_ ? ", phase detection" : "");
 +
@@ -1865,6 +1905,15 @@ index 0000000..ec69bd1
 +	pdSeenInFocus_ = false;
 +	pdJumps_ = 0;
 +	fine_ = false;
++	reportFrom_ = 0;
++	darkCount_ = 0;
++	noiseTry_ = false;
++	noiseGrid_.clear();
++	noiseGridLens_ = -1;
++	noiseCount_ = 0;
++	noisePairs_ = 0;
++	noiseCoeff_ = 0.0;
++	gains_.fill(0.0);
 +	LOG(IPAMtkIsp50Af, Debug) << "Phase detection " << (pdActive_ ? "on" : "off");
 +
 +	if (configured_ && lensCode_) {
@@ -1891,8 +1940,9 @@ index 0000000..ec69bd1
 +				phase_ = Phase::Monitor;
 +				rebase_ = true;
 +			} else {
++				/* A search is due */
 +				phase_ = Phase::Wait;
-+				state_ = controls::AfStateIdle;
++				state_ = controls::AfStateScanning;
 +			}
 +		} else {
 +			/* A scan of the old session does not go on */
@@ -1930,8 +1980,9 @@ index 0000000..ec69bd1
 +	context.activeState.af.update = true;
 +	moved_ = false;
 +
-+	state_ = controls::AfStateIdle;
 +	phase_ = mode_ == controls::AfModeContinuous ? Phase::Wait : Phase::Idle;
++	/* Continuous mode: the first search is due */
++	state_ = phase_ == Phase::Wait ? controls::AfStateScanning : controls::AfStateIdle;
 +	levelIndex_ = 0;
 +	dark_ = false;
 +	context.activeState.af.busy = phase_ == Phase::Wait;
@@ -1991,6 +2042,8 @@ index 0000000..ec69bd1
 +	heldMove_ = true;
 +	moveFrame_ = std::max(moveFrame_, acts);
 +	pdFrom_ = std::max(pdFrom_, moveFrame_ + settleFrames_);
++	if (reportFrom_)
++		reportFrom_ = std::max(reportFrom_, moveFrame_ + settleFrames_);
 +}
 +
 +void Af::startScan(IPAContext &context)
@@ -1998,8 +2051,9 @@ index 0000000..ec69bd1
 +	AfSearch::Config config;
 +
 +	dark_ = false;
-+	config.min = toCode(rangeMin_);
-+	config.max = toCode(rangeMax_);
++	/* A point the user chose may lie closer than the range of the centre */
++	config.min = toCode(targeted() ? targetedMin_ : rangeMin_);
++	config.max = toCode(targeted() ? targetedMax_ : rangeMax_);
 +	config.climb = climb_;
 +	config.start = lensCode_;
 +	const double step = climb_ ? climbStep_ : step_;
@@ -2013,6 +2067,7 @@ index 0000000..ec69bd1
 +	state_ = controls::AfStateScanning;
 +	scanStart_ = frame_;
 +	fine_ = false;
++	noiseTry_ = false;
 +	pdWindow_ = kPdAnyWindow;
 +	moveLens(context, search_.target());
 +
@@ -2034,11 +2089,16 @@ index 0000000..ec69bd1
 +		moveLens(context, fineCenter_);
 +		rebase_ = true;
 +	} else {
++		/* No peak: the rest position */
 +		state_ = controls::AfStateFailed;
 +		moveLens(context, toCode(defaultDioptres_));
 +		/* The first measurement at the default position is the reference. */
 +		rebase_ = true;
 +	}
++
++	/* Not Focused or Failed while the lens is on its way to the result */
++	if (context.activeState.af.update)
++		reportFrom_ = moveFrame_ + settleFrames_;
 +
 +	baseLevel_ = m.level;
 +	changeCount_ = 0;
@@ -2133,6 +2193,62 @@ index 0000000..ec69bd1
 +			<< "), refocus";
 +		enterWait(frame_ + 1);
 +	}
++}
++
++/* The analogue gain a frame was taken with, 1 if not known */
++double Af::frameGain(uint32_t frame) const
++{
++	const double gain = gains_[frame % kGainHistory];
++	return std::isfinite(gain) && gain > 0.0 ? gain : 1.0;
++}
++
++/*
++ * The temporal noise of the focus grid of this frame against the last grid
++ * at the same lens position (@lens, -1 while the lens is on its way): close
++ * in time, at the same analogue gain and about the same level
++ */
++void Af::measureNoise(const Statistics &stats, const AfMeasurement &m,
++		      double blackLevel, int32_t lens)
++{
++	const unsigned int cells = stats.afGridWidth * stats.afGridHeight;
++	const double gain = frameGain(frame_);
++
++	if (lens >= 0 && lens == noiseGridLens_ && noiseGrid_.size() == cells &&
++	    frame_ > noiseGridFrame_ && frame_ - noiseGridFrame_ <= 8 &&
++	    noiseGridLevel_ > 0.0 && std::abs(m.level / noiseGridLevel_ - 1.0) < 0.2 &&
++	    std::abs(gain / noiseGridGain_ - 1.0) < 0.02) {
++		const double variance = afTemporalNoise(stats.afGrid.data(), noiseGrid_.data(),
++							cells, stats.afCellSamples, blackLevel);
++		noisePairs_++;
++		if (variance > 0.0) {
++			noiseEstimates_[noiseCount_++ % kNoiseEstimates] =
++				variance / (m.level * stats.afCellSamples * gain);
++			const unsigned int n = std::min(noiseCount_, kNoiseEstimates);
++			std::array<double, kNoiseEstimates> sorted = noiseEstimates_;
++			std::sort(sorted.begin(), sorted.begin() + n);
++			noiseCoeff_ = sorted[n / 2];
++		}
++	}
++
++	noiseGrid_.assign(stats.afGrid.begin(), stats.afGrid.begin() + cells);
++	noiseGridFrame_ = frame_;
++	noiseGridLens_ = lens;
++	noiseGridLevel_ = m.level;
++	noiseGridGain_ = gain;
++}
++
++/*
++ * The share of the noise in the sharpness @m: a cell of the focus grid holds
++ * S = level * cellSamples above black, with the variance noiseCoeff_ * S *
++ * gain; the measure takes the square of the difference of two cells (twice
++ * the variance) over S^2. 0 while the noise is not known.
++ */
++double Af::noiseShare(const AfMeasurement &m, unsigned int cellSamples) const
++{
++	if (noiseCoeff_ <= 0.0 || m.level <= 0.0 || !cellSamples)
++		return 0.0;
++
++	return 2.0 * noiseCoeff_ * frameGain(frame_) / (m.level * cellSamples);
 +}
 +
 +/*
@@ -2291,6 +2407,7 @@ index 0000000..ec69bd1
 +	if (mode_ == controls::AfModeAuto) {
 +		const auto &trigger = controls.get(controls::AfTrigger);
 +		if (trigger && *trigger == controls::AfTriggerStart) {
++			exposureWait_ = 0;
 +			if (pdActive_) {
 +				/* Wait for a PD result of the frames from this one */
 +				phase_ = Phase::PdWait;
@@ -2322,14 +2439,17 @@ index 0000000..ec69bd1
 + * monitorInterval-th one while watching for a scene change, and not at all
 + * otherwise. The PD statistics are cheap: every frame unless idle.
 + */
-+void Af::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
-+		 [[maybe_unused]] IPAFrameContext &frameContext, DipFrameParams *params)
++void Af::prepare(IPAContext &context, const uint32_t frame,
++		 IPAFrameContext &frameContext, DipFrameParams *params)
 +{
 +	if (!enabled_)
 +		return;
 +
 +	lastPrepared_ = std::max(lastPrepared_, frame);
 +	followPendingMove(context);
++
++	/* The analogue gain of the frame, for the noise of its focus grid */
++	gains_[frame % kGainHistory] = frameContext.sensor.gain;
 +
 +	/* The focus grid in every frame while waiting or searching */
 +	const bool searching = phase_ == Phase::Scan || phase_ == Phase::PdWait ||
@@ -2489,8 +2609,14 @@ index 0000000..ec69bd1
 +	if (!best || best->level * std::max(1u, stats.pdFrames) < pdMinLevel_)
 +		return est;
 +
++	/*
++	 * On an AfWindows rectangle the targeted range: a PD target of a
++	 * close subject there is no reason to fall back on another window
++	 */
 +	const double target = lensCode_ + pdSlope_ * (best->shift - pdOffset_);
-+	if (target < toCode(rangeMin_) - pdMargin_ || target > toCode(rangeMax_) + pdMargin_)
++	const double min = targeted() ? targetedMin_ : rangeMin_;
++	const double max = targeted() ? targetedMax_ : rangeMax_;
++	if (target < toCode(min) - pdMargin_ || target > toCode(max) + pdMargin_)
 +		return est;
 +
 +	est.valid = true;
@@ -2585,6 +2711,12 @@ index 0000000..ec69bd1
 +	pdOutMax_ = std::max(pdOutMax_, dev);
 +}
 +
++/* Searches on an AfWindows rectangle: the targeted range */
++bool Af::targeted() const
++{
++	return meteringWindows_ && !afWindow_.isNull();
++}
++
 +/* A PD result in focus not long ago: the contrast watch stays off */
 +bool Af::pdHolds() const
 +{
@@ -2598,6 +2730,9 @@ index 0000000..ec69bd1
 +	pdMisses_ = 0;
 +	pdWindow_ = kPdAnyWindow;
 +	phase_ = Phase::Wait;
++	/* A search is due: the lens may move from now on */
++	state_ = controls::AfStateScanning;
++	darkCount_ = 0;
 +	levelIndex_ = 0;
 +	exposureWait_ = 0;
 +	waitCount_ = 0;
@@ -2664,6 +2799,7 @@ index 0000000..ec69bd1
 +	phase_ = Phase::Scan;
 +	state_ = controls::AfStateScanning;
 +	fine_ = true;
++	noiseTry_ = false;
 +	moveLens(context, search_.target());
 +
 +	LOG(IPAMtkIsp50Af, Debug) << "Fine search " << config.min << "-" << config.max
@@ -2771,7 +2907,10 @@ index 0000000..ec69bd1
 +	followPendingMove(context);
 +
 +	metadata.set(controls::AfMode, mode_);
-+	metadata.set(controls::AfState, state_);
++	/* The frames before the lens reached a result still belong to the search */
++	const bool settling = frame < reportFrom_ &&
++			      (state_ == controls::AfStateFocused || state_ == controls::AfStateFailed);
++	metadata.set(controls::AfState, settling ? controls::AfStateScanning : state_);
 +	if (mode_ == controls::AfModeContinuous)
 +		metadata.set(controls::AfPauseState,
 +			     paused_ ? controls::AfPauseStatePaused
@@ -2831,9 +2970,16 @@ index 0000000..ec69bd1
 +
 +	const bool exposureSteady = !context.activeState.agc.converging;
 +
++	/* The lens stood still for this grid unless a move is waiting to be sent */
++	if (m.sharpness >= 0.0)
++		measureNoise(*stats, m, context.activeState.blc.level,
++			     context.activeState.af.update ? -1 : lensCode_);
++	const double noise = m.sharpness >= 0.0 ? noiseShare(m, stats->afCellSamples) : 0.0;
++
 +	LOG(IPAMtkIsp50Af, Debug)
 +		<< "frame " << frame << " lens " << lensCode_
 +		<< " sharpness " << m.sharpness << " level " << m.level
++		<< " noise " << noise
 +		<< (exposureSteady ? "" : " (exposure moving)");
 +
 +	/*
@@ -2848,7 +2994,12 @@ index 0000000..ec69bd1
 +		break;
 +
 +	case Phase::PdWait:
-+		if (!pdTurn)
++		/*
++		 * A search asked for waits for the exposure to settle, not
++		 * forever: metering on the AfWindows rectangle may change it a
++		 * lot, and a contrast scan in a region still dark fails
++		 */
++		if (!pdTurn && (exposureSteady || ++exposureWait_ >= kMaxExposureWait))
 +			startScan(context);
 +		break;
 +
@@ -2871,9 +3022,16 @@ index 0000000..ec69bd1
 +			waitCount_ = 0;
 +			dark_ = true;
 +			context.activeState.af.busy = false;
++			/* Too dark for a while: the rest position, not anywhere */
++			if (++darkCount_ >= kMaxWait) {
++				scanStart_ = frame_ + 1 - darkCount_;
++				fine_ = false;
++				endScan(context, AfSearch::Result::Failed, m);
++			}
 +			break;
 +		}
 +		dark_ = false;
++		darkCount_ = 0;
 +
 +		/*
 +		 * While the exposure moves, the level must also be steady over
@@ -2898,8 +3056,12 @@ index 0000000..ec69bd1
 +		if (pdTurn)
 +			break;
 +
-+		if (drifting) {
-+			/* Not forever: flicker may keep the exposure moving */
++		if (drifting || (targeted() && !exposureSteady)) {
++			/*
++			 * Not forever: flicker may keep the exposure moving. On
++			 * an AfWindows rectangle the exposure may follow the
++			 * window (spot metering) as well.
++			 */
 +			if (++exposureWait_ >= kMaxExposureWait)
 +				startScan(context);
 +		} else if (steadyCount_ >= 2 || ++waitCount_ >= kMaxWait) {
@@ -2915,7 +3077,16 @@ index 0000000..ec69bd1
 +			break;
 +		}
 +
-+		const AfSearch::Result result = search_.update(m.sharpness, m.level);
++		/*
++		 * Without a noise estimate the first sample waits a frame: the
++		 * lens stays, the next grid gives one
++		 */
++		if (!noisePairs_ && !noiseTry_) {
++			noiseTry_ = true;
++			break;
++		}
++
++		const AfSearch::Result result = search_.update(m.sharpness - noise, m.level, noise);
 +		if (result == AfSearch::Result::Move)
 +			moveLens(context, search_.target());
 +		else
@@ -2967,10 +3138,10 @@ index 0000000..ec69bd1
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/af.h b/src/ipa/mtkisp50/algorithms/af.h
 new file mode 100644
-index 0000000..479fa38
+index 0000000..298e432
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/af.h
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,276 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast detect autofocus for the software ISP
@@ -2978,6 +3149,7 @@ index 0000000..479fa38
 +
 +#pragma once
 +
++#include <array>
 +#include <stdint.h>
 +#include <utility>
 +#include <vector>
@@ -3042,6 +3214,10 @@ index 0000000..479fa38
 +	void endScan(IPAContext &context, AfSearch::Result result,
 +		     const AfMeasurement &m);
 +	void monitor(const AfMeasurement &m, bool exposureSteady, bool pdFocused);
++	void measureNoise(const Statistics &stats, const AfMeasurement &m,
++			  double blackLevel, int32_t lens);
++	double noiseShare(const AfMeasurement &m, unsigned int cellSamples) const;
++	double frameGain(uint32_t frame) const;
 +
 +	bool centreDisagrees(const Statistics &stats) const;
 +	PdEstimate pdEstimate(const Statistics &stats) const;
@@ -3052,6 +3228,7 @@ index 0000000..479fa38
 +	void startFine(IPAContext &context);
 +	void enterWait(uint32_t from);
 +	bool pdHolds() const;
++	bool targeted() const;
 +
 +	bool enabled_ = false;
 +
@@ -3060,6 +3237,9 @@ index 0000000..479fa38
 +	double defaultDioptres_ = 0.0;
 +	double rangeMin_ = 0.0;
 +	double rangeMax_ = 0.0;
++	/* Range for a manual position and a search on an AfWindows rectangle */
++	double targetedMin_ = 0.0;
++	double targetedMax_ = 0.0;
 +	double step_ = 1.0;
 +	double climbStep_ = 1.0;
 +	bool climb_ = true;
@@ -3120,6 +3300,35 @@ index 0000000..479fa38
 +	bool rebase_ = false;
 +	bool levelRebase_ = false;
 +	uint32_t scanStart_ = 0;
++	/* Focus grid samples in a row too dark to measure while waiting */
++	unsigned int darkCount_ = 0;
++	/*
++	 * Focused or Failed is reported from this frame on: the frames
++	 * before it are taken while the lens moves to the result
++	 */
++	uint32_t reportFrom_ = 0;
++	/* A search without a noise estimate waited a frame for one */
++	bool noiseTry_ = false;
++
++	/*
++	 * Temporal noise of the focus grid, from two grids of frames at the
++	 * same lens position: the variance of a cell per sum above the black
++	 * level and per analogue gain, the median of the last estimates
++	 */
++	std::vector<uint32_t> noiseGrid_;
++	uint32_t noiseGridFrame_ = 0;
++	int32_t noiseGridLens_ = -1;
++	double noiseGridLevel_ = 0.0;
++	double noiseGridGain_ = 0.0;
++	static constexpr unsigned int kNoiseEstimates = 5;
++	std::array<double, kNoiseEstimates> noiseEstimates_{};
++	unsigned int noiseCount_ = 0;
++	/* Pairs of grids compared for the noise (also those without any) */
++	unsigned int noisePairs_ = 0;
++	double noiseCoeff_ = 0.0;
++	/* Analogue gain each frame was taken with, from prepare() */
++	static constexpr unsigned int kGainHistory = 16;
++	std::array<double, kGainHistory> gains_{};
 +
 +	/*
 +	 * Phase detection (tuning key "pd"): lens target = position + slope
@@ -3211,10 +3420,10 @@ index 0000000..479fa38
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/af_search.cpp b/src/ipa/mtkisp50/algorithms/af_search.cpp
 new file mode 100644
-index 0000000..f75ecc8
+index 0000000..5d7646d
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/af_search.cpp
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,372 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast detect focus search
@@ -3275,8 +3484,76 @@ index 0000000..f75ecc8
 +	return { diff / pairs / (meanAboveBlack * meanAboveBlack), level };
 +}
 +
++/*
++ * Temporal noise of a focus grid, see the header. Cells as in afMeasure()
++ * (sums of cellSamples samples of the black level and above).
++ */
++double afTemporalNoise(const uint32_t *a, const uint32_t *b, unsigned int cells,
++		       unsigned int cellSamples, double blackLevel)
++{
++	if (cells < 16 || !cellSamples)
++		return -1.0;
++
++	const double black = blackLevel * cellSamples;
++	double sumA = 0.0, sumB = 0.0;
++	for (unsigned int i = 0; i < cells; i++) {
++		sumA += a[i];
++		sumB += b[i];
++	}
++	const double meanA = sumA / cells - black;
++	const double meanB = sumB / cells - black;
++	if (meanA <= 0.0 || meanB <= 0.0)
++		return -1.0;
++
++	const double scale = meanA / meanB;
++	std::vector<double> squares(cells);
++	for (unsigned int i = 0; i < cells; i++) {
++		const double d = (a[i] - black) - scale * (b[i] - black);
++		squares[i] = d * d;
++	}
++	auto mid = squares.begin() + cells / 2;
++	std::nth_element(squares.begin(), mid, squares.end());
++
++	/* The median of the square of a normal variable is 0.455 of its variance */
++	const double variance = *mid / 0.4549;
++
++	/*
++	 * Var(a - s b) = Var(a) + s^2 Var(b), and with the noise of the light
++	 * Var(b) = Var(a) / s: the variance of a cell of @a
++	 */
++	return variance / (1.0 + scale);
++}
++
 +/* A side sample counts as better or worse with this relative difference */
 +static constexpr double kProbeMargin = 0.05;
++
++/*
++ * With the noise known: a sample counts as better or worse than another only
++ * if it also differs by this fraction of the noise share of the measure (the
++ * measure of a frame scatters by a few percent of it)
++ */
++static constexpr double kNoiseMargin = 0.1;
++
++/*
++ * With the noise known: the samples of a search must differ by this fraction
++ * of the noise share of the best one for a result. Less is a scene too dark or
++ * too plain to focus on: the lens goes to the rest position.
++ */
++static constexpr double kMinSignal = 0.2;
++
++/* Sample @a better than @b by @factor, and by more than the noise */
++bool AfSearch::above(const Sample &a, const Sample &b, double factor)
++{
++	return a.sharpness > b.sharpness * factor &&
++	       a.sharpness - b.sharpness > kNoiseMargin * std::max(a.noise, b.noise);
++}
++
++/* Sample @a below @factor of @b, and by more than the noise */
++bool AfSearch::below(const Sample &a, const Sample &b, double factor)
++{
++	return a.sharpness < b.sharpness * factor &&
++	       b.sharpness - a.sharpness > kNoiseMargin * std::max(a.noise, b.noise);
++}
 +
 +/* A sample of the climb compares with the scan within this relative level */
 +static constexpr double kLevelMatch = 0.05;
@@ -3335,10 +3612,8 @@ index 0000000..f75ecc8
 +	if (n < best_ + 3)
 +		return false;
 +
-+	const double limit = samples_[best_].sharpness * config_.peakDrop;
-+
-+	return samples_[n - 1].sharpness < limit &&
-+	       samples_[n - 2].sharpness < limit;
++	return below(samples_[n - 1], samples_[best_], config_.peakDrop) &&
++	       below(samples_[n - 2], samples_[best_], config_.peakDrop);
 +}
 +
 +AfSearch::Result AfSearch::finishScan(bool knownPeak)
@@ -3377,8 +3652,13 @@ index 0000000..f75ecc8
 +
 +	const Sample b = sorted[best];
 +
++	/*
++	 * No peak: the best sample not clearly above the worst, or (with the
++	 * noise known) not by a part of the noise
++	 */
 +	if (b.sharpness <= 0.0 ||
-+	    (!knownPeak && b.sharpness < worst * config_.minContrast)) {
++	    (!knownPeak && (b.sharpness < worst * config_.minContrast ||
++			    b.sharpness - worst < kMinSignal * b.noise))) {
 +		/* A climb over a few samples proves little: scan the range */
 +		if (phase_ == Phase::Probe || phase_ == Phase::Climb)
 +			return startFullScan();
@@ -3435,8 +3715,10 @@ index 0000000..f75ecc8
 +	return Result::Move;
 +}
 +
-+AfSearch::Result AfSearch::update(double sharpness, double level)
++AfSearch::Result AfSearch::update(double sharpness, double level, double noise)
 +{
++	const Sample sample{ target_, sharpness, level, noise };
++
 +	if (phase_ == Phase::Check) {
 +		/*
 +		 * Keep the interpolated position unless it measured clearly
@@ -3444,7 +3726,7 @@ index 0000000..f75ecc8
 +		 * when the scene changed during the scan.
 +		 */
 +		const Sample &b = checkBest_;
-+		if (sharpness < b.sharpness * 0.8)
++		if (below(sample, b, 0.8))
 +			target_ = b.position;
 +		else
 +			peak_ = sharpness;
@@ -3452,7 +3734,7 @@ index 0000000..f75ecc8
 +		return Result::Done;
 +	}
 +
-+	samples_.push_back({ target_, sharpness, level });
++	samples_.push_back(sample);
 +	if (sharpness > samples_[best_].sharpness)
 +		best_ = samples_.size() - 1;
 +
@@ -3468,7 +3750,7 @@ index 0000000..f75ecc8
 +			return moveTo(std::clamp(start + dir_ * step, config_.min, config_.max));
 +		}
 +
-+		if (sharpness > s0 * (1.0 + kProbeMargin)) {
++		if (above(sample, samples_[0], 1.0 + kProbeMargin)) {
 +			/* This side is better: climb on */
 +			dir_ = target_ > start ? 1 : -1;
 +			phase_ = Phase::Climb;
@@ -3487,14 +3769,14 @@ index 0000000..f75ecc8
 +		{
 +			bool lower = true;
 +			for (unsigned int i = 1; i < samples_.size(); i++)
-+				lower &= samples_[i].sharpness < s0 * (1.0 - 2.0 * kProbeMargin);
++				lower &= below(samples_[i], samples_[0], 1.0 - 2.0 * kProbeMargin);
 +			if ((lower || config_.near) && s0 > 0.0)
 +				return finishScan(true);
 +		}
 +		return startFullScan();
 +
 +	case Phase::Climb:
-+		if (sharpness < samples_[best_].sharpness * config_.peakDrop ||
++		if (below(sample, samples_[best_], config_.peakDrop) ||
 +		    (dir_ > 0 && target_ >= config_.max) || (dir_ < 0 && target_ <= config_.min))
 +			return finishScan();
 +		return moveTo(std::clamp(target_ + dir_ * step, config_.min, config_.max));
@@ -3516,10 +3798,10 @@ index 0000000..f75ecc8
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/algorithms/af_search.h b/src/ipa/mtkisp50/algorithms/af_search.h
 new file mode 100644
-index 0000000..61fe9e1
+index 0000000..12f0160
 --- /dev/null
 +++ b/src/ipa/mtkisp50/algorithms/af_search.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,137 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast detect focus search
@@ -3552,6 +3834,16 @@ index 0000000..61fe9e1
 +			double blackLevel, double fraction);
 +
 +/*
++ * Temporal noise of a focus grid: the variance of one cell of grid @a, from
++ * the differences to grid @b of the same scene at the same lens position
++ * (another frame), @b scaled to the mean of @a. The median of the squared
++ * differences keeps cells that changed (a moving subject, a shaking hand)
++ * out. Returns a negative value when it cannot be measured.
++ */
++double afTemporalNoise(const uint32_t *a, const uint32_t *b, unsigned int cells,
++		       unsigned int cellSamples, double blackLevel);
++
++/*
 + * Two strategies, both ending with a move to the peak interpolated from the
 + * best sample and its neighbours in position (parabola through the
 + * logarithms, i.e. a Gaussian fit) and one check measurement there:
@@ -3561,6 +3853,12 @@ index 0000000..61fe9e1
 + *   better or worse) falls back to the full scan.
 + * - full scan: coarse steps over the whole range from its lower end, with
 + *   an early end two samples past a clear peak.
++ *
++ * A sample may come with the share of the noise in its sharpness (0: not
++ * known). The sharpness is then the measure less that share, and a sample
++ * counts as better or worse than another only by more than a fraction of
++ * the noise as well; a search whose samples do not differ by a part of the
++ * noise found nothing (a scene too dark or too plain to focus on).
 + */
 +class AfSearch
 +{
@@ -3591,10 +3889,11 @@ index 0000000..61fe9e1
 +
 +	void start(const Config &config);
 +	/*
-+	 * The sharpness measured at target(), and the level of the
-+	 * measurement (0: not known)
++	 * The sharpness measured at target(), the level of the measurement
++	 * (0: not known) and the share of the noise in the measure that the
++	 * sharpness is net of (0: not known)
 +	 */
-+	Result update(double sharpness, double level = 0.0);
++	Result update(double sharpness, double level = 0.0, double noise = 0.0);
 +
 +	/* The position to measure next (Move) or the result (Done) */
 +	int32_t target() const { return target_; }
@@ -3606,7 +3905,11 @@ index 0000000..61fe9e1
 +		int32_t position;
 +		double sharpness;
 +		double level;
++		double noise;
 +	};
++
++	static bool above(const Sample &a, const Sample &b, double factor);
++	static bool below(const Sample &a, const Sample &b, double factor);
 +
 +	enum class Phase {
 +		Probe,
@@ -9712,7 +10015,7 @@ index 0000000..9958d5f
 +} /* namespace libcamera::ipa::mtkisp50 */
 diff --git a/src/ipa/mtkisp50/ipa_context.h b/src/ipa/mtkisp50/ipa_context.h
 new file mode 100644
-index 0000000..0665b2f
+index 0000000..e4b9cc3
 --- /dev/null
 +++ b/src/ipa/mtkisp50/ipa_context.h
 @@ -0,0 +1,178 @@
@@ -9847,8 +10150,8 @@ index 0000000..0665b2f
 +	 * regulated after it. VBLANK it was taken with, -1 if unknown.
 +	 */
 +	struct {
-+		int32_t exposure;
-+		double gain;
++		int32_t exposure = 0;
++		double gain = 0.0;
 +		int32_t vblank = -1;
 +	} sensor;
 +
@@ -14611,10 +14914,10 @@ index 0000000..52a2778
 +libcamera_deps += declare_dependency(link_whole : mtkisp50_align)
 diff --git a/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..79382be
+index 0000000..49a1c8d
 --- /dev/null
 +++ b/src/libcamera/pipeline/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,3915 @@
+@@ -0,0 +1,3992 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Pipeline handler for the MediaTek MT6785 camera subsystem with the ISP pass 2
@@ -15097,6 +15400,7 @@ index 0000000..79382be
 +	PipelineHandlerMtkIsp50 *pipe();
 +
 +	int init(MediaEntity *sensorEntity);
++	int enableSensorLink();
 +	int loadIPA();
 +
 +	/* A subdevice between the sensor and the capture video node */
@@ -15108,6 +15412,11 @@ index 0000000..79382be
 +	};
 +
 +	std::unique_ptr<CameraSensor> sensor_;
++	/*
++	 * The link from the sensor, which may be switched off while another
++	 * sensor uses the same input of the receiver
++	 */
++	MediaLink *sensorLink_ = nullptr;
 +	std::vector<Entity> entities_;
 +	std::unique_ptr<V4L2VideoDevice> video_;
 +
@@ -15413,6 +15722,8 @@ index 0000000..79382be
 +
 +	/* The camera that streams, the DIP serves one at a time */
 +	MtkIsp50CameraData *activeData_ = nullptr;
++	/* The camera acquired, for the message to another one */
++	Camera *inUse_ = nullptr;
 +
 +	Thread statsThread_;
 +	Thread seriesThread_;
@@ -15430,7 +15741,10 @@ index 0000000..79382be
 +/*
 + * Follow the links from the sensor to the capture video node. Entities with
 + * the routing API (seninf) are crossed through their active route from the
-+ * sink pad, others through their only source pad.
++ * sink pad, others through their only source pad. Sensors that share an
++ * input of the receiver (behind a MIPI switch) have one link each to it, at
++ * most one of them enabled: the link of the sensor is followed also when it
++ * is off, and switched on when the camera is configured.
 + */
 +int MtkIsp50CameraData::init(MediaEntity *sensorEntity)
 +{
@@ -15446,14 +15760,20 @@ index 0000000..79382be
 +		}
 +	}
 +
++	const MediaPad *sensorSource = source;
 +	while (source) {
-+		const MediaLink *link = nullptr;
-+		for (const MediaLink *l : source->links()) {
++		MediaLink *link = nullptr;
++		for (MediaLink *l : source->links()) {
 +			if (l->flags() & MEDIA_LNK_FL_ENABLED) {
 +				link = l;
 +				break;
 +			}
 +		}
++		if (!link && source == sensorSource && source->links().size() == 1 &&
++		    !(source->links()[0]->flags() & MEDIA_LNK_FL_IMMUTABLE))
++			link = source->links()[0];
++		if (source == sensorSource)
++			sensorLink_ = link;
 +		if (!link) {
 +			LOG(MtkIsp50, Error)
 +				<< "No enabled link from " << source->entity()->name()
@@ -15547,6 +15867,45 @@ index 0000000..79382be
 + * sensor), along the enabled links to a capture device that takes the PD
 + * frame format. The lowest such pad wins.
 + */
++/*
++ * Switch the input of the receiver to this sensor: the link of the other
++ * sensor at the same input off, then this one on. Fails with -EBUSY while
++ * the other sensor streams.
++ */
++int MtkIsp50CameraData::enableSensorLink()
++{
++	if (!sensorLink_ || (sensorLink_->flags() & MEDIA_LNK_FL_ENABLED))
++		return 0;
++
++	for (MediaLink *link : sensorLink_->sink()->links()) {
++		if (link == sensorLink_ || !(link->flags() & MEDIA_LNK_FL_ENABLED))
++			continue;
++
++		int ret = link->setEnabled(false);
++		if (ret) {
++			LOG(MtkIsp50, Error)
++				<< "Input " << sensorLink_->sink()->entity()->name() << ":"
++				<< sensorLink_->sink()->index() << " in use by "
++				<< link->source()->entity()->name() << ": " << strerror(-ret);
++			return ret;
++		}
++	}
++
++	int ret = sensorLink_->setEnabled(true);
++	if (ret) {
++		LOG(MtkIsp50, Error)
++			<< "Link from " << sensorLink_->source()->entity()->name()
++			<< " not enabled: " << strerror(-ret);
++		return ret;
++	}
++
++	LOG(MtkIsp50, Debug)
++		<< "Input " << sensorLink_->sink()->entity()->name() << ":"
++		<< sensorLink_->sink()->index() << " switched to "
++		<< sensorLink_->source()->entity()->name();
++	return 0;
++}
++
 +int MtkIsp50CameraData::findPdChain()
 +{
 +	const Entity &router = entities_[pd_.router];
@@ -16384,6 +16743,11 @@ index 0000000..79382be
 +		static_cast<MtkIsp50CameraConfiguration *>(c);
 +	MtkIsp50CameraData *data = cameraData(camera);
 +
++	/* The shared input of the receiver to this sensor */
++	int ret = data->enableSensorLink();
++	if (ret)
++		return ret;
++
 +	/*
 +	 * The sensor mode with PD frames gets the PD route, the others not
 +	 * (the route of a stream the sensor does not send fails the start).
@@ -16392,7 +16756,7 @@ index 0000000..79382be
 +	const MtkIsp50PdLayout *pdLayout = data->hasPdChain()
 +		? MtkIsp50PdLayout::find(data->sensor_->model(), config->sensorFormat.size)
 +		: nullptr;
-+	int ret = data->setPdRouting(pdLayout);
++	ret = data->setPdRouting(pdLayout);
 +	if (ret && pdLayout) {
 +		pdLayout = nullptr;
 +		ret = data->setPdRouting(nullptr);
@@ -18336,16 +18700,32 @@ index 0000000..79382be
 +void PipelineHandlerMtkIsp50::releaseDevice(Camera *camera)
 +{
 +	cameraData(camera)->restoreRouting();
++	if (inUse_ == camera)
++		inUse_ = nullptr;
 +}
 +
-+bool PipelineHandlerMtkIsp50::acquireDevice([[maybe_unused]] Camera *camera)
++bool PipelineHandlerMtkIsp50::acquireDevice(Camera *camera)
 +{
-+	/* One DIP: one camera at a time */
++	/*
++	 * One DIP: one camera at a time. Cameras behind a MIPI switch share
++	 * an input of the receiver too, which the configuration switches.
++	 */
 +	if (useCount() > 0) {
-+		LOG(MtkIsp50, Error) << "Another camera of the ISP is in use";
++		const MtkIsp50CameraData *data = cameraData(camera);
++		const MtkIsp50CameraData *other = inUse_ ? cameraData(inUse_) : nullptr;
++		if (other && data->sensorLink_ && other->sensorLink_ &&
++		    data->sensorLink_->sink() == other->sensorLink_->sink())
++			LOG(MtkIsp50, Error)
++				<< "Camera " << camera->id() << " shares its input with "
++				<< inUse_->id() << ", which is in use";
++		else
++			LOG(MtkIsp50, Error)
++				<< "Another camera of the ISP is in use"
++				<< (inUse_ ? ": " + inUse_->id() : std::string());
 +		return false;
 +	}
 +
++	inUse_ = camera;
 +	return true;
 +}
 +
@@ -22360,20 +22740,22 @@ index 86dcc9c..b19c26f 100644
  subdir('serialization')
 diff --git a/test/mtkisp50/af.cpp b/test/mtkisp50/af.cpp
 new file mode 100644
-index 0000000..858673c
+index 0000000..b637743
 --- /dev/null
 +++ b/test/mtkisp50/af.cpp
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,509 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * mtkisp50 IPA: autofocus state over a new configuration of the camera
 + */
 +
++#include <array>
 +#include <cmath>
 +#include <cstring>
 +#include <iostream>
 +#include <map>
 +#include <memory>
++#include <random>
 +#include <string>
 +#include <unistd.h>
 +
@@ -22404,6 +22786,7 @@ index 0000000..858673c
 +  map: [ 0.1, 468, 10.0, 775 ]
 +  default: 0.4
 +  range: [ -0.8, 10.5 ]
++  targetedRange: [ -0.8, 17.5 ]
 +  step: 1.25
 +  mode: auto
 +  settleFrames: 2
@@ -22478,12 +22861,35 @@ index 0000000..858673c
 +		stats_.afGridHeight = 12;
 +		stats_.afCellSize = 16;
 +		stats_.afCellSamples = 64;
-+		const double d = (effective_ - kSharpAt) / 40.0;
-+		const double amplitude = 20.0 + 1000.0 * std::exp(-d * d);
-+		for (unsigned int y = 0; y < 12; y++)
-+			for (unsigned int x = 0; x < 16; x++)
-+				stats_.afGrid[y * 16 + x] =
-+					static_cast<uint32_t>(64 * (2000 + ((x + y) & 1 ? amplitude : -amplitude)));
++		const double d = (effective_ - sharpAt) / 40.0;
++		if (!level) {
++			const double amplitude = 20.0 + 1000.0 * std::exp(-d * d);
++			for (unsigned int y = 0; y < 12; y++)
++				for (unsigned int x = 0; x < 16; x++)
++					stats_.afGrid[y * 16 + x] =
++						static_cast<uint32_t>(64 * (2000 + ((x + y) & 1 ? amplitude : -amplitude)));
++		} else {
++			/*
++			 * A dim scene: level per sample above black (16), lower
++			 * towards the macro end, a texture of contrast peaking
++			 * at kSharpAt, and the noise of the light (variance
++			 * noise per unit above black), on a grid as large as
++			 * that of the device (the measure of a frame scatters
++			 * by a few percent of the noise)
++			 */
++			stats_.afGridWidth = 64;
++			stats_.afGridHeight = 48;
++			const double l = level * (1.0 - falloff * (effective_ - 477) / 314.0);
++			const double amplitude = contrast * l * std::exp(-d * d);
++			for (unsigned int y = 0; y < 48; y++) {
++				for (unsigned int x = 0; x < 64; x++) {
++					const double above = 64 * (l + ((x + y) & 1 ? amplitude : -amplitude));
++					std::normal_distribution<double> scatter(0.0, std::sqrt(noise * std::max(above, 0.0)));
++					stats_.afGrid[y * 64 + x] =
++						static_cast<uint32_t>(std::max(0.0, 64 * 16 + above + scatter(rng_)));
++				}
++			}
++		}
 +
 +		ControlList metadata(controls::controls);
 +		ctx_.activeState.agc.converging = false;
@@ -22513,9 +22919,18 @@ index 0000000..858673c
 +	}
 +
 +	IPAContext &ctx() { return ctx_; }
++	int32_t effective() const { return effective_; }
 +
 +	int32_t lens = 0;
 +	unsigned int moves = 0;
++
++	int32_t sharpAt = kSharpAt;
++
++	/* A dim scene with noise (level 0: the plain synthetic one) */
++	double level = 0.0;
++	double contrast = 0.0;
++	double falloff = 0.0;
++	double noise = 0.0;
 +
 +private:
 +	ControlId focusId_{ V4L2_CID_FOCUS_ABSOLUTE, "Focus, Absolute", "v4l2",
@@ -22526,6 +22941,7 @@ index 0000000..858673c
 +	algorithms::Af af_;
 +	Statistics stats_{};
 +	std::map<uint32_t, int32_t> pending_;
++	std::mt19937 rng_{ 1 };
 +	int32_t effective_ = 0;
 +	uint32_t frame_ = 0;
 +};
@@ -22628,9 +23044,150 @@ index 0000000..858673c
 +		return TestPass;
 +	}
 +
++	/*
++	 * Continuous autofocus in a scene with the noise of the device: @level
++	 * per sample, @contrast of the texture, @noise of a cell. Returns the
++	 * final state, checks that the state is never Idle and that Focused or
++	 * Failed come only once the lens stands at the result.
++	 */
++	int continuousIn(Sim &sim, double level, double contrast, double noise,
++			 const std::string &name)
++	{
++		sim.level = level;
++		sim.contrast = contrast;
++		sim.falloff = 0.15;
++		sim.noise = noise;
++		sim.configure();
++
++		ControlList cont(controls::controls);
++		cont.set(controls::AfMode, controls::AfModeContinuous);
++		for (unsigned int i = 0; i < 200; i++) {
++			ControlList md = sim.frame(i ? nullptr : &cont);
++			const auto state = md.get(controls::AfState);
++			if (!state || *state == controls::AfStateIdle) {
++				fail(name + ": state Idle in continuous mode at frame " + std::to_string(i));
++				return -1;
++			}
++			if (*state == controls::AfStateFocused || *state == controls::AfStateFailed) {
++				if (sim.effective() != sim.lens) {
++					fail(name + ": done at frame " + std::to_string(i) +
++					     " with the lens at " + std::to_string(sim.effective()) +
++					     " on its way to " + std::to_string(sim.lens));
++					return -1;
++				}
++				return *state;
++			}
++		}
++		fail(name + ": no result");
++		return -1;
++	}
++
++	/*
++	 * A dim plain scene as on the device (20 % room light, 30 ms at gain
++	 * 15.5, level 4.3 falling by 15 % towards the macro end): the noise of
++	 * the measure is 30 times the texture. The search ended at the macro
++	 * end (the noise rises there); with the noise taken off it finds no
++	 * peak and the lens goes to the rest position (0.4 dpt, 477). In the
++	 * same scene under more light (level 40, gain 6) it finds the peak.
++	 */
++	int noisyScenes()
++	{
++		Sim dim;
++		if (dim.init())
++			return fail("init");
++		int state = continuousIn(dim, 4.3, 0.01, 1.65, "dim scene");
++		if (state < 0)
++			return TestFail;
++		if (state != controls::AfStateFailed || dim.lens != 477)
++			return fail("dim scene: state " + std::to_string(state) + " lens " +
++				    std::to_string(dim.lens) + ", expected the rest position");
++
++		Sim lit;
++		if (lit.init())
++			return fail("init");
++		state = continuousIn(lit, 40.0, 0.015, 0.64, "lit scene");
++		if (state < 0)
++			return TestFail;
++		if (state != controls::AfStateFocused || std::abs(lit.lens - kSharpAt) > 25)
++			return fail("lit scene: state " + std::to_string(state) + " lens " +
++				    std::to_string(lit.lens));
++
++		return TestPass;
++	}
++
++	/*
++	 * A subject closer than the range of the continuous search (17 dpt,
++	 * lens 995): a search on a window reaches it and the continuous search
++	 * on that window stays there; the continuous search over the centre
++	 * keeps to its range and ends at the rest position. A manual position
++	 * reaches the targeted range, the control says so.
++	 */
++	int targetedRange()
++	{
++		Sim sim;
++		if (sim.init())
++			return fail("init");
++		sim.sharpAt = 995;
++
++		const auto &info = sim.ctx().ctrlMap.find(&controls::LensPosition);
++		if (info == sim.ctx().ctrlMap.end() ||
++		    std::abs(info->second.max().get<float>() - 17.5f) > 0.01f)
++			return fail("targeted range: LensPosition limit");
++
++		/* Continuous over the centre: not beyond the range */
++		sim.configure();
++		ControlList cont(controls::controls);
++		cont.set(controls::AfMode, controls::AfModeContinuous);
++		sim.frame(&cont);
++		int32_t furthest = 0;
++		int state = -1;
++		for (unsigned int i = 0; i < 200 && state != controls::AfStateFailed; i++) {
++			state = sim.frame().get(controls::AfState).value_or(-1);
++			furthest = std::max(furthest, sim.lens);
++		}
++		if (state != controls::AfStateFailed || furthest > 791 || sim.lens != 477)
++			return fail("targeted range: centre search to " + std::to_string(furthest) +
++				    ", state " + std::to_string(state) + " lens " + std::to_string(sim.lens));
++
++		/* A tap: auto mode on a window */
++		ControlList tap(controls::controls);
++		tap.set(controls::AfMode, controls::AfModeAuto);
++		tap.set(controls::AfMetering, controls::AfMeteringWindows);
++		tap.set(controls::AfWindows, std::array<Rectangle, 1>{ Rectangle(800, 600, 400, 400) });
++		tap.set(controls::AfTrigger, controls::AfTriggerStart);
++		sim.frame(&tap);
++		if (sim.untilDone(200) != controls::AfStateFocused || std::abs(sim.lens - 995) > 20)
++			return fail("targeted range: tap to lens " + std::to_string(sim.lens));
++
++		/* Continuous on the window afterwards: stays close */
++		sim.frame(&cont);
++		for (unsigned int i = 0; i < 200; i++)
++			sim.frame();
++		if (std::abs(sim.lens - 995) > 20)
++			return fail("targeted range: continuous on the window at " +
++				    std::to_string(sim.lens));
++
++		/* Manual: the full targeted range */
++		ControlList manual(controls::controls);
++		manual.set(controls::AfMode, controls::AfModeManual);
++		manual.set(controls::LensPosition, 17.5f);
++		sim.frame(&manual);
++		sim.frame();
++		if (sim.lens < 1000)
++			return fail("targeted range: manual 17.5 dpt at lens " + std::to_string(sim.lens));
++
++		return TestPass;
++	}
++
 +	int run() override
 +	{
 +		if (darkScan() != TestPass)
++			return TestFail;
++
++		if (targetedRange() != TestPass)
++			return TestFail;
++
++		if (noisyScenes() != TestPass)
 +			return TestFail;
 +
 +		/* Scan to the sharp position, then run on for many frames */
@@ -22698,10 +23255,10 @@ index 0000000..858673c
 +TEST_REGISTER(MtkIsp50AfTest)
 diff --git a/test/mtkisp50/af_pd.cpp b/test/mtkisp50/af_pd.cpp
 new file mode 100644
-index 0000000..af793ef
+index 0000000..131e87c
 --- /dev/null
 +++ b/test/mtkisp50/af_pd.cpp
-@@ -0,0 +1,673 @@
+@@ -0,0 +1,691 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * mtkisp50 IPA: autofocus with phase detection
@@ -22951,6 +23508,8 @@ index 0000000..af793ef
 +	int32_t centre = 0;
 +	/* The lens is held, as during the capture of a multi-frame series */
 +	bool held = false;
++
++	IPAContext &ctx() { return ctx_; }
 +
 +	int32_t lens = 0;
 +	unsigned int moves = 0;
@@ -23321,20 +23880,36 @@ index 0000000..af793ef
 +					    " averages over a lens move, lens " + std::to_string(sim.lens));
 +		}
 +
-+		/* Too dark: waits without searching and without hanging busy */
++		/*
++		 * Too dark: no search over the range, the lens goes to the rest
++		 * position (Failed) and nothing stays busy; with light the
++		 * search follows
++		 */
 +		{
 +			Sim sim;
 +			if (sim.init())
 +				return fail("init");
 +			sim.dark = true;
 +			sim.configure();
-+			for (unsigned int i = 0; i < 60; i++)
-+				sim.frame();
-+			if (sim.scans)
-+				return fail("dark: searched");
++			/* The start position goes with the first frame */
++			sim.frame();
++			sim.path = 0;
++			int state = -1;
++			for (unsigned int i = 0; i < 60; i++) {
++				ControlList md = sim.frame();
++				state = md.get(controls::AfState).value_or(-1);
++			}
++			if (state != controls::AfStateFailed || sim.lens != 477 || sim.path ||
++			    sim.ctx().activeState.af.busy)
++				return fail("dark: state " + std::to_string(state) + " lens " +
++					    std::to_string(sim.lens) + " path " + std::to_string(sim.path));
 +			sim.dark = false;
-+			if (sim.untilDone(120) != controls::AfStateFocused ||
-+			    std::abs(sim.lens - sim.sharpAt) > 20)
++			bool ok = false;
++			for (unsigned int i = 0; i < 120 && !ok; i++) {
++				ControlList md = sim.frame();
++				ok = md.get(controls::AfState) == controls::AfStateFocused;
++			}
++			if (!ok || std::abs(sim.lens - sim.sharpAt) > 20)
 +				return fail("after dark: lens " + std::to_string(sim.lens));
 +		}
 +
@@ -27782,10 +28357,10 @@ index 0000000..17868f5
 +TEST_REGISTER(MtkIsp50SensorTimelineTest)
 diff --git a/test/mtkisp50/streams.cpp b/test/mtkisp50/streams.cpp
 new file mode 100644
-index 0000000..22b8cff
+index 0000000..8f613a8
 --- /dev/null
 +++ b/test/mtkisp50/streams.cpp
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,308 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * mtkisp50 pipeline: assignment of the streams to the outputs of the ISP
@@ -28040,6 +28615,45 @@ index 0000000..22b8cff
 +			    plan.mode != Size(2592, 1940) || plan.crop != Rectangle(0, 0, 2592, 1940) ||
 +			    c[0].size != Size(1296, 970))
 +				return fail("one mode, viewfinder beside the still", c);
++		}
++
++		/*
++		 * The ultra wide camera: a binned mode of a centred crop and the
++		 * whole field of 3264x2448, whose width lies in a band of the
++		 * tile computation. A still of the whole field gets the widest
++		 * width below the band, the viewfinder beside it half of that;
++		 * the viewfinder alone takes the whole field too, not the crop.
++		 */
++		{
++			const std::vector<Size> wide = { { 1280, 720 }, { 3264, 2448 } };
++			std::vector<StreamConfiguration> c = { stream(formats::YUYV, { 1616, 1224 }),
++							       stream(formats::NV12, { 3234, 2448 }) };
++			MtkIsp50StreamPlan plan(wide, true);
++			if (plan.plan(c) != Status::Valid || plan.scaled != 0 || plan.main != 1 ||
++			    plan.mode != Size(3264, 2448) || plan.crop != Rectangle(12, 0, 3234, 2448) ||
++			    c[0].size != Size(1616, 1224))
++				return fail("ultra wide, viewfinder beside the still", c);
++
++			c = { stream(formats::NV12, { 3264, 2448 }) };
++			if (plan.plan(c) != Status::Adjusted || c[0].size != Size(3234, 2448) ||
++			    plan.mode != Size(3264, 2448))
++				return fail("ultra wide, still of the whole width", c);
++
++			c = { stream(formats::YUYV, { 1616, 1224 }) };
++			if (plan.plan(c) != Status::Valid || plan.scaled != 0 ||
++			    plan.mode != Size(3264, 2448) || plan.crop != Rectangle(12, 0, 3234, 2448) ||
++			    c[0].size != Size(1616, 1224))
++				return fail("ultra wide, viewfinder alone", c);
++		}
++
++		/* The macro camera's viewfinder of the whole mode on the main output */
++		{
++			const std::vector<Size> one = { { 2592, 1940 } };
++			std::vector<StreamConfiguration> c = { stream(formats::NV12, { 2592, 1940 }) };
++			MtkIsp50StreamPlan plan(one, true);
++			if (plan.plan(c) != Status::Valid || plan.main != 0 || plan.scaled != -1 ||
++			    plan.mode != Size(2592, 1940) || plan.crop != Rectangle(0, 0, 2592, 1940))
++				return fail("one mode, viewfinder of the whole mode", c);
 +		}
 +
 +		/* Nothing asked */
