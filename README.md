@@ -81,8 +81,15 @@ yet; `--trotzdem` takes it anyway) and puts it into `$PAKETE_OUT/repo` like a lo
 Every run on `main` publishes its packages to the public APT registry of the organisation
 [moblix on Codeberg](https://codeberg.org/moblix/-/packages), suite `testing`, component `main` (runs for pull
 requests and runs with additional draft packages do not publish; debug symbol packages are left out). A version
-that is already there is not replaced, so a changed package needs a new `REVISION`. Codeberg signs the index with
-the key of the registry:
+that is already there is not replaced, so a changed package needs a new `REVISION`. As in the Debian archive the
+registry holds one version per package: after publishing, `registry.sh aufraeumen` removes older versions of the
+source packages of this repository and binary packages a source no longer builds. Packages that other repositories
+publish to the same registry are not touched.
+
+Codeberg signs the index (`InRelease`) with the key of the registry; apt verifies it and, through the checksums in
+the index, every package. The packages themselves carry no signature (as in Debian). `registry.sh pruefen` checks
+in every run that the signed index describes exactly the files this run built, and warns when the registry holds a
+different build of the same version (for example after a rebuild without the cache).
 
     sudo curl -o /etc/apt/keyrings/forgejo-moblix.asc https://codeberg.org/api/packages/moblix/debian/repository.key
     echo "deb [signed-by=/etc/apt/keyrings/forgejo-moblix.asc] https://codeberg.org/api/packages/moblix/debian testing main" \
