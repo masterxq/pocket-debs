@@ -150,30 +150,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/apt-repo"
           cp -a "$PAKETE_OUT/repo/dists" "$PAKETE_OUT/repo/pool" "$PAKETE_OUT/repo/stand" "$RUNNER_TEMP/apt-repo/"
           { echo '```'; ./bau.sh liste; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      # Publishes to the public APT registry codeberg.org/moblix (suite testing, component main): only from main
-      # and never a run that was started with additional draft packages. A version that is already there is
-      # left as it is (HTTP 409), debug symbol packages are not published.
+      # Publishes to the public APT registry codeberg.org/moblix (suite testing, component main) with registry.sh:
+      # only from main and never a run that was started with additional draft packages. A version that is already
+      # there is left as it is; then the signed index of the registry is checked against the files of this run and
+      # older versions of our source packages are removed, so the registry holds one version per package.
       - name: publish
         if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && inputs.pakete == '' }}
         env:
           CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
         run: |
           set -eu
-          [ -n "$CODEBERG_TOKEN" ] || { echo "::error::secret CODEBERG_TOKEN is not set"; exit 1; }
-          url=https://codeberg.org/api/packages/moblix/debian/pool/testing/main/upload
-          echo '| package | result |' >> "$GITHUB_STEP_SUMMARY"; echo '|---|---|' >> "$GITHUB_STEP_SUMMARY"
-          fail=0
-          for deb in $(find "$RUNNER_TEMP/ergebnis" -name '*.deb' ! -name '*-dbgsym_*' | sort); do
-            code=$(curl -sS -m 600 --retry 3 -o /dev/null -w '%{http_code}' \
-              -H "Authorization: token $CODEBERG_TOKEN" --upload-file "$deb" "$url") || code=000
-            case $code in
-              201) res=published ;;
-              409) res='already there' ;;
-              *) res="failed (HTTP $code)"; fail=1; echo "::error::$(basename "$deb"): HTTP $code" ;;
-            esac
-            echo "| $(basename "$deb") | $res |" >> "$GITHUB_STEP_SUMMARY"
-          done
-          exit $fail
+          ./registry.sh hochladen "$RUNNER_TEMP/ergebnis"
+          ./registry.sh pruefen "$RUNNER_TEMP/ergebnis"
+          ./registry.sh aufraeumen "$RUNNER_TEMP/ergebnis"
       - uses: actions/upload-artifact@v7
         with:
           name: apt-repo
