@@ -62,17 +62,23 @@ cache).
 - **Every run carries all packages.** Each run uploads one artifact per package, named `<source>_<version>`
   (`.deb` files, source package, `STAND` with version and key, `BUILDINFO`, `SHA256SUMS`, patch and comparison
   results), and `apt-repo` with the complete repository (`dists/`, `pool/`, `stand/`).
-- **Test builds.** In a pull request and on other branches than `main` a package that is built gets the version
-  `<debian version>+pd<n>~test.<commit>` (`PAKETE_TEST`). It sorts before the version `main` builds later, so apt
-  replaces a test build on a device once the build of `main` is in the APT repository. A package the pull request
-  does not change comes from the cache and keeps the version of `main`.
+- **Pull requests build once.** A pull request builds the final version, the same `main` builds (there is no
+  separate test version: a package from a pull request cannot be told apart on a device from the published one of
+  the same version, so a changed package needs a new `REVISION` before it is tested). After the merge the run on
+  `main` cannot read the cache of the pull request; on a cache miss it takes over the artifact `<source>_<version>`
+  of an earlier run of this repository (the pull request, or an earlier run on `main`) whose `STAND` has the same
+  key, checks `SHA256SUMS` and stores it in its own cache. Artifacts of forks are never taken over. Only without
+  such an artifact the package is built again.
 - **Compiler cache.** Builds run through ccache. Locally the cache lives in `$PAKETE_OUT/ccache/<source>/`
   (`PAKETE_CCACHE=0` builds without it, `PAKETE_CCACHE_MAX` caps it per package, default 2G); in CI each built
   package restores the newest `ccache-<source>-*` entry and saves the updated one, so rebuilding the same package
   after a patch change mostly hits the cache. A hit yields the same object file as the compiler, so the cache is not
   part of the input key. `BUILDINFO` records the hit rate (`ccache_treffer`).
-- **Expiry.** Cache entries unused for 7 days and artifacts after 90 days (`apt-repo` after 30) are deleted by
-  GitHub. The weekly run keeps the cache in use. A missing cache entry simply means the package is built again.
+- **Expiry and upkeep.** Cache entries unused for 7 days and artifacts after 90 days (`apt-repo` after 30) are
+  deleted by GitHub; the weekly run keeps the cache in use, and a missing entry is taken over from an artifact or
+  built again. The repository has 10 GB of cache. After every run on `main` the job `pflege` deletes the entries of
+  closed pull requests and deleted branches, all compiler caches but the newest per package and branch, and on
+  `main` the results of active packages whose key is no longer current.
 
 ### Following Debian
 

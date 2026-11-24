@@ -26,8 +26,9 @@
 #   PAKETE_GPG_KEY (Schluessel zum Signieren des Repos) mit PAKETE_GNUPGHOME (Standard $GNUPGHOME bzw. ~/.gnupg),
 #   PAKETE_TIMEOUT (Sekunden je Containerlauf, Standard 21600), NICE (Standard 10),
 #   PAKETE_CCACHE=0 (ohne Compiler-Cache bauen), PAKETE_CCACHE_MAX (Obergrenze je Paket, Standard 2G),
-#   PAKETE_TEST=<commit> (Testbau: Fassung <debian>+pd<n>~test.<7 Zeichen des Commits>; sie sortiert vor der Fassung
-#   aus main, apt ersetzt einen Testbau also durch den spaeteren Bau aus main. Geht nicht in den Schluessel ein.)
+#   PAKETE_TEST=<commit> (lokaler Testbau: Fassung <debian>+pd<n>~test.<7 Zeichen des Commits>; sie sortiert vor
+#   der Fassung aus main, apt ersetzt einen Testbau also durch den spaeteren Bau aus main. Geht nicht in den
+#   Schluessel ein. Die CI setzt es nicht: Pull Requests bauen die endgueltige Fassung.)
 # Compiler-Cache: $PAKETE_OUT/ccache/<quelle>/ (ccache), bleibt ueber Bauten erhalten; geht nicht in den Schluessel ein,
 #   weil ein Treffer dieselbe Objektdatei liefert wie der Compiler.
 # Rueckgabe: 0 gut, 1 Fehler, 2 Aufruf, 3 neuere Debian-Fassung (pruefen) bzw. Patch-Konflikt (nachziehen).
