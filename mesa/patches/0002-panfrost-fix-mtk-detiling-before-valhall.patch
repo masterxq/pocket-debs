@@ -1,0 +1,52 @@
+Description: panfrost: fix MTK 16L32S detiling before Valhall
+ Before Valhall, shader images are bound as attribute buffers whose S/T
+ dimensions are taken from the pipe_resource. For the tiled sources of the
+ MTK detile compute shader that is the size of the detiled plane, while the
+ shader reads the one-tile-per-row view that the import set up (extent_px,
+ e.g. 128x4080 texels for a 1920x1088 luma plane). Loads beyond the plane
+ height were out of bounds and returned zero: only the first <height> luma
+ tiles and <height/2> chroma tiles were copied, the rest of the picture
+ stayed black/green. Seen on Mali-G76 (Bifrost v7) with the MT6785 video
+ decoder (MM21 output) through EGL dma-buf import, e.g. GStreamer glupload.
+ Expose the size of the tiled view while the images are bound and restore
+ height0 together with width0 afterwards.
+Author: pocket-debs
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-24
+--- a/src/gallium/drivers/panfrost/pan_cmdstream.c
++++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
+@@ -3917,6 +3917,23 @@
+          DIV_ROUND_UP(uv_src->height0, 16);
+    }
+ 
++   /* Before Valhall, images are bound as attribute buffers whose S/T
++    * dimensions come from the pipe_resource. For the tiled sources that is
++    * the size of the detiled plane, but the shader reads the one-tile-per-row
++    * view set up at import (extent_px), which has far more rows: loads past
++    * the plane height would be out of bounds and return zero, leaving the
++    * lower part of the destination black. Expose the view size while the
++    * images are bound; panfrost_resource_restore_format() puts it back. */
++   if (y_src) {
++      y_src->width0 = pan_resource(y_src)->image.props.extent_px.width;
++      y_src->height0 = pan_resource(y_src)->image.props.extent_px.height;
++   }
++
++   if (uv_src) {
++      uv_src->width0 = pan_resource(uv_src)->image.props.extent_px.width;
++      uv_src->height0 = pan_resource(uv_src)->image.props.extent_px.height;
++   }
++
+    image[0].resource = y_src;
+    image[0].format = PIPE_FORMAT_R8G8B8A8_UINT;
+    image[0].shader_access = image[0].access = PIPE_IMAGE_ACCESS_READ;
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -1279,6 +1279,7 @@
+    rsrc->base.format = saved->base.format;
+    rsrc->image.props.format = saved->image.props.format;
+    rsrc->base.width0 = saved->base.width0;
++   rsrc->base.height0 = saved->base.height0;
+    rsrc->image.props.extent_px.width = saved->image.props.extent_px.width;
+    rsrc->image.props.extent_px.height = saved->image.props.extent_px.height;
+ }
