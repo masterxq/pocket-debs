@@ -1,0 +1,93 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:30:00 +0100
+Subject: [PATCH] kitemviews: open the view context menu on a touch press held on the background
+Description:
+ A touch press held on an item enters the selection mode, and the context
+ menu of the items is reachable from its bar. A touch press held on the
+ background only started a rubber band; when it was released without dragging
+ nothing happened, so the context menu of the view, which holds the actions
+ for the folder itself (Paste, Create New, Open Terminal, ...), could not be
+ opened by touch at all. On a phone the copied files could not be pasted: the
+ toolbar of the phone UI has Copy but no Paste, and the paste bar of the
+ selection mode only follows a copy started from the toolbar.
+ .
+ Open the context menu of the view when such a press is released without a
+ rubber band drag. Dragging from the held position still selects with the
+ rubber band as before.
+Origin: other
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-24
+---
+diff --git a/src/kitemviews/kitemlistcontroller.cpp b/src/kitemviews/kitemlistcontroller.cpp
+index b1927fc..420f939 100644
+--- a/src/kitemviews/kitemlistcontroller.cpp
++++ b/src/kitemviews/kitemlistcontroller.cpp
+@@ -42,6 +42,7 @@ KItemListController::KItemListController(KItemModelBase *model, KItemListView *v
+     , m_pinchGestureInProgress(false)
+     , m_mousePress(false)
+     , m_isTouchEvent(false)
++    , m_viewBackgroundHeld(false)
+     , m_selectionBehavior(NoSelection)
+     , m_autoActivationBehavior(ActivationAndExpansion)
+     , m_mouseDoubleClickAction(ActivateItemOnly)
+@@ -681,6 +682,8 @@ bool KItemListController::mouseReleaseEvent(QGraphicsSceneMouseEvent *event, con
+ {
+     m_mousePress = false;
+     m_isTouchEvent = false;
++    const bool viewBackgroundHeld = m_viewBackgroundHeld;
++    m_viewBackgroundHeld = false;
+ 
+     if (!m_view) {
+         return false;
+@@ -699,9 +702,20 @@ bool KItemListController::mouseReleaseEvent(QGraphicsSceneMouseEvent *event, con
+         return false;
+     }
+ 
++    // A touch press held on the view background without dragging a rubber band from there is the touch
++    // equivalent of a right click on the background: it opens the context menu of the view, which holds
++    // the actions for the folder itself (Paste, Create New, ...). There is no other way to reach them by touch.
++    const bool rubberBandDragged = rubberBand->isActive()
++        && (rubberBand->endPosition() - rubberBand->startPosition()).manhattanLength() >= QApplication::startDragDistance();
++
+     Q_EMIT mouseButtonReleased(m_pressedIndex.value_or(-1), event->buttons());
+ 
+-    return onRelease(transform.map(event->pos()), event->modifiers(), event->button(), false);
++    const bool handled = onRelease(transform.map(event->pos()), event->modifiers(), event->button(), false);
++    if (viewBackgroundHeld && !rubberBandDragged) {
++        Q_EMIT viewContextMenuRequested(event->screenPos());
++        return true;
++    }
++    return handled;
+ }
+ 
+ bool KItemListController::mouseDoubleClickEvent(QGraphicsSceneMouseEvent *event, const QTransform &transform)
+@@ -1114,6 +1128,7 @@ bool KItemListController::touchBeginEvent(QTouchEvent *event, const QTransform &
+     Q_UNUSED(transform)
+ 
+     m_isTouchEvent = true;
++    m_viewBackgroundHeld = false;
+     return false;
+ }
+ 
+@@ -1179,6 +1194,7 @@ void KItemListController::tapAndHoldTriggered(QGestureEvent *event, const QTrans
+         } else {
+             m_selectionManager->clearSelection();
+             startRubberBand();
++            m_viewBackgroundHeld = true;
+         }
+ 
+         Q_EMIT scrollerStop();
+diff --git a/src/kitemviews/kitemlistcontroller.h b/src/kitemviews/kitemlistcontroller.h
+index 38a4b60..29b6c9b 100644
+--- a/src/kitemviews/kitemlistcontroller.h
++++ b/src/kitemviews/kitemlistcontroller.h
+@@ -350,6 +350,8 @@ private:
+     bool m_pinchGestureInProgress;
+     bool m_mousePress;
+     bool m_isTouchEvent;
++    /** A touch press was held on the view background, see tapAndHoldTriggered(). */
++    bool m_viewBackgroundHeld;
+     SelectionBehavior m_selectionBehavior;
+     AutoActivationBehavior m_autoActivationBehavior;
+     MouseDoubleClickAction m_mouseDoubleClickAction;
