@@ -1,0 +1,14 @@
+--- a/debian/rules	2026-11-24 08:51:02.104677297 +0100
++++ b/debian/rules	2026-11-24 08:51:02.111467438 +0100
+@@ -96,6 +96,11 @@
+ ifeq (riscv64,$(DEB_BUILD_ARCH))
+ 	CONFIGURE_FLAGS += --disable-debug-symbols
+ endif
++# Without dbgsym packages the debug symbols are stripped anyway; building them
++# made rustc run out of memory on a 16 GB build machine (firefox-on-glean).
++ifneq (,$(filter noautodbgsym,$(DEB_BUILD_OPTIONS)))
++	CONFIGURE_FLAGS += --disable-debug-symbols
++endif
+ 
+ CONFIGURE_FLAGS += --enable-update-channel=$(CHANNEL)
+ 
