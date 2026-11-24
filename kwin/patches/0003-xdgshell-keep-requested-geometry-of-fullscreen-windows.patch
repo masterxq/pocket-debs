@@ -1,0 +1,44 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:00:00 +0100
+Subject: [PATCH] xdgshellwindow: keep the requested geometry of fullscreen and maximized windows
+Description:
+ When a client acknowledges a configure event and commits before it has
+ attached a buffer of the new size, KWin clamps the new window geometry to
+ the old buffer. XdgSurfaceWindow::maybeUpdateMoveResizeGeometry() then
+ takes this interim frame geometry over as the move resize geometry, since
+ no configure event is pending any more. Every configure event sent after
+ that without a new moveResize(), for example for a change of the activated
+ or suspended state, asks the client for the interim size, and the client
+ keeps it although the window is still fullscreen or maximized.
+ .
+ Seen after rotating the screen of a phone from portrait (415x910) to
+ landscape (946x415): a fullscreen video player stayed at 415x415, a
+ maximized window at 415x357, i.e. the new size clamped to the old buffer.
+ Leaving and entering fullscreen again fixed it at once.
+ .
+ The size of a fullscreen or fully maximized window is dictated by the
+ compositor, so keep the requested geometry for these windows and do not
+ take over the committed one. The frame geometry still follows what the
+ client commits.
+Forwarded: no
+License: GPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-24
+---
+--- a/src/xdgshellwindow.cpp
++++ b/src/xdgshellwindow.cpp
+@@ -194,6 +194,15 @@
+         }
+     }
+ 
++    // The geometry of a fullscreen or maximized window is dictated by the compositor. The client
++    // can commit another size for a while, e.g. when it acknowledges a configure event before it
++    // has attached a buffer of the new size (the window geometry is then clamped to the old
++    // buffer). Keep the requested geometry in that case, otherwise every following configure
++    // event, e.g. for an activation change, would ask the client to keep the interim size.
++    if (isRequestedFullScreen() || requestedMaximizeMode() == MaximizeFull) {
++        return;
++    }
++
+     setMoveResizeGeometry(rect);
+ }
+ 
