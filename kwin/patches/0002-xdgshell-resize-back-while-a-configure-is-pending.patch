@@ -1,0 +1,48 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Mon, 24 Nov 2026 12:00:00 +0100
+Subject: [PATCH] xdgshellwindow: resize back while another size is pending
+Description:
+ XdgSurfaceWindow::moveResizeInternal() compares the requested size with the
+ size the client committed last. If they are equal, it only updates the frame
+ geometry and sends no configure event. When a configure event with another
+ size is still pending, the client acknowledges that event afterwards and
+ commits its size, so the request back to the committed size is lost.
+ .
+ This happens when a window is resized twice before the client commits:
+ the on-screen keyboard opens (configure with the reduced height) and closes
+ again, or its geometry changes while it is going away, before the client
+ has answered. The window then keeps the reduced height with no keyboard on
+ screen.
+ .
+ Send a configure event as well when the last pending configure event asks
+ for a different size than the request. The same idea is proposed upstream
+ in merge request 9814 (not merged as of this date); this is an own, smaller
+ variant that only looks at the last pending event.
+Forwarded: no (upstream proposal: https://invent.kde.org/plasma/kwin/-/merge_requests/9814)
+Bug: https://bugs.kde.org/show_bug.cgi?id=459136
+License: GPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-24
+---
+--- a/src/xdgshellwindow.cpp
++++ b/src/xdgshellwindow.cpp
+@@ -271,7 +271,19 @@
+         const QSizeF roundedRequestedClientSize = surface()->snappedSize(requestedClientSize);
+ 
+         const QSizeF roundedClientSize = surface()->snappedSize(clientSize());
+-        if (roundedRequestedClientSize == roundedClientSize) {
++
++        // The client ends up with the size of the last configure event it acknowledges. If that
++        // event asks for another size, a request back to the committed size needs a configure event
++        // of its own, otherwise it would be overridden by the stale event on the next commit.
++        bool pendingResize = false;
++        if (!m_configureEvents.isEmpty()) {
++            const RectF pendingBounds = m_configureEvents.constLast()->bounds;
++            if (!pendingBounds.isEmpty()) {
++                pendingResize = snapToPixels(pendingBounds.size(), nextTargetScale()) != requestedFrameSize;
++            }
++        }
++
++        if (roundedRequestedClientSize == roundedClientSize && !pendingResize) {
+             const RectF snappedRect = RectF(rect.topLeft(), nextClientSizeToFrameSize(snapToPixels(roundedClientSize, nextTargetScale())));
+             updateGeometry(m_nextGravity.apply(snappedRect, rect));
+         } else {

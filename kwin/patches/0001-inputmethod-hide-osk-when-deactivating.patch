@@ -1,0 +1,27 @@
+From: Xaver Hugl <xaver.hugl@kde.org>
+Date: Mon, 6 Oct 2026 14:20:34 +0200
+Subject: [PATCH] inputmethod: immediately hide OSK when deactivating the input method
+Description:
+ This way, we don't need to wait for the roundtrip through the input method, and
+ it avoids some intermediary resizes when the input method window stays open for
+ longer than necessary.
+ .
+ Without it, a window that was shrunk for the on-screen keyboard keeps the
+ reduced height when the application ends the text input by itself (e.g.
+ Firefox when the user taps outside the text field): the keyboard goes away,
+ the window stays small until it is activated again.
+Origin: upstream, https://invent.kde.org/plasma/kwin/-/commit/0f3aee69d0b455d35064a20bc6ca983596f38407 (Plasma/6.7, in 6.7.6; master 10c89069e8f871b445fb4acb4c163095e2e4dec7)
+Bug: https://bugs.kde.org/show_bug.cgi?id=459136
+License: GPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-24
+---
+--- a/src/inputmethod.cpp
++++ b/src/inputmethod.cpp
+@@ -257,6 +257,7 @@
+     const bool wasActive = waylandServer()->inputMethod()->context();
+     if (wasActive && !active) {
+         waylandServer()->inputMethod()->sendDeactivate();
++        hide();
+     }
+ 
+     if (active) {
