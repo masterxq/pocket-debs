@@ -5,10 +5,15 @@
 # Each package's build result is kept in the Actions cache under paket-<source>-<key>. A package whose key is in
 # the cache is restored instead of built; every run still uploads one artifact per package (<source>_<version>)
 # and the complete APT repository (apt-repo), so a run always carries all packages.
-# Cache entries not used for 7 days are evicted; the weekly scheduled run uses them all. Missing entries are
-# simply rebuilt.
+# Pull requests build the final version, the same main builds. A run on main cannot read the cache of a pull
+# request, so on a cache miss it takes over the artifact <source>_<version> of an earlier run of this repository
+# (the pull request before the merge, or an earlier run on main) whose STAND has the same key; it checks key and
+# SHA256SUMS and stores the result in its own cache. Only when there is no such artifact the package is built.
+# Cache entries not used for 7 days are evicted; the weekly scheduled run uses them all.
 # A package that is built gets its compiler cache (ccache) from the newest entry ccache-<source>-*, and the run
-# saves the updated cache under a new key, also after a failed build. "neu" builds without both caches.
+# saves the updated cache under a new key, also after a failed build. "neu" builds without the caches and without
+# taking over artifacts.
+# After a run on main the job pflege deletes cache entries nobody reads any more (see there).
 name: bau
 
 on:
@@ -24,18 +29,12 @@ on:
         type: string
         default: ''
       neu:
-        description: 'Build without the cache'
+        description: 'Build without the caches and without taking over artifacts'
         type: boolean
         default: false
 
 permissions:
   contents: read
-
-# Test builds (pull requests, runs on other branches than main) get the version <debian>+pd<n>~test.<commit>, which
-# sorts before the version main builds later. A package restored from the cache keeps the version it was built with:
-# an unchanged package in a pull request is the build of main.
-env:
-  PAKETE_TEST: ${{ github.event.pull_request.head.sha || (github.ref != 'refs/heads/main' && github.sha) || '' }}
 
 concurrency:
   group: bau-${{ github.ref }}
@@ -71,6 +70,9 @@ jobs:
     name: ${{ matrix.quelle }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 355
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -78,6 +80,7 @@ jobs:
     env:
       Q: ${{ matrix.quelle }}
       K: ${{ matrix.schluessel }}
+      F: ${{ matrix.fassung }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -93,21 +96,46 @@ jobs:
         with:
           path: ${{ runner.temp }}/ergebnis/${{ matrix.quelle }}
           key: paket-${{ matrix.quelle }}-${{ matrix.schluessel }}
-      - name: ccache restore
+      # Artifacts of forks are not taken: only runs whose head is this repository (pushed with write access).
+      - name: take over
+        id: uebernahme
         if: ${{ steps.cache.outputs.cache-hit != 'true' && !inputs.neu }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          E=$PAKETE_ERGEBNIS/$Q
+          name=${Q}_$(printf %s "$F" | sed 's/^[0-9]*://')
+          gh api -X GET "repos/$GITHUB_REPOSITORY/actions/artifacts" -f name="$name" -f per_page=100 --jq \
+            '.artifacts | map(select((.expired | not) and .workflow_run.repository_id != null
+              and .workflow_run.head_repository_id == .workflow_run.repository_id))
+              | sort_by(.created_at) | reverse | .[:3][] | "\(.workflow_run.id) \(.id)"' > "$RUNNER_TEMP/kandidaten"
+          while read -r run art; do
+            rm -rf "$E"; mkdir -p "$E"
+            gh run download "$run" -R "$GITHUB_REPOSITORY" -n "$name" -D "$E" || { echo "$name: download from run $run failed"; continue; }
+            if grep -qx "schluessel=$K" "$E/STAND" && grep -qx "fassung=$F" "$E/STAND"; then
+              echo "$name: taken over from run $run (artifact $art)"
+              echo "lauf=$run" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            echo "$name: run $run built another state ($(sed -n 's/^schluessel=//p' "$E/STAND")), not taken"
+          done < "$RUNNER_TEMP/kandidaten"
+          rm -rf "$E"
+          echo "$name: no artifact with key $K, building"
+      - name: ccache restore
+        if: ${{ steps.cache.outputs.cache-hit != 'true' && !steps.uebernahme.outputs.lauf && !inputs.neu }}
         uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/out/ccache/${{ matrix.quelle }}
           key: ccache-${{ matrix.quelle }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-${{ matrix.quelle }}-
       - name: build
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: ${{ steps.cache.outputs.cache-hit != 'true' && !steps.uebernahme.outputs.lauf }}
         env:
           PAKETE_TIMEOUT: '20400'
           PAKETE_CCACHE_MAX: 1500M
         run: ./bau.sh bau "$Q" --neu
       - name: ccache save
-        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' }}
+        if: ${{ always() && steps.cache.outputs.cache-hit != 'true' && !steps.uebernahme.outputs.lauf }}
         uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/out/ccache/${{ matrix.quelle }}
@@ -122,8 +150,10 @@ jobs:
           grep -qx "schluessel=$K" "$E/STAND" || { echo "::error::$Q: key in STAND differs from $K"; exit 1; }
           (cd "$E" && sha256sum -c --quiet SHA256SUMS)
           how=built; [ "${{ steps.cache.outputs.cache-hit }}" != true ] || how="from cache"
+          [ -z "${{ steps.uebernahme.outputs.lauf }}" ] || how="from run ${{ steps.uebernahme.outputs.lauf }}"
           { echo '| source | version | result | build time | ccache hits |'; echo '|---|---|---|---|---|'
             echo "| $Q | $(sed -n 's/^fassung=//p' "$E/STAND") | $how | $(sed -n 's/^bauzeit_min=//p' "$E/BUILDINFO") min | $(sed -n 's/^ccache_treffer=//p' "$E/BUILDINFO") |"; } >> "$GITHUB_STEP_SUMMARY"
+      # also a result taken over from another run: the next run on this ref finds it in the cache
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
@@ -175,3 +205,68 @@ jobs:
       artefakte: '*_*'
     secrets:
       CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+
+  # Cache upkeep after a run on main (the repository has 10 GB of cache; when it is full GitHub evicts entries that
+  # are still needed). Deletes the entries of closed pull requests and of deleted branches, all compiler caches
+  # but the newest per package and ref, and on main the results of active packages whose key is no longer current
+  # (an artifact of the old state can still be taken over). Drafts and removed packages expire after 7 days unused.
+  pflege:
+    needs: [plan, bau, registry]
+    if: ${{ always() && needs.plan.result == 'success' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PLAN: ${{ needs.plan.outputs.matrix }}
+    steps:
+      - name: prune the cache
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP"
+          R=repos/$GITHUB_REPOSITORY
+          gh api --paginate "$R/actions/caches?per_page=100" --jq '.actions_caches[]' > caches.json
+          gh api --paginate "$R/pulls?state=open&per_page=100" --jq '.[].number' > offen.txt
+          gh api --paginate "$R/branches?per_page=100" --jq '.[].name' > zweige.txt
+          python3 - > weg.tsv <<'EOF'
+          import json, os, re
+          caches = [json.loads(z) for z in open('caches.json') if z.strip()]
+          offen = set(open('offen.txt').read().split())
+          zweige = set(open('zweige.txt').read().split())
+          aktuell = {p['quelle']: p['schluessel'] for p in json.loads(os.environ['PLAN'])}
+          neueste = set()
+          for c in sorted(caches, key=lambda c: c['created_at'], reverse=True):
+              ref, key, grund = c['ref'], c['key'], None
+              pr = re.fullmatch(r'refs/pull/(\d+)/\w+', ref)
+              cc = re.fullmatch(r'ccache-(.+)-\d+-\d+', key)
+              pk = re.fullmatch(r'paket-(.+)-([0-9a-f]{16})', key)
+              if pr and pr.group(1) not in offen:
+                  grund = 'pull request closed'
+              elif ref.startswith('refs/heads/') and ref[11:] not in zweige:
+                  grund = 'branch deleted'
+              elif cc and (ref, cc.group(1)) in neueste:
+                  grund = 'older compiler cache'
+              elif cc:
+                  neueste.add((ref, cc.group(1)))
+              elif pk and ref == 'refs/heads/main' and aktuell.get(pk.group(1), pk.group(2)) != pk.group(2):
+                  grund = 'key no longer current'
+              if grund:
+                  print(c['id'], c['size_in_bytes'], ref, key, grund, sep='\t')
+          EOF
+          vorher=$(gh api "$R/actions/cache/usage" --jq '.active_caches_size_in_bytes')
+          { echo '| deleted cache entry | ref | MB | reason |'; echo '|---|---|---|---|'; } >> "$GITHUB_STEP_SUMMARY"
+          fehler=0
+          while IFS=$'\t' read -r id groesse ref key grund; do
+            if gh api -X DELETE "$R/actions/caches/$id" > /dev/null; then
+              echo "deleted $key ($ref, $grund)"
+              echo "| $key | $ref | $((groesse / 1048576)) | $grund |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              fehler=1; echo "::warning::cache $id ($key, $ref) could not be deleted"
+            fi
+          done < weg.tsv
+          nachher=$(gh api "$R/actions/cache/usage" --jq '.active_caches_size_in_bytes')
+          echo "cache: $((vorher / 1048576)) MB before, $((nachher / 1048576)) MB after" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit $fehler
