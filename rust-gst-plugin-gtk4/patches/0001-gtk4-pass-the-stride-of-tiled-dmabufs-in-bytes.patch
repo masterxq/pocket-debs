@@ -1,0 +1,52 @@
+From: Christian Gmeiner <cgmeiner@igalia.com>
+Date: Tue, 17 Nov 2026 20:37:17 +0100
+Subject: gtk4: Pass the stride of tiled dmabufs in bytes
+Description:
+ The video meta of a tiled format stores the tile counts in the stride.
+ Convert it to bytes for the dmabuf texture, like waylandsink does.
+ .
+ Without it gtk4paintablesink hands GTK the packed tile counts as row pitch
+ (e.g. 0x220078 for a 1920x1088 MM21 frame of the MediaTek video decoder):
+ the picture is garbled, mostly green, in every GTK 4 player that uses the
+ sink (GNOME Showtime). Upstream fixes the same for NV12_4L4 of Hantro G2.
+Origin: upstream, https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs/-/commit/d346b18122450e508c531809498c0ea13af45f92
+Applied-Upstream: https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs/-/merge_requests/3429
+License: MPL-2.0 (as the patched file)
+Last-Update: 2026-11-24
+---
+diff --git a/src/sink/frame.rs b/src/sink/frame.rs
+index d28b998f2..8824b3daf 100644
+--- a/src/sink/frame.rs
++++ b/src/sink/frame.rs
+@@ -762,6 +762,14 @@ impl Frame {
+                 let vmeta_offsets = vmeta.offset();
+                 let vmeta_strides = vmeta.stride();
+ 
++                // The video meta of a tiled format stores the tile counts
++                // in the stride. A dmabuf needs the stride in bytes.
++                let tiled_finfo = info
++                    .to_video_info()
++                    .ok()
++                    .map(|info| info.format_info())
++                    .filter(|finfo| finfo.is_tiled());
++
+                 for plane in 0..n_planes {
+                     let Some((range, skip)) =
+                         buffer.find_memory(vmeta_offsets[plane]..(vmeta_offsets[plane] + 1))
+@@ -778,7 +786,15 @@ impl Frame {
+                     let fd = mem.fd();
+                     fds[plane] = fd;
+                     offsets[plane] = mem.offset() + skip;
+-                    strides[plane] = vmeta_strides[plane] as usize;
++                    strides[plane] = match &tiled_finfo {
++                        Some(finfo) => {
++                            let x_tiles = (vmeta_strides[plane]
++                                & gst_video::ffi::GST_VIDEO_TILE_X_TILES_MASK)
++                                as usize;
++                            x_tiles * finfo.tile_info(plane as u32).stride() as usize
++                        }
++                        None => vmeta_strides[plane] as usize,
++                    };
+                 }
+ 
+                 // All fds valid?
