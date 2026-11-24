@@ -1,0 +1,178 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:00:00 +0100
+Subject: [PATCH] QWidgetWindow: open the context menu of text input widgets on a touch press and hold
+Description:
+ Qt widgets get touch input as synthesized mouse events with the left button,
+ so the context menu of a QLineEdit, QTextEdit, QPlainTextEdit or of an
+ editable combo or spin box could not be opened by touch. With no hardware
+ keyboard there was no way to paste text into such a field, nor to copy from
+ it: on-screen keyboards have no Ctrl key.
+ .
+ Send a QContextMenuEvent (reason Mouse) to the widget when a synthesized
+ left button press (touch or pen) is held for mousePressAndHoldInterval
+ without moving farther than startDragDistance, if the widget or the nearest
+ ancestor with Qt::WA_InputMethodEnabled is a text input widget that allows a
+ context menu. Widgets in that chain that accept touch events or grab the tap
+ and hold gesture are left alone, so applications with their own touch
+ handling (item views with kinetic scrolling, Dolphin) keep their behaviour.
+ The finger is still down when the menu opens; the release goes to the menu,
+ which ignores a release without a press of its own, as after a right button
+ press on platforms that open context menus on the press.
+ .
+ Qt has no press and hold context menu for widgets outside Android (where an
+ environment variable enables a right button from a long press), see
+ QTBUG-73949 and QTBUG-84179.
+Origin: other
+Bug: https://bugreports.qt.io/browse/QTBUG-73949
+Forwarded: no
+License: LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only (as the patched file)
+Last-Update: 2026-11-24
+---
+diff --git a/src/widgets/kernel/qwidgetwindow.cpp b/src/widgets/kernel/qwidgetwindow.cpp
+index 4d56b26..60b27b8 100644
+--- a/src/widgets/kernel/qwidgetwindow.cpp
++++ b/src/widgets/kernel/qwidgetwindow.cpp
+@@ -17,6 +17,8 @@
+ #include <qpa/qplatformwindow.h>
+ #include <private/qgesturemanager_p.h>
+ #include <private/qhighdpiscaling_p.h>
++#include <QtCore/qbasictimer.h>
++#include <QtGui/qstylehints.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -107,6 +109,15 @@ public:
+ 
+     QRectF closestAcceptableGeometry(const QRectF &rect) const override;
+ 
++#ifndef QT_NO_CONTEXTMENU
++    void trackTouchPressAndHold(const QMouseEvent *event, QWidget *receiver);
++    void touchPressAndHoldTimeout();
++
++    QBasicTimer pressAndHoldTimer;
++    QPointer<QWidget> pressAndHoldReceiver;
++    QPointF pressAndHoldGlobalPos;
++#endif
++
+     bool participatesInLastWindowClosed() const override;
+     bool treatAsVisible() const override;
+ };
+@@ -252,6 +263,17 @@ bool QWidgetWindow::event(QEvent *event)
+         return QWindow::event(event);
+ 
+     switch (event->type()) {
++#ifndef QT_NO_CONTEXTMENU
++    case QEvent::Timer: {
++        Q_D(QWidgetWindow);
++        if (static_cast<QTimerEvent *>(event)->matches(d->pressAndHoldTimer)) {
++            d->touchPressAndHoldTimeout();
++            return true;
++        }
++        break;
++    }
++#endif
++
+     case QEvent::Enter:
+     case QEvent::Leave:
+         handleEnterLeaveEvent(event);
+@@ -512,6 +534,12 @@ void QWidgetWindow::handleMouseEvent(QMouseEvent *event)
+     // so we need QPointer to avoid a dangling d below
+     QPointer<QWidgetWindow> self = this;
+ 
++#ifndef QT_NO_CONTEXTMENU
++    // Any mouse event but a small move ends a pending touch press and hold; a press starts
++    // a new one below, once it is known which widget got it.
++    d->trackTouchPressAndHold(event, nullptr);
++#endif
++
+     if (auto *activePopupWidget = QApplication::activePopupWidget()) {
+         QPointF mapped = event->position();
+         if (activePopupWidget != m_widget)
+@@ -693,6 +721,11 @@ void QWidgetWindow::handleMouseEvent(QMouseEvent *event)
+     if (self.isNull())
+         return;
+ 
++#ifndef QT_NO_CONTEXTMENU
++    if (event->type() == QEvent::MouseButtonPress)
++        d->trackTouchPressAndHold(event, receiver);
++#endif
++
+ #if QT_VERSION < QT_VERSION_CHECK(7, 0, 0)
+     if (
+ #else
+@@ -1205,6 +1238,75 @@ void QWidgetWindow::handleGestureEvent(QNativeGestureEvent *e)
+ #endif // QT_NO_GESTURES
+ 
+ #ifndef QT_NO_CONTEXTMENU
++/*
++    A press and hold of a finger (or of a pen, both arrive here as synthesized mouse events) on a
++    text input widget opens its context menu, the only way to reach Paste, Copy and Select All
++    without a keyboard. Touch platforms do the same for their text fields, and so do the text
++    fields of Qt Quick Controls. Widgets which handle touch events or the tap and hold gesture
++    themselves are left alone.
++*/
++static bool wantsTouchPressAndHoldContextMenu(const QWidget *w)
++{
++    for (; w; w = w->parentWidget()) {
++        if (w->testAttribute(Qt::WA_AcceptTouchEvents))
++            return false;
++#ifndef QT_NO_GESTURES
++        if (QWidgetPrivate::get(w)->gestureContext.contains(Qt::TapAndHoldGesture))
++            return false;
++#endif
++        if (w->testAttribute(Qt::WA_InputMethodEnabled)) {
++            return w->contextMenuPolicy() != Qt::NoContextMenu
++                && w->contextMenuPolicy() != Qt::PreventContextMenu;
++        }
++        if (w->isWindow())
++            return false;
++    }
++    return false;
++}
++
++void QWidgetWindowPrivate::trackTouchPressAndHold(const QMouseEvent *event, QWidget *receiver)
++{
++    Q_Q(QWidgetWindow);
++    switch (event->type()) {
++    case QEvent::MouseButtonPress:
++        pressAndHoldTimer.stop();
++        if (event->source() != Qt::MouseEventNotSynthesized && event->button() == Qt::LeftButton
++            && event->buttons() == Qt::LeftButton && wantsTouchPressAndHoldContextMenu(receiver)) {
++            pressAndHoldReceiver = receiver;
++            pressAndHoldGlobalPos = event->globalPosition();
++            pressAndHoldTimer.start(std::chrono::milliseconds(QGuiApplication::styleHints()->mousePressAndHoldInterval()), q);
++        }
++        break;
++    case QEvent::MouseMove:
++        if (pressAndHoldTimer.isActive()
++            && (event->globalPosition() - pressAndHoldGlobalPos).manhattanLength()
++                > QGuiApplication::styleHints()->startDragDistance()) {
++            pressAndHoldTimer.stop();
++        }
++        break;
++    default:
++        pressAndHoldTimer.stop();
++        break;
++    }
++}
++
++void QWidgetWindowPrivate::touchPressAndHoldTimeout()
++{
++    pressAndHoldTimer.stop();
++    QPointer<QWidget> receiver = pressAndHoldReceiver;
++    pressAndHoldReceiver = nullptr;
++    if (!receiver || !receiver->isVisible() || !receiver->isEnabled() || QApplication::activePopupWidget())
++        return;
++
++    // The finger is still down: the following release goes to the menu, which ignores a release
++    // without a press of its own, as after a right button press on platforms that open context
++    // menus on the press.
++    const QPoint globalPos = pressAndHoldGlobalPos.toPoint();
++    QContextMenuEvent e(QContextMenuEvent::Mouse, receiver->mapFromGlobal(globalPos), globalPos,
++                        QGuiApplication::keyboardModifiers());
++    QApplication::sendEvent(receiver, &e);
++}
++
+ void QWidgetWindow::handleContextMenuEvent(QContextMenuEvent *e)
+ {
+     QWidget *receiver = qt_last_mouse_receiver.get();
