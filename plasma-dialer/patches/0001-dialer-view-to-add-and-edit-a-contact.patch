@@ -1,0 +1,548 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] dialer: view to add and edit a contact
+Description:
+ A view to add a contact or to change one, laid out as the one of Plasma
+ Phonebook: photo (chosen from a file, scaled down, or removed), name and
+ phone numbers (added and removed). It is stored as vCard through KPeople as
+ Plasma Phonebook does it (PersonPluginManager::addContact() for a new
+ contact, PersonData::setContactCustomProperty("vcard") for an existing
+ one); properties the view does not show are kept. A tap on a number of the
+ contact puts it into the dial pad and closes the view.
+ .
+ The dialer page gets the action "Add to Contacts" in its header, next to
+ the settings, which opens the view for a new contact with the entered
+ number; it is disabled while no number is entered. The contacts page gets
+ the action "New Contact", which opens it for an empty contact.
+ .
+ ContactPage.qml follows AddContactPage.qml of Plasma Phonebook, and
+ contacteditor.cpp takes the scaling of the photo from contactcontroller.cpp
+ of Plasma Phonebook (both by Nicolas Fella, LGPL-2.0-or-later).
+Forwarded: no
+License: as the patched files (LGPL-2.0-or-later, LicenseRef-KDE-Accepted-GPL); new files contacteditor.*, contact/ContactPage.qml LGPL-2.0-or-later
+Last-Update: 2026-11-25
+---
+--- a/plasma-dialer/src/CMakeLists.txt
++++ b/plasma-dialer/src/CMakeLists.txt
+@@ -3,6 +3,7 @@
+ # SPDX-License-Identifier: LicenseRef-KDE-Accepted-GPL
+ 
+ set(dialer_SRCS
++    contacteditor.cpp
+     lockscreenutils.cpp
+     ringtoneutils.cpp
+ )
+@@ -21,6 +22,7 @@ qt_target_qml_sources(plasma-dialer QML_FILES
+     qml/ContactsPage.qml
+     qml/HistoryPage.qml
+     qml/AboutPage.qml
++    qml/contact/ContactPage.qml
+     qml/settings/SettingsPage.qml
+     qml/settings/CallBlockSettingsPage.qml
+     qml/settings/RingtoneSettingsPage.qml
+@@ -43,7 +45,7 @@ qt_target_qml_sources(plasma-dialer QML_FILES
+ 
+ 
+ find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED Core Quick Qml QuickControls2 Multimedia)
+-find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS Config Crash CoreAddons I18n DBusAddons)
++find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS Config Contacts Crash CoreAddons I18n DBusAddons People)
+ find_package(KF6KirigamiAddons 1.3 REQUIRED)
+ 
+ if (DIALER_BUILD_SHELL_OVERLAY)
+@@ -78,6 +80,8 @@ target_link_libraries(plasma-dialer PRIVATE
+     Qt::QuickControls2
+     Qt::Multimedia
+     KF6::ConfigGui
++    KF6::Contacts
++    KF6::People
+     KF6::CoreAddons
+     KF6::Crash
+     KF6::I18n
+--- /dev/null
++++ b/plasma-dialer/src/contacteditor.cpp
+@@ -0,0 +1,121 @@
++// SPDX-FileCopyrightText: 2021 Nicolas Fella <nicolas.fella@gmx.de>
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: LGPL-2.0-or-later
++
++#include "contacteditor.h"
++
++#include <KContacts/Addressee>
++#include <KContacts/PhoneNumber>
++#include <KContacts/Picture>
++#include <KContacts/VCardConverter>
++#include <KPeople/PersonData>
++#include <KPeople/PersonPluginManager>
++
++#include <QDebug>
++#include <QGuiApplication>
++#include <QImage>
++
++#include <algorithm>
++
++using namespace Qt::Literals::StringLiterals;
++
++// property of a KPeople contact that holds its vCard
++static const QString vCardProperty = u"vcard"_s;
++
++static KContacts::Addressee addresseeOf(const KPeople::PersonData &person)
++{
++    static const KContacts::VCardConverter converter;
++    return converter.parseVCard(person.contactCustomProperty(vCardProperty).toByteArray());
++}
++
++ContactEditor::ContactEditor(QObject *parent)
++    : QObject(parent)
++{
++}
++
++QVariantMap ContactEditor::contact(const QString &personUri) const
++{
++    QVariantMap contact;
++    if (personUri.isEmpty()) {
++        contact[u"name"_s] = QString();
++        contact[u"phoneNumbers"_s] = QStringList();
++        contact[u"hasPhoto"_s] = false;
++        contact[u"editable"_s] = true;
++        return contact;
++    }
++
++    const KPeople::PersonData person(personUri);
++    const KContacts::Addressee addressee = addresseeOf(person);
++    QStringList phoneNumbers;
++    for (const auto &phoneNumber : addressee.phoneNumbers()) {
++        phoneNumbers.append(phoneNumber.number());
++    }
++    contact[u"name"_s] = addressee.isEmpty() ? person.name() : addressee.formattedName();
++    contact[u"phoneNumbers"_s] = phoneNumbers;
++    contact[u"hasPhoto"_s] = !addressee.photo().isEmpty();
++    contact[u"editable"_s] = person.isEditable();
++    return contact;
++}
++
++bool ContactEditor::save(const QString &personUri, const QString &name, const QStringList &phoneNumbers, const QUrl &photo, bool removePhoto)
++{
++    static const KContacts::VCardConverter converter;
++
++    KContacts::Addressee addressee;
++    KPeople::PersonData *person = nullptr;
++    if (!personUri.isEmpty()) {
++        person = new KPeople::PersonData(personUri, this);
++        addressee = addresseeOf(*person);
++    }
++
++    addressee.setFormattedName(name.trimmed());
++
++    // numbers that stay keep their type, new ones are mobile numbers
++    const KContacts::PhoneNumber::List oldNumbers = addressee.phoneNumbers();
++    KContacts::PhoneNumber::List newNumbers;
++    for (const QString &number : phoneNumbers) {
++        const QString trimmed = number.trimmed();
++        if (trimmed.isEmpty()) {
++            continue;
++        }
++        const auto old = std::find_if(oldNumbers.cbegin(), oldNumbers.cend(), [&trimmed](const KContacts::PhoneNumber &phoneNumber) {
++            return phoneNumber.number() == trimmed;
++        });
++        if (old != oldNumbers.cend()) {
++            newNumbers.append(*old);
++        } else {
++            KContacts::PhoneNumber phoneNumber(trimmed);
++            phoneNumber.setType(KContacts::PhoneNumber::Cell);
++            newNumbers.append(phoneNumber);
++        }
++    }
++    addressee.setPhoneNumbers(newNumbers);
++
++    if (removePhoto) {
++        addressee.setPhoto(KContacts::Picture());
++    }
++    if (photo.isValid() && !photo.isEmpty()) {
++        const QImage image(photo.isLocalFile() ? photo.toLocalFile() : photo.toString());
++        if (image.isNull()) {
++            qWarning() << "Could not read the photo" << photo;
++        } else {
++            // photos are scaled down, so that contacts with photos load quickly
++            constexpr int unscaledWidth = 200;
++            const int avatarSize = int(unscaledWidth * qGuiApp->devicePixelRatio());
++            addressee.setPhoto(KContacts::Picture(image.scaled(QSize(avatarSize, avatarSize), Qt::KeepAspectRatio, Qt::SmoothTransformation)));
++        }
++    }
++
++    const QByteArray vCard = converter.createVCard(addressee);
++    bool saved;
++    if (person) {
++        saved = person->setContactCustomProperty(vCardProperty, vCard);
++        person->deleteLater();
++    } else {
++        saved = KPeople::PersonPluginManager::addContact({{vCardProperty, vCard}});
++    }
++    if (!saved) {
++        qWarning() << "Could not save the contact" << personUri;
++    }
++    return saved;
++}
+--- /dev/null
++++ b/plasma-dialer/src/contacteditor.h
+@@ -0,0 +1,42 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: LGPL-2.0-or-later
++
++#pragma once
++
++#include <QObject>
++#include <QStringList>
++#include <QUrl>
++#include <QVariantMap>
++#include <qqmlregistration.h>
++
++/**
++ * Reads and writes the name, the phone numbers and the photo of a contact.
++ *
++ * The contact is stored as vCard through KPeople, as Plasma Phonebook does;
++ * properties that the dialer does not edit (e-mail addresses, birthday, ...)
++ * are kept when an existing contact is saved.
++ */
++class ContactEditor : public QObject
++{
++    Q_OBJECT
++    QML_ELEMENT
++    QML_SINGLETON
++
++public:
++    explicit ContactEditor(QObject *parent = nullptr);
++
++    /**
++     * The contact with the KPeople URI personUri: name, phoneNumbers (list of
++     * strings), hasPhoto and editable. An empty URI gives an empty, editable
++     * contact.
++     */
++    Q_INVOKABLE QVariantMap contact(const QString &personUri) const;
++
++    /**
++     * Adds a contact (empty personUri) or changes the contact personUri.
++     * photo is an image file that becomes the photo of the contact, scaled
++     * down; with removePhoto the contact loses its photo. Returns whether the
++     * contact was stored.
++     */
++    Q_INVOKABLE bool save(const QString &personUri, const QString &name, const QStringList &phoneNumbers, const QUrl &photo, bool removePhoto);
++};
+--- a/plasma-dialer/src/qml/ContactsPage.qml
++++ b/plasma-dialer/src/qml/ContactsPage.qml
+@@ -24,6 +24,13 @@ Kirigami.ScrollablePage {
+     title: i18n("Contacts")
+     icon.name: "view-pim-contacts"
+     actions: [
++        Kirigami.Action {
++            icon.name: "contact-new-symbolic"
++            displayHint: Kirigami.DisplayHint.IconOnly
++            enabled: !applicationWindow().lockscreenMode
++            text: i18nc("@action:intoolbar", "New Contact")
++            onTriggered: applicationWindow().openContact("", "")
++        },
+         Kirigami.Action {
+             icon.name: "settings-configure"
+             displayHint: Kirigami.DisplayHint.IconOnly
+--- a/plasma-dialer/src/qml/DialerPage.qml
++++ b/plasma-dialer/src/qml/DialerPage.qml
+@@ -32,6 +32,15 @@ Kirigami.Page {
+     bottomPadding: 0
+ 
+     actions: [
++        Kirigami.Action {
++            id: addContactAction
++
++            icon.name: "contact-new-symbolic"
++            displayHint: Kirigami.DisplayHint.IconOnly
++            enabled: dialPad.number.length > 0 && !applicationWindow().lockscreenMode
++            text: i18nc("@action:intoolbar", "Add to Contacts")
++            onTriggered: applicationWindow().openContact("", dialPad.number)
++        },
+         Kirigami.Action {
+             id: settingsAction
+ 
+--- a/plasma-dialer/src/qml/Main.qml
++++ b/plasma-dialer/src/qml/Main.qml
+@@ -102,6 +102,14 @@ Kirigami.ApplicationWindow {
+         console.log("TODO: select device uni");
+     }
+ 
++    // view of the contact personUri; without personUri a new contact with the number
++    function openContact(personUri, number) {
++        pageStack.pushDialogLayer(Qt.resolvedUrl("contact/ContactPage.qml"), {
++            "personUri": personUri || "",
++            "newNumber": number || ""
++        });
++    }
++
+     function call(number) {
+         getPage("Dialer").pad.number = number;
+         switchToPage(getPage("Dialer"));
+--- /dev/null
++++ b/plasma-dialer/src/qml/contact/ContactPage.qml
+@@ -0,0 +1,265 @@
++// SPDX-FileCopyrightText: 2019 Nicolas Fella <nicolas.fella@gmx.de>
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: LGPL-2.0-or-later
++
++pragma ComponentBehavior: Bound
++
++import QtQuick
++import QtQuick.Controls as Controls
++import QtQuick.Dialogs
++import QtQuick.Layouts
++import QtQuick.Templates as T
++
++import org.kde.kirigami as Kirigami
++import org.kde.kirigamiaddons.components as Components
++import org.kde.kirigamiaddons.formcard as FormCard
++import org.kde.telephony
++import org.kde.plasma.dialer
++
++// Name, photo and phone numbers of a contact, laid out as in Plasma Phonebook.
++// A tap on a number puts it into the dial pad.
++FormCard.FormCardPage {
++    id: root
++
++    // KPeople URI of the contact, empty for a new contact
++    property string personUri
++    // phone number of a new contact
++    property string newNumber
++
++    readonly property var contact: ContactEditor.contact(personUri)
++    readonly property bool editable: contact.editable
++    property list<string> pendingNumbers
++    // image file chosen as new photo
++    property url pendingPhoto
++    property bool photoRemoved: false
++    readonly property bool hasPhoto: pendingPhoto.toString() !== "" || (contact.hasPhoto && !photoRemoved)
++
++    // the number goes to the dial pad, the view closes
++    function useNumber(number) {
++        const window = applicationWindow();
++        root.Kirigami.PageStack.closeDialog();
++        window.call(number);
++    }
++
++    function save() {
++        let numbers = root.pendingNumbers.slice();
++        const extraNumber = addNumberField.text.trim();
++        if (extraNumber !== "") {
++            numbers.push(extraNumber);
++        }
++        if (ContactEditor.save(root.personUri, nameField.text, numbers, root.pendingPhoto, root.photoRemoved)) {
++            root.Kirigami.PageStack.closeDialog();
++        } else {
++            saveError.visible = true;
++        }
++    }
++
++    title: personUri === "" ? i18nc("@title", "New Contact") : i18nc("@title", "Edit Contact")
++
++    Component.onCompleted: {
++        if (personUri === "") {
++            pendingNumbers = newNumber !== "" ? [newNumber] : [];
++            nameField.forceActiveFocus();
++        } else {
++            pendingNumbers = contact.phoneNumbers;
++        }
++    }
++
++    Controls.RoundButton {
++        Layout.alignment: Qt.AlignHCenter
++        Layout.topMargin: Kirigami.Units.gridUnit
++
++        implicitWidth: Kirigami.Units.gridUnit * 5
++        implicitHeight: implicitWidth
++        enabled: root.editable
++        Accessible.name: root.hasPhoto ? i18nc("@action:button", "Change photo") : i18nc("@action:button", "Add photo")
++
++        contentItem: Components.Avatar {
++            source: {
++                if (root.pendingPhoto.toString() !== "") {
++                    return root.pendingPhoto;
++                }
++                if (root.contact.hasPhoto && !root.photoRemoved) {
++                    return ContactUtils.photoImageProviderUri(root.personUri);
++                }
++                return "";
++            }
++            name: nameField.text
++            imageMode: Components.Avatar.ImageMode.AdaptiveImageOrInitals
++        }
++
++        onClicked: fileDialog.open()
++
++        FileDialog {
++            id: fileDialog
++
++            title: i18nc("@title:window", "Choose a Photo")
++            nameFilters: [i18nc("@item:inlistbox file type", "Images (*.png *.jpg *.jpeg *.webp *.bmp)")]
++            onAccepted: {
++                root.pendingPhoto = selectedFile;
++                root.photoRemoved = false;
++            }
++        }
++    }
++
++    Controls.Label {
++        Layout.alignment: Qt.AlignHCenter
++        visible: !root.hasPhoto && root.editable
++        color: Kirigami.Theme.disabledTextColor
++        text: i18n("Add profile picture")
++    }
++
++    Controls.ToolButton {
++        Layout.alignment: Qt.AlignHCenter
++        visible: root.hasPhoto && root.editable
++        icon.name: "edit-delete-remove"
++        text: i18nc("@action:button", "Remove photo")
++        onClicked: {
++            root.pendingPhoto = "";
++            root.photoRemoved = true;
++        }
++    }
++
++    Kirigami.InlineMessage {
++        id: saveError
++
++        Layout.fillWidth: true
++        Layout.topMargin: Kirigami.Units.largeSpacing
++        Layout.leftMargin: Kirigami.Units.largeSpacing
++        Layout.rightMargin: Kirigami.Units.largeSpacing
++        type: Kirigami.MessageType.Error
++        text: i18n("The contact could not be saved.")
++    }
++
++    FormCard.FormCard {
++        Layout.topMargin: Kirigami.Units.largeSpacing
++
++        FormCard.FormTextFieldDelegate {
++            id: nameField
++
++            label: i18n("Name")
++            text: root.contact.name
++            enabled: root.editable
++        }
++    }
++
++    FormCard.FormCard {
++        Layout.topMargin: Kirigami.Units.largeSpacing
++
++        Repeater {
++            model: root.pendingNumbers
++
++            delegate: FormCard.AbstractFormDelegate {
++                id: numberDelegate
++
++                required property string modelData
++                required property int index
++
++                Accessible.name: i18nc("@action:button %1 is a phone number", "Put %1 into the dial pad", modelData)
++                onClicked: root.useNumber(modelData)
++
++                contentItem: RowLayout {
++                    spacing: Kirigami.Units.largeSpacing
++
++                    Kirigami.Icon {
++                        Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
++                        Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
++                        source: "phone-symbolic"
++                    }
++
++                    ColumnLayout {
++                        Layout.fillWidth: true
++                        spacing: 0
++
++                        Controls.Label {
++                            Layout.fillWidth: true
++                            text: CallUtils.formatNumber(numberDelegate.modelData)
++                            elide: Text.ElideRight
++                        }
++
++                        Controls.Label {
++                            Layout.fillWidth: true
++                            text: i18nc("@info a tap on a phone number", "Tap to put into the dial pad")
++                            font: Kirigami.Theme.smallFont
++                            color: Kirigami.Theme.disabledTextColor
++                            elide: Text.ElideRight
++                        }
++                    }
++
++                    Controls.ToolButton {
++                        visible: root.editable
++                        display: Controls.AbstractButton.IconOnly
++                        icon.name: "list-remove"
++                        text: i18nc("@action:button", "Remove number")
++                        onClicked: root.pendingNumbers = root.pendingNumbers.filter((number, index) => index !== numberDelegate.index)
++                        Controls.ToolTip.text: text
++                        Controls.ToolTip.visible: hovered
++                        Controls.ToolTip.delay: Kirigami.Units.toolTipDelay
++                    }
++                }
++            }
++        }
++
++        FormCard.FormTextFieldDelegate {
++            id: addNumberField
++
++            visible: root.editable
++            label: i18n("Phone")
++            inputMethodHints: Qt.ImhDialableCharactersOnly
++            onAccepted: addNumber.clicked()
++        }
++
++        FormCard.FormDelegateSeparator {
++            visible: root.editable
++            above: addNumber
++        }
++
++        FormCard.FormButtonDelegate {
++            id: addNumber
++
++            visible: root.editable
++            enabled: addNumberField.text.trim().length > 0
++            text: i18n("Add phone number")
++            icon.name: "list-add"
++            onClicked: {
++                root.pendingNumbers = root.pendingNumbers.concat([addNumberField.text.trim()]);
++                addNumberField.text = "";
++            }
++        }
++    }
++
++    footer: T.Control {
++        implicitWidth: Math.max(implicitBackgroundWidth + leftInset + rightInset, implicitContentWidth + leftPadding + rightPadding)
++        implicitHeight: Math.max(implicitBackgroundHeight + topInset + bottomInset, implicitContentHeight + topPadding + bottomPadding)
++
++        leftPadding: Kirigami.Units.smallSpacing
++        rightPadding: Kirigami.Units.smallSpacing
++        bottomPadding: Kirigami.Units.smallSpacing
++        topPadding: Kirigami.Units.smallSpacing + footerSeparator.implicitHeight
++
++        contentItem: Controls.DialogButtonBox {
++            id: buttonBox
++
++            standardButtons: root.editable ? Controls.DialogButtonBox.Cancel | Controls.DialogButtonBox.Save : Controls.DialogButtonBox.Close
++            position: Controls.DialogButtonBox.Footer
++            onAccepted: root.save()
++            onRejected: root.Kirigami.PageStack.closeDialog()
++
++            Component.onCompleted: {
++                const saveButton = standardButton(Controls.DialogButtonBox.Save);
++                if (saveButton) {
++                    saveButton.enabled = Qt.binding(() => nameField.text.trim().length > 0 || root.pendingNumbers.length > 0 || addNumberField.text.trim().length > 0);
++                }
++            }
++        }
++
++        background: Item {
++            Kirigami.Separator {
++                id: footerSeparator
++
++                width: parent.width
++                anchors.top: parent.top
++            }
++        }
++    }
++}

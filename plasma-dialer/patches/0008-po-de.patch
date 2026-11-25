@@ -1,0 +1,137 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] po/de: German translation of the new strings
+Description:
+ German translation of the strings added by the other patches of this
+ series: the contact view, the buttons of the contacts page and of the
+ call history, and the SIM choice of the dialer (call buttons, menu,
+ settings).
+Forwarded: not-needed
+License: as the patched files (the translations are under the license of the translated program)
+Last-Update: 2026-11-25
+---
+--- a/po/de/plasma-dialer.po
++++ b/po/de/plasma-dialer.po
+@@ -335,6 +335,122 @@ msgstr "Senden"
+ msgid "Cancel USSD session"
+ msgstr "USSD-Sitzung abbrechen"
+ 
++msgid "Name"
++msgstr "Name"
++
++msgid "Add phone number"
++msgstr "Telefonnummer hinzufügen"
++
++msgid "Add profile picture"
++msgstr "Profilbild hinzufügen"
++
++#, kde-format
++msgctxt "@action:button %1 is a phone number"
++msgid "Put %1 into the dial pad"
++msgstr "%1 in die Wähltasten übernehmen"
++
++msgctxt "@action:button"
++msgid "Add photo"
++msgstr "Foto hinzufügen"
++
++msgctxt "@action:button"
++msgid "Change photo"
++msgstr "Foto ändern"
++
++msgctxt "@action:button"
++msgid "Remove photo"
++msgstr "Foto entfernen"
++
++msgctxt "@action:button"
++msgid "Remove number"
++msgstr "Nummer entfernen"
++
++msgctxt "@action:button"
++msgid "Add to Contacts"
++msgstr "Zu Kontakten hinzufügen"
++
++msgctxt "@action:button"
++msgid "Show contact"
++msgstr "Kontakt anzeigen"
++
++msgctxt "@action:button"
++msgid "Edit contact"
++msgstr "Kontakt bearbeiten"
++
++msgctxt "@action:button"
++msgid "Call"
++msgstr "Anrufen"
++
++msgctxt "@action:button"
++msgid "Call back"
++msgstr "Zurückrufen"
++
++#, kde-format
++msgctxt "@action:button"
++msgid "Call through %1"
++msgstr "Über %1 anrufen"
++
++msgctxt "@action:button"
++msgid "Call through another SIM"
++msgstr "Über eine andere SIM anrufen"
++
++msgctxt "@action:intoolbar"
++msgid "Add to Contacts"
++msgstr "Zu Kontakten hinzufügen"
++
++msgctxt "@action:intoolbar"
++msgid "New Contact"
++msgstr "Neuer Kontakt"
++
++#, kde-format
++msgctxt "@info %1 time of the call, %2 its duration"
++msgid "%1 · %2"
++msgstr "%1 · %2"
++
++msgctxt "@info a tap on a phone number"
++msgid "Tap to put into the dial pad"
++msgstr "Antippen für die Wähltasten"
++
++msgctxt "@item:inlistbox file type"
++msgid "Images (*.png *.jpg *.jpeg *.webp *.bmp)"
++msgstr "Bilder (*.png *.jpg *.jpeg *.webp *.bmp)"
++
++#, kde-format
++msgctxt "@item:inmenu SIM, default"
++msgid "%1 (default)"
++msgstr "%1 (Standard)"
++
++#, kde-format
++msgctxt "@label name of a SIM card after its slot"
++msgid "SIM %1"
++msgstr "SIM %1"
++
++msgctxt "@label name of a SIM card"
++msgid "SIM"
++msgstr "SIM"
++
++msgctxt "@title"
++msgid "New Contact"
++msgstr "Neuer Kontakt"
++
++msgctxt "@title"
++msgid "Edit Contact"
++msgstr "Kontakt bearbeiten"
++
++msgctxt "@title:menu"
++msgid "Call Through"
++msgstr "Anrufen über"
++
++msgctxt "@title:window"
++msgid "Choose a Photo"
++msgstr "Foto auswählen"
++
++msgid "SIM for calls and messages"
++msgstr "SIM für Anrufe und Nachrichten"
++
++msgid "The contact could not be saved."
++msgstr "Der Kontakt konnte nicht gespeichert werden."
++
+ #~ msgid "More Info:"
+ #~ msgstr "Weitere Informationen:"
+ 
