@@ -1,0 +1,183 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] kcm_cellularnetwork: SIM for mobile data, SIM names and icons
+Description:
+ The main page follows the modem for mobile data instead of the first modem
+ and, with more than one modem, offers the choice "SIM for mobile data";
+ choosing a SIM enables mobile data on it and disables it on the others.
+ SIMs are listed with their name ("SIM <slot>") and icon, the SIM page
+ lets the user choose the icon of the SIM out of the shared set. The page
+ of a modem is named after its SIM instead of the object number.
+ .
+ While a modem goes away and comes back (e.g. a modem object restarted by
+ ModemManager) the pages show no modem instead of failing on a missing one.
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-25
+---
+--- a/kcms/kcm_cellularnetwork/ui/ModemPage.qml
++++ b/kcms/kcm_cellularnetwork/ui/ModemPage.qml
+@@ -19,7 +19,7 @@ FormCard.FormCardPage {
+     property Cellular.CellularModem modem
+     property bool showExtra: false
+ 
+-    title: i18n("Modem %1", modem.displayId)
++    title: (modem && modem.sim) ? i18nc("@title modem of a SIM", "Modem of %1", modem.sim.name) : i18n("Modem")
+ 
+     MessagesList {
+         Layout.fillWidth: true
+--- a/kcms/kcm_cellularnetwork/ui/SimPage.qml
++++ b/kcms/kcm_cellularnetwork/ui/SimPage.qml
+@@ -20,6 +20,7 @@ FormCard.FormCardPage {
+     property Cellular.CellularSim sim: null
+ 
+     property string displayId: sim ? sim.displayId : ""
++    property string simName: sim ? sim.name : ""
+     property bool simEnabled: sim ? sim.enabled : false
+     property bool simLocked: sim ? sim.locked : false
+     property string simImsi: sim ? sim.imsi : ""
+@@ -31,7 +32,7 @@ FormCard.FormCardPage {
+     property string simIdentifier: sim ? sim.simIdentifier : ""
+     property var simEmergencyNumbers: sim ? sim.emergencyNumbers : []
+ 
+-    title: i18nc("@title", "SIM %1", displayId)
++    title: simName
+ 
+     data: PlasmaNM.EnabledConnections {
+         id: enabledConnections
+@@ -51,6 +52,59 @@ FormCard.FormCardPage {
+         model: kcm.messages
+     }
+ 
++    FormCard.FormCard {
++        Layout.topMargin: Kirigami.Units.gridUnit
++        visible: simEnabled && simIdentifier !== ""
++
++        FormCard.AbstractFormDelegate {
++            id: iconChooser
++
++            background: null
++            contentItem: ColumnLayout {
++                spacing: Kirigami.Units.smallSpacing
++
++                Controls.Label {
++                    Layout.fillWidth: true
++                    text: i18n("Icon")
++                    elide: Text.ElideRight
++                    textFormat: Text.PlainText
++                }
++
++                Controls.Label {
++                    Layout.fillWidth: true
++                    text: i18n("Shown with this SIM wherever a SIM is chosen.")
++                    color: Kirigami.Theme.disabledTextColor
++                    font: Kirigami.Theme.smallFont
++                    wrapMode: Text.Wrap
++                    textFormat: Text.PlainText
++                }
++
++                Flow {
++                    Layout.fillWidth: true
++                    spacing: Kirigami.Units.smallSpacing
++
++                    Repeater {
++                        model: simPage.sim ? simPage.sim.availableIcons : []
++
++                        Controls.ToolButton {
++                            required property string modelData
++
++                            icon.name: modelData
++                            icon.width: Kirigami.Units.iconSizes.medium
++                            icon.height: Kirigami.Units.iconSizes.medium
++                            display: Controls.AbstractButton.IconOnly
++                            checkable: true
++                            checked: simPage.sim && simPage.sim.icon === modelData
++                            text: modelData
++                            Accessible.name: i18n("Use this icon for the SIM")
++                            onClicked: simPage.sim.icon = modelData
++                        }
++                    }
++                }
++            }
++        }
++    }
++
+     FormCard.FormCard {
+         Layout.topMargin: Kirigami.Units.gridUnit
+ 
+--- a/kcms/kcm_cellularnetwork/ui/main.qml
++++ b/kcms/kcm_cellularnetwork/ui/main.qml
+@@ -30,7 +30,7 @@ KCM.SimpleKCM {
+         id: modemList
+     }
+ 
+-    property Cellular.CellularModem selectedModem: modemList.primaryModem
++    property Cellular.CellularModem selectedModem: modemList.dataModem
+ 
+     PlasmaNM.Handler {
+         id: nmHandler
+@@ -86,7 +86,7 @@ KCM.SimpleKCM {
+                 id: mobileDataSwitch
+                 text: i18n("Mobile data")
+                 description: {
+-                    if (!modemList.modemAvailable) {
++                    if (!modemList.modemAvailable || !selectedModem) {
+                         return "";
+                     } else if (!selectedModem.hasSim) {
+                         return i18n("No SIM is inserted.")
+@@ -115,14 +115,40 @@ KCM.SimpleKCM {
+                         return;
+                     }
+ 
+-                    if (selectedModem.mobileDataEnabled != checked) {
++                    if (selectedModem && selectedModem.mobileDataEnabled != checked) {
+                         manuallySet = true;
+                         selectedModem.mobileDataEnabled = checked;
+                     }
+                 }
+             }
+ 
+-            FormCard.FormDelegateSeparator { above: mobileDataSwitch; below: dataUsageButton }
++            FormCard.FormDelegateSeparator {
++                visible: dataSimCombo.visible
++                above: mobileDataSwitch
++                below: dataSimCombo
++            }
++
++            FormCard.FormComboBoxDelegate {
++                id: dataSimCombo
++                text: i18n("SIM for mobile data")
++                description: i18n("Mobile data only uses this SIM.")
++                visible: modemList.modems.length > 1
++                enabled: enabledConnections.wwanEnabled
++
++                // one entry per modem with a SIM
++                model: modemList.modems.filter(modem => modem.sim !== null).map(modem => ({ "text": modem.sim.name, "modem": modem }))
++                textRole: "text"
++                currentIndex: model.findIndex(entry => entry.modem === root.selectedModem)
++
++                onActivated: index => {
++                    const modem = model[index] ? model[index].modem : null;
++                    if (modem && modem !== root.selectedModem) {
++                        modemList.setDataModem(modem);
++                    }
++                }
++            }
++
++            FormCard.FormDelegateSeparator { above: dataSimCombo.visible ? dataSimCombo : mobileDataSwitch; below: dataUsageButton }
+ 
+             FormCard.FormButtonDelegate {
+                 id: dataUsageButton
+@@ -156,9 +182,9 @@ KCM.SimpleKCM {
+ 
+                     FormCard.FormButtonDelegate {
+                         id: simDelegate
+-                        text: i18n("SIM %1", modelData.displayId)
+-                        description: i18n("View SIM %1 details.", modelData.displayId)
+-                        icon.name: "auth-sim-symbolic"
++                        text: modelData.name
++                        description: i18n("View %1 details.", modelData.name)
++                        icon.name: modelData.icon
+                         onClicked: {
+                             simPage.sim = modelData;
+                             simPage.visible = true;
