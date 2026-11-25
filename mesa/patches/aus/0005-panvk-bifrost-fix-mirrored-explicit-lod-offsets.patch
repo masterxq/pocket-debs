@@ -1,0 +1,105 @@
+Description: panvk: fix mirrored-repeat offsets for Bifrost explicit LOD
+ Apply the offset before wrapping for explicit-LOD operations that use
+ a single mip level. Scale it using the sampled mip dimensions.
+ On the Mali-G76 this fixes 195 of the 500 failures in the GLSL
+ Mirror/Repeat offset sample without introducing new failures.
+Forwarded: no
+License: MIT (as the patched file)
+Last-Update: 2026-11-24
+--- a/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c
++++ b/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c
+@@ -819,6 +819,86 @@
+    }
+ }
+ 
++#if PAN_ARCH < 9
++static bool
++lower_bifrost_mirrored_txl_offset(nir_builder *b, nir_tex_instr *tex,
++                                 const struct lower_desc_ctx *ctx)
++{
++   if (tex->op != nir_texop_txl)
++      return false;
++
++   const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
++   const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
++   const int sampler_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
++   const int texture_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
++   if (offset_idx < 0 || lod_idx < 0 || sampler_idx < 0 || texture_idx < 0 ||
++       nir_tex_instr_src_index(tex, nir_tex_src_plane) >= 0 ||
++       nir_tex_instr_src_index(tex, nir_tex_src_projector) >= 0)
++      return false;
++
++   nir_deref_instr *sampler = nir_src_as_deref(tex->src[sampler_idx].src);
++   nir_deref_instr *texture = nir_src_as_deref(tex->src[texture_idx].src);
++   nir_def *sampler_words = load_resource_deref_desc(
++      b, sampler, VK_DESCRIPTOR_TYPE_SAMPLER, 0, 2, 32, ctx);
++   nir_def *wrap_modes = nir_channel(b, sampler_words, 0);
++   nir_def *lod_limits = nir_channel(b, sampler_words, 1);
++   nir_def *min_lod = nir_ubitfield_extract_imm(b, lod_limits, 0, 13);
++   nir_def *max_lod = nir_ubitfield_extract_imm(b, lod_limits, 16, 13);
++   nir_def *nearest = nir_ieq_imm(b, nir_ushr_imm(b, wrap_modes, 30), 0);
++
++   /* TEXC applies texel offsets in the wrapped coordinate space. A
++    * normalized offset before TEXC preserves the direction when mirroring.
++    * It can be computed this way when only one mip level contributes.
++    */
++   nir_def *lod = tex->src[lod_idx].src.ssa;
++   lod = nir_fclamp(b, lod, nir_imm_float(b, -16.0), nir_imm_float(b, 16.0));
++   lod = nir_ftrunc(b, nir_fmul_imm(b, lod, 256.0));
++   lod = nir_fclamp(b, lod, nir_u2f32(b, min_lod), nir_u2f32(b, max_lod));
++   lod = nir_fmul_imm(b, lod, 1.0 / 256.0);
++
++   nir_def *levels = load_tex_levels(b, texture, tex->sampler_dim, ctx);
++   lod = nir_fmin(b, lod, nir_u2f32(b, nir_iadd_imm(b, levels, -1)));
++   nir_def *rounded = nir_fround_even(b, lod);
++   nir_def *single_level = nir_ior(b, nearest, nir_feq(b, lod, rounded));
++   nir_def *level = nir_f2u32(b, rounded);
++
++   nir_def *size = load_tex_size(b, texture, tex->sampler_dim, tex->is_array, ctx);
++   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
++   nir_def *coord = tex->src[coord_idx].src.ssa;
++   nir_def *offset = tex->src[offset_idx].src.ssa;
++   nir_def *new_coord[4], *new_offset[3];
++
++   for (unsigned i = 0; i < coord->num_components; ++i) {
++      new_coord[i] = nir_channel(b, coord, i);
++      if (i >= offset->num_components)
++         continue;
++
++      new_offset[i] = nir_channel(b, offset, i);
++      if (nir_scalar_is_zero(nir_get_scalar(new_offset[i], 0)))
++         continue;
++
++      nir_def *wrap = nir_ubitfield_extract_imm(b, wrap_modes, 16 - 4 * i, 4);
++      nir_def *emulate = nir_iand(b, single_level, nir_ieq_imm(b, wrap, 12));
++      nir_def *level_size = nir_umax_imm(
++         b, nir_ushr(b, nir_channel(b, size, i), level), 1);
++      nir_def *delta = nir_fdiv(b, nir_i2f32(b, new_offset[i]),
++                               nir_u2f32(b, level_size));
++
++      /* Reduce to one mirror period to retain the offset for large inputs. */
++      nir_def *period_coord = nir_ffract(b, nir_fmul_imm(b, new_coord[i], 0.5));
++      nir_def *shifted = nir_ffma(b, period_coord, nir_imm_float(b, 2.0), delta);
++      new_coord[i] = nir_bcsel(b, emulate, shifted, new_coord[i]);
++      new_offset[i] = nir_bcsel(b, emulate, nir_imm_int(b, 0), new_offset[i]);
++   }
++
++   nir_src_rewrite(&tex->src[coord_idx].src,
++                   nir_vec(b, new_coord, coord->num_components));
++   nir_src_rewrite(&tex->src[offset_idx].src,
++                   nir_vec(b, new_offset, offset->num_components));
++   return true;
++}
++#endif
++
+ static bool
+ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
+ {
+@@ -840,6 +920,7 @@
+    lower_tex_immutable(b, tex, ctx);
+ 
+ #if PAN_ARCH < 9
++   progress |= lower_bifrost_mirrored_txl_offset(b, tex, ctx);
+    if (tex->op == nir_texop_txs || tex->op == nir_texop_query_levels ||
+        tex->op == nir_texop_texture_samples) {
+       int tex_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);

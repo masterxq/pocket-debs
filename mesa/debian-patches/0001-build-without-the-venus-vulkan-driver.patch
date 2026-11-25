@@ -1,0 +1,23 @@
+--- a/debian/control	2026-11-23 15:33:11.000000000 +0100
++++ b/debian/control	2026-11-25 08:28:51.158071034 +0100
+@@ -62,7 +62,6 @@
+  rustfmt [amd64 arm64 armhf i386 loong64 ppc64el riscv64 x32],
+  spirv-tools-dev (>= 2025.1~rc1) [amd64 arm64 armhf i386 loong64 powerpc ppc64 ppc64el riscv64 s390x sparc64 x32],
+  valgrind [amd64 arm64 armhf i386 powerpc ppc64 ppc64el riscv64 s390x],
+- venus-protocol-dev [amd64 arm64 armhf i386 loong64 powerpc ppc64 ppc64el riscv64 s390x sparc64 x32],
+  wayland-protocols (>= 1.41),
+  x11proto-dev,
+  zlib1g-dev
+--- a/debian/rules	2026-11-23 15:18:45.000000000 +0100
++++ b/debian/rules	2026-11-25 08:28:51.157308298 +0100
+@@ -145,8 +145,8 @@
+   ifneq (,$(filter $(DEB_HOST_ARCH), $(LLVM_ARCHS)))
+ 	GALLIUM_DEFAULTS += radeonsi zink
+ 	GALLIUM_DRIVERS += radeonsi zink llvmpipe
+-	VULKAN_DEFAULTS += radv lavapipe venus
+-	VULKAN_DRIVERS += amd swrast virtio
++	VULKAN_DEFAULTS += radv lavapipe
++	VULKAN_DRIVERS += amd swrast
+ 
+ 	VULKAN_LAYERS += device-select intel-nullhw overlay screenshot
+ 	confflags_GALLIUM += -Dllvm=enabled

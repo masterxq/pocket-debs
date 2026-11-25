@@ -1,0 +1,49 @@
+Description: panvk: preserve fractional textureQueryLod for Bifrost trilinear samplers
+ Bifrost GRDESC returns fixed-point LOD values. Keep the fractional
+ clamped LOD for trilinear Vulkan samplers. Read the mipmap mode from the
+ bound descriptor so this works with dynamically selected samplers too.
+ The Mali-G76 passes all 190 Vulkan CTS textureQueryLod cases, up from 186.
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-24
+--- a/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c
++++ b/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c
+@@ -903,6 +903,15 @@
+       nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle, handle);
+ #else
+       tex->sampler_index = sampler_index;
++      if (tex->op == nir_texop_lod) {
++         /* The sampler descriptor's mipmap mode is in bits 30-31.
++          * Both trilinear modes have bit 31 set.
++          */
++         nir_def *word = load_resource_deref_desc(
++            b, deref, VK_DESCRIPTOR_TYPE_SAMPLER, 0, 1, 32, ctx);
++         nir_def *trilinear = nir_ine_imm(b, nir_ushr_imm(b, word, 31), 0);
++         nir_tex_instr_add_src(tex, nir_tex_src_backend1, trilinear);
++      }
+       if (index_ssa != NULL) {
+          nir_tex_instr_add_src(tex, nir_tex_src_sampler_offset,
+                                nir_imul_imm(b, index_ssa, desc_stride));
+--- a/src/panfrost/compiler/pan_nir_lower_tex.c
++++ b/src/panfrost/compiler/pan_nir_lower_tex.c
+@@ -639,6 +639,7 @@
+ bi_lower_lod(nir_builder *b, nir_tex_instr *tex, unsigned arch)
+ {
+    b->cursor = nir_before_instr(&tex->instr);
++   nir_def *trilinear = nir_steal_tex_src(tex, nir_tex_src_backend1);
+    struct tex_srcs srcs = steal_tex_srcs(b, tex, arch);
+ 
+    struct bifrost_texture_operation desc = {
+@@ -670,8 +671,10 @@
+       nir_def *lod = nir_i2f32(b, lod_i16);
+ 
+       lod = nir_fdiv_imm(b, lod, 256.0);
+-      if (i == 0)
+-         lod = nir_fround_even(b, lod);
++      if (i == 0) {
++         nir_def *nearest = nir_fround_even(b, lod);
++         lod = trilinear ? nir_bcsel(b, trilinear, lod, nearest) : nearest;
++      }
+ 
+       comps[i] = lod;
+    }
