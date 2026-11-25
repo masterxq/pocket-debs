@@ -1,0 +1,146 @@
+Description: panvk/jm: compute the index range inline for small direct indexed draws
+ vkCmdDrawIndexed goes through the indirect path and searched the whole
+ index buffer. Search only the draw's indices, and for up to 4096 indices
+ compute min/max in the draw helper instead of a separate search job.
+Author: pocket-debs
+Origin: https://github.com/masterxq/mesa-lisbon (branch lisbon/26.3)
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-25
+diff --git a/src/panfrost/libpan/draw_helper.cl b/src/panfrost/libpan/draw_helper.cl
+index a2b35d37451..c14195dc3d0 100644
+--- a/src/panfrost/libpan/draw_helper.cl
++++ b/src/panfrost/libpan/draw_helper.cl
+@@ -517,9 +517,9 @@ static void
+ draw_indexed_indirect_helper(
+    global VkDrawIndexedIndirectCommand *cmd, global uint8_t *index_buffer_ptr,
+    global struct libpan_draw_helper_index_min_max_result *index_min_max_res,
+-   uint32_t index_size, uint32_t primitive_vertex_count,
+-   uint32_t attrib_bufs_valid, uint32_t attribs_valid,
+-   global struct poly_heap *heap,
++   uint32_t index_size, uint32_t primitive_restart,
++   uint32_t primitive_vertex_count, uint32_t attrib_bufs_valid,
++   uint32_t attribs_valid, global struct poly_heap *heap,
+    global struct mali_attribute_buffer_packed *varying_bufs_descs,
+    global struct mali_attribute_buffer_packed *attrib_bufs_descs,
+    global struct libpan_draw_helper_attrib_buf_info *attrib_bufs_infos,
+@@ -534,8 +534,34 @@ draw_indexed_indirect_helper(
+    const uint32_t first_instance = cmd->firstInstance;
+    const uint32_t instance_count = cmd->instanceCount;
+    const int32_t vertex_offset = cmd->vertexOffset;
+-   const uint32_t min_vertex = index_min_max_res->min;
+-   const uint32_t max_vertex = index_min_max_res->max;
++   uint32_t min_vertex = UINT32_MAX;
++   uint32_t max_vertex = 0;
++
++   if (index_min_max_res != NULL) {
++      min_vertex = index_min_max_res->min;
++      max_vertex = index_min_max_res->max;
++   } else {
++      const uint32_t restart =
++         index_size == 4 ? UINT32_MAX : (1u << (index_size * 8)) - 1;
++
++      for (uint32_t i = 0; i < index_count; i++) {
++         uint32_t val;
++
++         if (index_size == 4)
++            val = ((global uint32_t *)index_buffer_ptr)[first_index + i];
++         else if (index_size == 2)
++            val = ((global uint16_t *)index_buffer_ptr)[first_index + i];
++         else
++            val = index_buffer_ptr[first_index + i];
++
++         if (primitive_restart && val == restart)
++            continue;
++
++         min_vertex = min(min_vertex, val);
++         max_vertex = max(max_vertex, val);
++      }
++   }
++
+    const uint32_t vertex_range =
+       max_vertex >= min_vertex ? max_vertex - min_vertex + 1 : 0;
+ 
+@@ -590,7 +616,7 @@ panlib_draw_helper_batch(global struct libpan_draw_helper_entry *entries,
+          (global uint8_t *)e->index_buffer_ptr,
+          (global struct libpan_draw_helper_index_min_max_result *)
+             e->index_min_max_res,
+-         e->index_size, e->primitive_vertex_count,
++         e->index_size, e->primitive_restart, e->primitive_vertex_count,
+          e->attrib_bufs_valid, e->attribs_valid, heap,
+          (global struct mali_attribute_buffer_packed *)e->varying_bufs_descs,
+          (global struct mali_attribute_buffer_packed *)e->attrib_bufs_descs,
+diff --git a/src/panfrost/libpan/draw_helper.h b/src/panfrost/libpan/draw_helper.h
+index 53c1e8c7934..0fc72b3a3b7 100644
+--- a/src/panfrost/libpan/draw_helper.h
++++ b/src/panfrost/libpan/draw_helper.h
+@@ -55,8 +55,10 @@ struct libpan_draw_helper_entry {
+     uint64_t vertex_job;
+     uint64_t tiler_job;
+     uint32_t index_size;
++    uint32_t primitive_restart;
+     uint32_t primitive_vertex_count;
+     uint32_t attrib_bufs_valid;
+     uint32_t attribs_valid;
++    uint32_t pad;
+ };
+ #endif
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index c24cadf6f46..ed8f4909c03 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -43,6 +43,7 @@
+ 
+ struct panvk_draw_data {
+    struct panvk_draw_info info;
++   uint32_t direct_index_count;
+    unsigned vertex_range;
+    unsigned padded_vertex_count;
+    struct mali_invocation_packed invocation;
+@@ -82,6 +83,8 @@ struct panvk_draw_data {
+    } indirect_info;
+ };
+ 
++#define INLINE_MIN_MAX_COUNT 4096
++
+ static bool
+ is_indirect_draw(const struct panvk_draw_data *draw)
+ {
+@@ -1528,7 +1531,9 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+ 
+    struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+    uint64_t index_min_max_res_ptr = 0;
+-   if (draw->info.index.index_size) {
++   const bool inline_min_max = draw->direct_index_count &&
++                               draw->direct_index_count <= INLINE_MIN_MAX_COUNT;
++   if (draw->info.index.index_size && !inline_min_max) {
+       index_min_max_res_ptr =
+          panvk_cmd_alloc_dev_mem(
+             cmdbuf, desc,
+@@ -1566,7 +1571,9 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+       util_dynarray_append(&batch->jobs, write_job.cpu);
+ 
+       const uint32_t index_count =
+-         draw->info.index.buffer_size / draw->info.index.index_size;
++         draw->direct_index_count
++            ? draw->direct_index_count
++            : draw->info.index.buffer_size / draw->info.index.index_size;
+       uint32_t wg_count = DIV_ROUND_UP(index_count, 65536);
+       assert(wg_count <= 65536);
+ 
+@@ -1632,6 +1639,7 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+          .vertex_job = draw->jobs.vertex.gpu,
+          .tiler_job = draw->jobs.tiler.gpu,
+          .index_size = draw->info.index.index_size,
++         .primitive_restart = draw->info.index.restart_enable,
+          .primitive_vertex_count = mesa_vertices_per_prim(draw->info.prim),
+          .attrib_bufs_valid = attrib_bufs_valid,
+          .attribs_valid = attribs_valid,
+@@ -1806,6 +1814,7 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
+          .indirect.stride = 0,
+          .prim = panvk_get_client_prim(cmdbuf),
+       },
++      .direct_index_count = indexCount,
+    };
+ 
+    panvk_cmd_draw_indirect(cmdbuf, &draw);

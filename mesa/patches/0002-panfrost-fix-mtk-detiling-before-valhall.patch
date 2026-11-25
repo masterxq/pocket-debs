@@ -16,7 +16,7 @@ License: MIT (as the patched files)
 Last-Update: 2026-11-24
 --- a/src/gallium/drivers/panfrost/pan_cmdstream.c
 +++ b/src/gallium/drivers/panfrost/pan_cmdstream.c
-@@ -3917,6 +3917,23 @@
+@@ -4074,6 +4074,23 @@ panfrost_mtk_detile_compute(struct panfr
           DIV_ROUND_UP(uv_src->height0, 16);
     }
  
@@ -42,7 +42,7 @@ Last-Update: 2026-11-24
     image[0].shader_access = image[0].access = PIPE_IMAGE_ACCESS_READ;
 --- a/src/gallium/drivers/panfrost/pan_resource.c
 +++ b/src/gallium/drivers/panfrost/pan_resource.c
-@@ -1279,6 +1279,7 @@
+@@ -1263,6 +1263,7 @@ panfrost_resource_restore_format(struct
     rsrc->base.format = saved->base.format;
     rsrc->image.props.format = saved->image.props.format;
     rsrc->base.width0 = saved->base.width0;

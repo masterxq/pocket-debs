@@ -1,0 +1,64 @@
+Description: panvk: recycle large varying BOs through a command pool BO pool
+ Varying allocations larger than the slab size got a new BO for every
+ command buffer reset. Give the command pool a big-BO pool for varyings,
+ like the TLS one, and release it with RELEASE_RESOURCES.
+Author: pocket-debs
+Origin: https://github.com/masterxq/mesa-lisbon (branch lisbon/26.3)
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-25
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index 8cf3d560ccd..abb92cb1f2c 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -516,8 +516,8 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
+       .owns_bos = true,
+       .needs_locking = false,
+    };
+-   panvk_pool_init(&cmdbuf->varying_pool, device, &pool->varying_bo_pool, NULL,
+-                   &var_pool_props);
++   panvk_pool_init(&cmdbuf->varying_pool, device, &pool->varying_bo_pool,
++                   &pool->varying_big_bo_pool, &var_pool_props);
+ 
+    list_inithead(&cmdbuf->batches);
+    *cmdbuf_out = &cmdbuf->vk;
+diff --git a/src/panfrost/vulkan/panvk_cmd_pool.c b/src/panfrost/vulkan/panvk_cmd_pool.c
+index 358b5bfcbbe..9c0d4ee8e29 100644
+--- a/src/panfrost/vulkan/panvk_cmd_pool.c
++++ b/src/panfrost/vulkan/panvk_cmd_pool.c
+@@ -41,6 +41,7 @@ panvk_CreateCommandPool(VkDevice _device,
+    panvk_bo_pool_init(&pool->cs_bo_pool);
+    panvk_bo_pool_init(&pool->desc_bo_pool);
+    panvk_bo_pool_init(&pool->varying_bo_pool);
++   panvk_bo_pool_init(&pool->varying_big_bo_pool);
+    panvk_bo_pool_init(&pool->tls_bo_pool);
+    panvk_bo_pool_init(&pool->tls_big_bo_pool);
+    list_inithead(&pool->push_sets);
+@@ -63,6 +64,7 @@ panvk_DestroyCommandPool(VkDevice _device, VkCommandPool commandPool,
+    panvk_bo_pool_cleanup(&pool->cs_bo_pool);
+    panvk_bo_pool_cleanup(&pool->desc_bo_pool);
+    panvk_bo_pool_cleanup(&pool->varying_bo_pool);
++   panvk_bo_pool_cleanup(&pool->varying_big_bo_pool);
+    panvk_bo_pool_cleanup(&pool->tls_bo_pool);
+    panvk_bo_pool_cleanup(&pool->tls_big_bo_pool);
+ 
+@@ -85,6 +87,7 @@ panvk_ResetCommandPool(VkDevice _device, VkCommandPool commandPool,
+       (flags & VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT) != 0;
+    if (release_resources) {
+       panvk_bo_pool_cleanup(&pool->tls_big_bo_pool);
++      panvk_bo_pool_cleanup(&pool->varying_big_bo_pool);
+    }
+ 
+    return vk_common_ResetCommandPool(_device, commandPool, flags);
+diff --git a/src/panfrost/vulkan/panvk_cmd_pool.h b/src/panfrost/vulkan/panvk_cmd_pool.h
+index 9c173203849..6e1b6e44ba7 100644
+--- a/src/panfrost/vulkan/panvk_cmd_pool.h
++++ b/src/panfrost/vulkan/panvk_cmd_pool.h
+@@ -15,6 +15,7 @@ struct panvk_cmd_pool {
+    struct panvk_bo_pool cs_bo_pool;
+    struct panvk_bo_pool desc_bo_pool;
+    struct panvk_bo_pool varying_bo_pool;
++   struct panvk_bo_pool varying_big_bo_pool;
+    struct panvk_bo_pool tls_bo_pool;
+    struct panvk_bo_pool tls_big_bo_pool;
+    struct list_head push_sets;

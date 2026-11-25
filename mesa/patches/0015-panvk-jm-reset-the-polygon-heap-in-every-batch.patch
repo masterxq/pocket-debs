@@ -1,0 +1,21 @@
+Description: panvk/jm: reset the polygon heap in every batch
+ Only the first batch of a command buffer that used the polygon heap reset
+ it, so later batches kept allocating on top of earlier ones. Clear
+ uses_poly_heap whenever a batch is opened, as the job-count split did.
+Author: pocket-debs
+Origin: https://github.com/masterxq/mesa-lisbon (branch lisbon/26.3)
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-25
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index 09cbf4a6611..8cf3d560ccd 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -326,6 +326,7 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
+                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+    cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
+    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
++   cmdbuf->state.uses_poly_heap = false;
+    assert(cmdbuf->cur_batch);
+    return cmdbuf->cur_batch;
+ }

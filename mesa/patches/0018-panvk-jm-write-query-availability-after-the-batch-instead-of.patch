@@ -1,0 +1,153 @@
+Description: panvk/jm: write query availability after the batch instead of splitting it
+ Ending a query closed the current batch first, which split render passes
+ into many batches. Collect the availability addresses per batch and write
+ them in a short batch right after it; flush them before query copy/reset.
+Author: pocket-debs
+Origin: https://github.com/masterxq/mesa-lisbon (branch lisbon/26.3)
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-25
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index eef218ccc9c..a3c5c34523c 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -35,6 +35,7 @@ struct panvk_batch {
+    struct list_head node;
+    struct util_dynarray jobs;
+    struct util_dynarray event_ops;
++   struct util_dynarray oq_available;
+    struct pan_jc vtc_jc;
+    struct pan_jc frag_jc;
+    struct {
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index abb92cb1f2c..1d04ed0a294 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -66,8 +66,8 @@ panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
+    return VK_SUCCESS;
+ }
+ 
+-void
+-panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
++static void
++close_batch(struct panvk_cmd_buffer *cmdbuf)
+ {
+    struct panvk_batch *batch = cmdbuf->cur_batch;
+ 
+@@ -326,11 +326,52 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
+                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+    cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
+    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
++   cmdbuf->cur_batch->oq_available = UTIL_DYNARRAY_INIT;
+    cmdbuf->state.uses_poly_heap = false;
+    assert(cmdbuf->cur_batch);
+    return cmdbuf->cur_batch;
+ }
+ 
++void
++panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
++{
++   struct panvk_batch *batch = cmdbuf->cur_batch;
++
++   if (!batch)
++      return;
++
++   struct util_dynarray available = batch->oq_available;
++
++   batch->oq_available = UTIL_DYNARRAY_INIT;
++   close_batch(cmdbuf);
++
++   if (util_dynarray_num_elements(&available, uint64_t)) {
++      batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
++
++      util_dynarray_foreach(&available, uint64_t, addr) {
++         struct pan_ptr job =
++            pan_pool_alloc_desc(&cmdbuf->desc_pool.base, WRITE_VALUE_JOB);
++
++         if (!job.gpu)
++            break;
++
++         pan_section_pack(job.cpu, WRITE_VALUE_JOB, PAYLOAD, payload) {
++            payload.type = MALI_WRITE_VALUE_TYPE_IMMEDIATE_32;
++            payload.address = *addr;
++            payload.immediate_value = 1;
++         }
++
++         pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_WRITE_VALUE, true, false,
++                        0, 0, &job, false);
++         util_dynarray_append(&batch->jobs, job.cpu);
++      }
++
++      close_batch(cmdbuf);
++   }
++
++   util_dynarray_fini(&available);
++}
++
+ VkResult
+ panvk_per_arch(cmd_init_poly_heap)(struct panvk_cmd_buffer *cmdbuf,
+                                    unsigned *job_id)
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
+index e2d79e3c11f..b42d1f2eb23 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
+@@ -79,6 +79,14 @@ close_batch(struct panvk_cmd_buffer *cmd, bool had_batch)
+       panvk_per_arch(cmd_close_batch)(cmd);
+ }
+ 
++static void
++flush_available(struct panvk_cmd_buffer *cmd)
++{
++   if (cmd->cur_batch &&
++       util_dynarray_num_elements(&cmd->cur_batch->oq_available, uint64_t))
++      panvk_per_arch(cmd_close_batch)(cmd);
++}
++
+ static void
+ panvk_emit_clear_queries(struct panvk_cmd_buffer *cmd,
+                          struct panvk_query_pool *pool, bool availaible,
+@@ -95,6 +103,7 @@ panvk_emit_clear_queries(struct panvk_cmd_buffer *cmd,
+    };
+ 
+    bool had_batch;
++   flush_available(cmd);
+    open_batch(cmd, &had_batch);
+    struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmd);
+    panlib_clear_query_result_struct(&precomp_ctx, panlib_1d(query_count),
+@@ -182,15 +191,9 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
+    /* TODO: transform feedback */
+    assert(index == 0);
+ 
+-   bool end_sync = cmd->cur_batch != NULL;
+-
+-   /* Close to ensure we are sync and flush caches */
+-   if (end_sync)
+-      panvk_per_arch(cmd_close_batch)(cmd);
+-
++   uint64_t available_addr = panvk_query_available_dev_addr(pool, query);
+    bool had_batch;
+    struct panvk_batch *batch = open_batch(cmd, &had_batch);
+-   had_batch |= end_sync;
+ 
+    switch (pool->vk.query_type) {
+    case VK_QUERY_TYPE_OCCLUSION: {
+@@ -203,10 +206,7 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
+       UNREACHABLE("Unsupported query type");
+    }
+ 
+-   uint64_t available_addr = panvk_query_available_dev_addr(pool, query);
+-   panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
+-                        available_addr, 1);
+-
++   util_dynarray_append(&batch->oq_available, available_addr);
+    close_batch(cmd, had_batch);
+ }
+ 
+@@ -231,6 +231,7 @@ panvk_meta_copy_query_pool_results(struct panvk_cmd_buffer *cmd,
+    };
+ 
+    bool had_batch;
++   flush_available(cmd);
+    open_batch(cmd, &had_batch);
+    struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmd);
+    panlib_copy_query_result_struct(&precomp_ctx, panlib_1d(query_count),

@@ -1,0 +1,59 @@
+Description: panvk: open a separate DRM file for each VkDevice before v10
+ Panfrost ties its single GPU address space to the DRM file. Open the
+ render node again for each VkDevice instead of duplicating the physical
+ device fd, so that BOs of different devices do not share an address space.
+Author: pocket-debs
+Origin: https://github.com/masterxq/mesa-lisbon (branch lisbon/26.3)
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-25
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index 82c567d273d..8bffd786f14 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -10,6 +10,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <fcntl.h>
++
+ #include "drm-uapi/panthor_drm.h"
+ 
+ #include "vk_cmd_enqueue_entrypoints.h"
+@@ -288,6 +290,27 @@ global_priority_to_group_allow_priority_flag(
+    }
+ }
+ 
++static int
++open_device_fd(const struct panvk_physical_device *physical_device)
++{
++   int physical_fd = physical_device->kmod.dev->fd;
++
++#if PAN_ARCH < 10
++   /* Panfrost ties its single address space to the DRM file. Open a fresh
++    * file for each VkDevice so their BOs do not share that address space.
++    */
++   char *path = drmGetRenderDeviceNameFromFd(physical_fd);
++   if (path) {
++      int fd = open(path, O_RDWR | O_CLOEXEC);
++      free(path);
++      if (fd >= 0)
++         return fd;
++   }
++#endif
++
++   return os_dupfd_cloexec(physical_fd);
++}
++
+ static VkResult
+ check_global_priority(const struct panvk_physical_device *phys_dev,
+                       const VkDeviceQueueCreateInfo *create_info)
+@@ -506,7 +529,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+       .priv = &device->vk.alloc,
+    };
+    device->kmod.dev = pan_kmod_dev_create(
+-      os_dupfd_cloexec(physical_device->kmod.dev->fd),
++      open_device_fd(physical_device),
+       physical_device->kmod.dev->flags, &device->kmod.allocator);
+ 
+    if (!device->kmod.dev) {

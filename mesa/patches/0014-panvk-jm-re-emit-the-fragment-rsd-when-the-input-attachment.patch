@@ -1,0 +1,22 @@
+Description: panvk/jm: re-emit the fragment RSD when the input attachment map changes
+ The renderer state reads the input attachment map to decide which render
+ targets and depth/stencil are read by the shader. Replace the duplicated
+ DS_DEPTH_COMPARE_OP check in the dirty list with INPUT_ATTACHMENT_MAP.
+Author: pocket-debs
+Origin: https://github.com/masterxq/mesa-lisbon (branch lisbon/26.3)
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-25
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index b0dc7c3427c..41d70ed8fc5 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -215,7 +215,7 @@ panvk_draw_prepare_fs_rsd(struct panvk_cmd_buffer *cmdbuf,
+                 dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_TEST_ENABLE) ||
+                 dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_WRITE_ENABLE) ||
+                 dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_COMPARE_OP) ||
+-                dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_COMPARE_OP) ||
++                dyn_gfx_state_dirty(cmdbuf, INPUT_ATTACHMENT_MAP) ||
+                 dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_TEST_ENABLE) ||
+                 dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_OP) ||
+                 dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_COMPARE_MASK) ||
