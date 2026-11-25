@@ -1,8 +1,10 @@
 # pocket-debs
 
-Debian packages with patches for phones running mainline Linux (Debian/Mobian). Each package is the Debian source
-package of the target suite plus a few patches, built for arm64 as `<debian version>+pd<n>`. The first device is
-the Motorola Moto G60s ("lisbon"); device specific parts keep the device name (e.g. the `lisbonfpc` driver).
+Debian packages with patches for phones running mainline Linux (Debian/Mobian). Most packages are the Debian
+source package of the target suite plus a few patches, built for arm64 as `<debian version>+pd<n>`. Software that
+Debian does not have is packaged from its upstream release with our own `debian/` directory, built as
+`<upstream version>-0pd<n>`. The first device is the Motorola Moto G60s ("lisbon"); device specific parts keep the
+device name (e.g. the `lisbonfpc` driver).
 
 | Source | What the patches change | Why |
 |---|---|---|
@@ -28,13 +30,23 @@ build); `FEHLT_ERLAUBT` in `paket.conf` names files that are then missing on pur
 in `patches/aus/` are prepared but not applied. Every patch is under the license of the files it changes (named in
 its header). `STATUS=entwurf` marks drafts, which are only built on request.
 
+Layout of an upstream package (`UPSTREAM` instead of `DEBIAN` in `paket.conf`): `paket.conf` names the upstream
+version (`UPSTREAM`), the release tarball (`TARBALL`, its checksum `TARBALL_SHA256`) and optionally the GitLab
+project (`GITLAB`) that `./bau.sh pruefen` asks for the newest release. `<source>/debian/` is the complete packaging
+without `debian/changelog`; the build writes the changelog entry from `paket.conf`. Patches to the upstream source go
+to `debian/patches/` with a `series` file; `patches/`, `dateien/` and `debian-patches/` are not used. The tarball
+becomes `<source>_<upstream version>.orig.tar.<ext>`, so the result is an ordinary source package (`.orig.tar`,
+`.debian.tar`, `.dsc`). The Debian revision `0pd<n>` sorts below a later Debian package `<upstream version>-1` and
+cannot be mistaken for one of our builds of a Debian package (`+pd<n>`).
+
 ## Build locally
 
 Needs Docker; on an amd64 host additionally qemu-user binfmt for arm64, on an arm64 host the build runs natively.
 One entry point, non-interactive (comments and messages of the scripts are in German):
 
     ./bau.sh bau <source...>|alle|image [--neu]   # build into the APT repository under $PAKETE_OUT (default out/)
-    ./bau.sh pruefen          # compares our base version with the Debian suite, exit 3 if Debian is newer
+    ./bau.sh pruefen          # compares our base version with the Debian suite, exit 3 if Debian is newer;
+                              # for upstream packages it shows the newest release (no exit 3)
     ./bau.sh liste            # packages, versions, state in the repository
     ./bau.sh schluessel <source>   # input key of a package and what goes into it
 
@@ -43,11 +55,15 @@ package (the `.dsc` is checked against `DSC_SHA256` in `paket.conf`, all other f
 the patches without fuzz, builds in a throwaway `debian:<suite>` container for linux/arm64, compares every binary
 package with Debian's package of the same base version (file list without `usr/share/doc`, dependency names;
 anything missing fails the build, so a dependency that the build silently did not find cannot drop a feature) and
-adds source and binaries to a reprepro repository (`$PAKETE_OUT/repo`).
+adds source and binaries to a reprepro repository (`$PAKETE_OUT/repo`). An upstream package is built the same way
+by `bau-innen-upstream.sh`: the tarball is checked against `TARBALL_SHA256`, unpacked, `<source>/debian/` is added;
+there is no Debian package to compare with, so `PRUEFEN` in `paket.conf` checks the result instead.
 
 A build is skipped when the repository already holds the package built from the same inputs; `--neu` forces it.
 The input key hashes the suite, mirror and snapshot, `pakete.conf`, `Dockerfile`, `bau-innen.sh`, the package's
-`paket.conf`, `patches/*.patch` and `dateien/`. It depends only on files in this repository, so it is the same on
+`paket.conf`, `patches/*.patch` and `dateien/`; for an upstream package `bau-innen-upstream.sh` and every file under
+`<source>/debian/` take the place of `bau-innen.sh`, the patches and `dateien/` (tarball URL and checksum are in
+`paket.conf`). It depends only on files in this repository, so it is the same on
 every machine and in CI. Not part of the key: `bau.sh` itself, the state of the build image and of the build
 dependencies in the mirror at build time (pinned only with `SNAPSHOT` in `pakete.conf`); build with `--neu` after
 changing those.
@@ -60,8 +76,9 @@ cache).
 
 - **Only changed packages are built.** A plan job computes the input key of every active package. The result of
   each build is stored in the Actions cache under `paket-<source>-<key>`; a package whose key is cached is restored
-  instead of built. A change to a shared file (`pakete.conf`, `Dockerfile`, `bau-innen.sh`) changes every key and
-  rebuilds everything; a change below `<source>/` rebuilds that package only.
+  instead of built. A change to a shared file (`pakete.conf`, `Dockerfile`) changes every key and rebuilds
+  everything, a change to `bau-innen.sh` all Debian based packages, to `bau-innen-upstream.sh` all upstream packages;
+  a change below `<source>/` rebuilds that package only.
 - **Every run carries all packages.** Each run uploads one artifact per package, named `<source>_<version>`
   (`.deb` files, source package, `STAND` with version and key, `BUILDINFO`, `SHA256SUMS`, patch and comparison
   results), and `apt-repo` with the complete repository (`dists/`, `pool/`, `stand/`).
@@ -92,7 +109,9 @@ refreshed patches) is committed to `main` and the workflow `bau` is started; it 
 publishes it. If not, `main` and the published version stay as they are and an issue `nachziehen: <source> <debian
 version>` is opened, once per Debian version; the run that later moves the package closes it. A second kind of issue
 reports a patch that was dropped because Debian already contains the change: then the package may no longer be
-needed. Drafts are not moved. "Run workflow" with `probe` tries everything without the commit and without issues.
+needed. Drafts are not moved, nor are upstream packages: `./bau.sh pruefen` (also in this workflow's summary) shows
+when a newer upstream release exists, and `UPSTREAM` and `TARBALL_SHA256` are raised by hand. "Run workflow" with
+`probe` tries everything without the commit and without issues.
 
 Fetch the CI results instead of building (needs an authenticated GitHub CLI `gh`):
 
@@ -137,6 +156,7 @@ The packages are built against Debian `forky` and are test builds for developmen
 
 The build scripts, the workflow and the documentation of this repository are under the GNU General Public License,
 version 3 or (at your option) any later version, see `LICENSE`. Every patch and every file under `<source>/dateien/`
-is under the license of the source package it changes (named in its header).
+is under the license of the source package it changes (named in its header); the packaging under `<source>/debian/`
+of an upstream package is under the license of the upstream software (named in its `debian/copyright`).
 
 This repository was developed with heavy AI assistance; review and release on the device are done by a human.
