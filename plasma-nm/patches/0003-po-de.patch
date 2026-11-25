@@ -3,15 +3,15 @@ Date: Tue, 25 Nov 2026 12:00:00 +0100
 Subject: [PATCH] po/de: German translation of the strings for several SIMs
 Description:
  German translation of the strings added by the patches for several SIMs:
- the SIM names of the cellular library and the strings of the cellular
- network settings page.
+ the SIM names and error messages of the cellular library and the strings
+ of the cellular network settings page.
 Forwarded: not-needed
 License: as the patched files (the translations are under the license of the translated program)
 Last-Update: 2026-11-25
 ---
 --- a/po/de/kcm_cellular_network.po
 +++ b/po/de/kcm_cellular_network.po
-@@ -561,6 +561,39 @@ msgstr "SIM ID"
+@@ -561,6 +561,42 @@ msgstr "SIM ID"
  msgid "Emergency Numbers"
  msgstr "Notfallnummern"
  
@@ -48,12 +48,15 @@ Last-Update: 2026-11-25
 +msgid "View %1 details."
 +msgstr "Details zu %1 anzeigen."
 +
++msgid "Switching the SIM for mobile data…"
++msgstr "SIM für mobile Daten wird gewechselt …"
++
  #~ msgid "Error resetting the modem: %1"
  #~ msgstr "Fehler beim Zurücksetzen des Modems: %1"
  
 --- a/po/de/plasmanetworkmanagement-libs.po
 +++ b/po/de/plasmanetworkmanagement-libs.po
-@@ -4258,6 +4258,15 @@ msgctxt "global connection state"
+@@ -4258,6 +4258,21 @@ msgctxt "global connection state"
  msgid "Unknown"
  msgstr "Unbekannt"
  
@@ -65,6 +68,12 @@ Last-Update: 2026-11-25
 +msgctxt "@label name of a SIM card"
 +msgid "SIM"
 +msgstr "SIM"
++
++msgid "Mobile data is not available with this modem."
++msgstr "Mobile Daten sind mit diesem Modem nicht verfügbar."
++
++msgid "An APN needs to be configured to have mobile data."
++msgstr "Für mobile Daten muss ein APN konfiguriert sein."
 +
  #~ msgid "Wi-Fi Security"
  #~ msgstr "WLAN-Sicherheit"

@@ -1,16 +1,18 @@
 From: pocket-debs <masterxq@users.noreply.github.com>
 Date: Tue, 25 Nov 2026 12:00:00 +0100
-Subject: [PATCH] po/de: German translation of the strings for several SIMs
+Subject: [PATCH] po/de: German translation of the new strings
 Description:
- German translation of the strings added by the patches for several SIMs:
- the SIM choice of the dialer (call buttons, menu, call back, settings).
+ German translation of the strings added by the other patches of this
+ series: the actions to add a number to the contacts and to edit a
+ contact, and the SIM choice of the dialer (call buttons, menu, call back,
+ settings).
 Forwarded: not-needed
 License: as the patched files (the translations are under the license of the translated program)
 Last-Update: 2026-11-25
 ---
 --- a/po/de/plasma-dialer.po
 +++ b/po/de/plasma-dialer.po
-@@ -335,6 +335,44 @@ msgstr "Senden"
+@@ -335,6 +335,67 @@ msgstr "Senden"
  msgid "Cancel USSD session"
  msgstr "USSD-Sitzung abbrechen"
  
@@ -51,6 +53,29 @@ Last-Update: 2026-11-25
 +msgctxt "@label name of a SIM card"
 +msgid "SIM"
 +msgstr "SIM"
++
++msgctxt "@action:intoolbar"
++msgid "Add to Contacts"
++msgstr "Zu Kontakten hinzufügen"
++
++msgctxt "@title:dialog"
++msgid "Add to Contacts"
++msgstr "Zu Kontakten hinzufügen"
++
++msgctxt "@action:button"
++msgid "Add"
++msgstr "Hinzufügen"
++
++msgctxt "@info:placeholder name of the new contact"
++msgid "Name"
++msgstr "Name"
++
++msgid "The contact could not be saved."
++msgstr "Der Kontakt konnte nicht gespeichert werden."
++
++msgctxt "@action:button"
++msgid "Edit in Contacts"
++msgstr "In der Kontakte-App bearbeiten"
 +
  #~ msgid "More Info:"
  #~ msgstr "Weitere Informationen:"

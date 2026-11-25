@@ -30,8 +30,25 @@ Description:
  else the SIM in the first slot; setDefaultModem() chooses it.
  CellularModem: networkType, the radio access technology as named in the
  network-mobile-<strength>-<type> icons.
+ .
+ While mobile data moves to another SIM, dataModem is the modem chosen
+ with setDataModem() until it is connected (at most two minutes,
+ dataModemSwitching), also while modems disappear and come back; the
+ choice is kept by the SIM identifier. errorOccurred passes on the errors
+ of every modem. Enabling mobile data on a modem without a connection that
+ can be used with its SIM adds one with the APN of the provider of the SIM
+ (as addDetectedProfileSettings(), which now returns whether settings were
+ found) and reports an error when none is known; enabling it on a modem
+ without a NetworkManager device reports an error. Both did nothing
+ before.
+ .
+ CellularModem.operatorName: when the network sends no operator name,
+ ModemManager reports the network code (MCC and MNC) as the name; the name
+ of the provider of that network is then taken from the mobile broadband
+ provider database (MobileProviders::getNetworkProviderName(): the
+ provider marked as primary for the network, else the first one).
 Forwarded: no
-License: as the patched files (libs/cellular: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL)
+License: as the patched files (libs/cellular: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL; libs/editor: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL)
 Last-Update: 2026-11-25
 ---
 --- a/CMakeLists.txt
@@ -73,7 +90,7 @@ Last-Update: 2026-11-25
  #include "cellularsim.h"
  
  #include "plasma_nm_cellular.h"
-@@ -16,7 +17,12 @@
+@@ -16,7 +17,13 @@
  #include <KLocalizedString>
  #include <KUser>
  #include <NetworkManagerQt/Settings>
@@ -82,11 +99,17 @@ Last-Update: 2026-11-25
 +#include <QDBusMessage>
 +#include <QDBusObjectPath>
  #include <QDBusReply>
++#include <QHash>
 +#include <QPointer>
  
  using namespace Qt::Literals::StringLiterals;
  
-@@ -58,6 +64,7 @@ CellularModem::CellularModem(QObject *parent, ModemManager::ModemDevice::Ptr mmM
+@@ -54,10 +61,12 @@ CellularModem::CellularModem(QObject *parent, ModemManager::ModemDevice::Ptr mmM
+ 
+         // Signal strength and operator name from 3GPP
+         connect(m_mm3gppDevice.data(), &ModemManager::Modem3gpp::operatorNameChanged, this, &CellularModem::operatorNameChanged);
++        connect(m_mm3gppDevice.data(), &ModemManager::Modem3gpp::operatorCodeChanged, this, &CellularModem::operatorNameChanged);
+     }
  
      // Signal strength from modem interface
      connect(m_mmInterface.data(), &ModemManager::Modem::signalQualityChanged, this, &CellularModem::signalStrengthChanged);
@@ -94,7 +117,7 @@ Last-Update: 2026-11-25
  
      // SIM lock status
      connect(m_mmInterface.data(), &ModemManager::Modem::unlockRequiredChanged, this, &CellularModem::simLockedChanged);
-@@ -68,6 +75,9 @@ CellularModem::CellularModem(QObject *parent, ModemManager::ModemDevice::Ptr mmM
+@@ -68,6 +77,9 @@ CellularModem::CellularModem(QObject *parent, ModemManager::ModemDevice::Ptr mmM
      // find networkmanager modem, if it exists
      findNetworkManagerDevice();
  
@@ -104,7 +127,7 @@ Last-Update: 2026-11-25
      // we need to initialize it after m_mm3gppDevice has been set
      m_details = new CellularModemDetails(this, this);
  
-@@ -108,6 +118,44 @@ void CellularModem::findNetworkManagerDevice()
+@@ -108,6 +120,44 @@ void CellularModem::findNetworkManagerDevice()
      Q_EMIT mobileDataSupportedChanged();
  }
  
@@ -149,7 +172,17 @@ Last-Update: 2026-11-25
  CellularModemDetails *CellularModem::modemDetails() const
  {
      return m_details;
-@@ -222,28 +270,87 @@ void CellularModem::setMobileDataEnabled(bool enabled)
+@@ -200,6 +250,9 @@ void CellularModem::setMobileDataEnabled(bool enabled)
+     }
+ 
+     if (!m_nmModem) {
++        if (enabled) {
++            addError(i18n("Mobile data is not available with this modem."));
++        }
+         return;
+     }
+ 
+@@ -222,28 +275,94 @@ void CellularModem::setMobileDataEnabled(bool enabled)
              }
          }
  
@@ -164,6 +197,13 @@ Last-Update: 2026-11-25
 +        // of this modem and no other modem connects by itself
 +        for (auto other : others) {
 +            other->disableMobileData(latestCon.isNull() ? QString() : latestCon->uuid());
++        }
++
++        // no connection can be used with this SIM: add one with the APN of the provider of the SIM
++        if (latestCon.isNull() && m_nmModem->availableConnections().isEmpty()) {
++            if (!addDetectedProfileSettings()) {
++                addError(i18n("An APN needs to be configured to have mobile data."));
++            }
 +        }
 +
          // if we found the last used connection, set it to autoconnect and connect it immediately
@@ -246,7 +286,7 @@ Last-Update: 2026-11-25
  bool CellularModem::hasSim() const
  {
      if (!m_mmModem) {
-@@ -267,6 +374,33 @@ int CellularModem::signalStrength() const
+@@ -267,9 +386,60 @@ int CellularModem::signalStrength() const
      return m_mmInterface ? m_mmInterface->signalQuality().signal : 0;
  }
  
@@ -279,8 +319,36 @@ Last-Update: 2026-11-25
 +
  QString CellularModem::operatorName() const
  {
-     return m_mm3gppDevice ? m_mm3gppDevice->operatorName() : QString{};
-@@ -317,6 +451,7 @@ void CellularModem::refreshSims()
+-    return m_mm3gppDevice ? m_mm3gppDevice->operatorName() : QString{};
++    if (!m_mm3gppDevice) {
++        return {};
++    }
++    const QString name = m_mm3gppDevice->operatorName();
++    const QString code = m_mm3gppDevice->operatorCode();
++    // without a name from the network, ModemManager reports the network code (MCC and MNC) as the name
++    if (!code.isEmpty() && (name.isEmpty() || name == code)) {
++        const QString providerName = networkProviderName(code);
++        if (!providerName.isEmpty()) {
++            return providerName;
++        }
++    }
++    return name;
++}
++
++QString CellularModem::networkProviderName(const QString &mccmnc)
++{
++    // the provider database is large, so it is read once and the names found are kept
++    static QHash<QString, QString> names;
++    auto it = names.constFind(mccmnc);
++    if (it == names.constEnd()) {
++        static MobileProviders mobileProviders{};
++        it = names.insert(mccmnc, mobileProviders.getNetworkProviderName(mccmnc));
++    }
++    return *it;
+ }
+ 
+ QStringList CellularModem::errors() const
+@@ -317,6 +487,7 @@ void CellularModem::refreshSims()
  
      // Connect error signals from all SIMs
      for (auto sim : m_sims) {
@@ -288,7 +356,7 @@ Last-Update: 2026-11-25
          connect(sim, &CellularSim::errorOccurred, this, &CellularModem::addError);
      }
  
-@@ -389,6 +524,9 @@ QCoro::Task<void> CellularModem::addProfile(QString name, QString apn, QString u
+@@ -389,6 +560,9 @@ QCoro::Task<void> CellularModem::addProfile(QString name, QString apn, QString u
      gsmSetting->setPasswordFlags(password.isEmpty() ? NetworkManager::Setting::NotRequired : NetworkManager::Setting::AgentOwned);
      gsmSetting->setNetworkType(CellularConnectionProfile::networkTypeFlag(networkType));
      gsmSetting->setHomeOnly(true); // New profiles default to roaming disabled
@@ -298,7 +366,41 @@ Last-Update: 2026-11-25
  
      gsmSetting->setInitialized(true);
  
-@@ -516,6 +654,21 @@ QList<CellularSim *> CellularModem::sims()
+@@ -459,21 +633,21 @@ QCoro::Task<void> CellularModem::updateProfile(QString connectionUni, QString na
+     }
+ }
+ 
+-void CellularModem::addDetectedProfileSettings()
++bool CellularModem::addDetectedProfileSettings()
+ {
+     if (!m_mmModem) {
+         qCWarning(PLASMA_NM_CELLULAR_LOG) << "ModemManager device missing, cannot detect profile settings";
+-        return;
++        return false;
+     }
+ 
+     if (!hasSim() || !m_mmModem->sim()) {
+         qCWarning(PLASMA_NM_CELLULAR_LOG) << "No SIM found, cannot detect profile settings";
+-        return;
++        return false;
+     }
+ 
+     if (!m_mm3gppDevice) {
+         qCWarning(PLASMA_NM_CELLULAR_LOG) << "3gpp object not found, cannot detect profile settings";
+-        return;
++        return false;
+     }
+ 
+     bool found = false;
+@@ -509,6 +683,7 @@ void CellularModem::addDetectedProfileSettings()
+         qCDebug(PLASMA_NM_CELLULAR_LOG) << "No profiles were found.";
+         Q_EMIT couldNotAutodetectSettings();
+     }
++    return found;
+ }
+ 
+ QList<CellularSim *> CellularModem::sims()
+@@ -516,6 +691,21 @@ QList<CellularSim *> CellularModem::sims()
      return m_sims;
  }
  
@@ -331,16 +433,18 @@ Last-Update: 2026-11-25
  
      Q_PROPERTY(bool hasSim READ hasSim NOTIFY hasSimChanged)
      Q_PROPERTY(bool simLocked READ simLocked NOTIFY simLockedChanged)
-@@ -54,6 +56,8 @@ class PLASMANM_CELLULAR_EXPORT CellularModem : public QObject
+@@ -54,6 +56,10 @@ class PLASMANM_CELLULAR_EXPORT CellularModem : public QObject
      Q_PROPERTY(bool needsAPNAdded READ needsAPNAdded NOTIFY mobileDataEnabledChanged)
  
      Q_PROPERTY(int signalStrength READ signalStrength NOTIFY signalStrengthChanged)
 +    // radio access technology as named in the network-mobile-<strength>-<type> icons ("lte", "5g", ...), empty if none
 +    Q_PROPERTY(QString networkType READ networkType NOTIFY networkTypeChanged)
++    // name of the network operator; the name of the provider of the network from the mobile broadband provider
++    // database when the network sends no name
      Q_PROPERTY(QString operatorName READ operatorName NOTIFY operatorNameChanged)
  
      Q_PROPERTY(QStringList errors READ errors NOTIFY errorsChanged)
-@@ -80,6 +84,7 @@ public:
+@@ -80,6 +86,7 @@ public:
      bool simEmpty() const;
  
      int signalStrength() const;
@@ -348,8 +452,13 @@ Last-Update: 2026-11-25
      QString operatorName() const;
  
      QStringList errors() const;
-@@ -93,6 +98,12 @@ public:
-     Q_INVOKABLE void addDetectedProfileSettings(); // detect modem connection settings (ex. apn) and add a new connection
+@@ -90,9 +97,16 @@ public:
+     Q_INVOKABLE QCoro::Task<void> addProfile(QString name, QString apn, QString username, QString password, QString networkType);
+     Q_INVOKABLE QCoro::Task<void> removeProfile(const QString &connectionUni);
+     Q_INVOKABLE QCoro::Task<void> updateProfile(QString connectionUni, QString name, QString apn, QString username, QString password, QString networkType);
+-    Q_INVOKABLE void addDetectedProfileSettings(); // detect modem connection settings (ex. apn) and add a new connection
++    // detect modem connection settings (ex. apn) and add a new connection, returns whether settings were found
++    Q_INVOKABLE bool addDetectedProfileSettings();
  
      QList<CellularSim *> sims();
 +    CellularSim *sim() const;
@@ -361,7 +470,7 @@ Last-Update: 2026-11-25
  
      ModemManager::ModemDevice::Ptr mmModemDevice();
      NetworkManager::ModemDevice::Ptr nmModemDevice();
-@@ -109,10 +120,12 @@ Q_SIGNALS:
+@@ -109,10 +123,12 @@ Q_SIGNALS:
      void mobileDataEnabledChanged();
      void mobileDataSupportedChanged();
      void simsChanged();
@@ -374,17 +483,19 @@ Last-Update: 2026-11-25
      void operatorNameChanged();
      void errorsChanged();
      void errorOccurred(const QString &message);
-@@ -120,6 +133,9 @@ Q_SIGNALS:
+@@ -120,6 +136,11 @@ Q_SIGNALS:
  
  private:
      void findNetworkManagerDevice();
 +    void loadSimSlot();
++    // name of the provider of a network (MCC and MNC) from the mobile broadband provider database
++    static QString networkProviderName(const QString &mccmnc);
 +    QList<CellularModem *> otherModems() const;
 +    QCoro::Task<void> bindConnectionToSim(NetworkManager::Connection::Ptr connection);
      void refreshSims();
      void refreshProfiles();
      void addError(const QString &message);
-@@ -133,5 +149,6 @@ private:
+@@ -133,5 +154,6 @@ private:
      ModemManager::Modem3gpp::Ptr m_mm3gppDevice = nullptr; // may be nullptr if no sim is inserted
  
      QList<CellularSim *> m_sims;
@@ -409,15 +520,23 @@ Last-Update: 2026-11-25
  CellularModemList::CellularModemList(QObject *parent)
      : QObject{parent}
  {
-@@ -17,6 +23,7 @@ CellularModemList::CellularModemList(QObject *parent)
+@@ -17,6 +23,15 @@ CellularModemList::CellularModemList(QObject *parent)
  
      connect(ModemManager::notifier(), &ModemManager::Notifier::modemAdded, this, &CellularModemList::updateModemList);
      connect(ModemManager::notifier(), &ModemManager::Notifier::modemRemoved, this, &CellularModemList::updateModemList);
 +    connect(SimIdentities::instance(), &SimIdentities::changed, this, &CellularModemList::updateDefaultModem);
++
++    // a modem that does not connect within two minutes is no longer shown as the one for mobile data
++    m_requestedDataSimTimer.setSingleShot(true);
++    m_requestedDataSimTimer.setInterval(std::chrono::minutes(2));
++    connect(&m_requestedDataSimTimer, &QTimer::timeout, this, [this]() {
++        setRequestedDataSim(QString());
++        updateDataModem();
++    });
  }
  
  QList<CellularModem *> CellularModemList::modems() const
-@@ -32,6 +39,157 @@ CellularModem *CellularModemList::primaryModem() const
+@@ -32,6 +47,191 @@ CellularModem *CellularModemList::primaryModem() const
      return nullptr;
  }
  
@@ -432,8 +551,28 @@ Last-Update: 2026-11-25
 +        return;
 +    }
 +    // enabling mobile data on a modem disables it on the other ones
++    setRequestedDataSim(modem->simIdentifier());
 +    modem->setMobileDataEnabled(true);
 +    updateDataModem();
++}
++
++bool CellularModemList::dataModemSwitching() const
++{
++    return !m_requestedDataSim.isEmpty();
++}
++
++void CellularModemList::setRequestedDataSim(const QString &simIdentifier)
++{
++    if (m_requestedDataSim == simIdentifier) {
++        return;
++    }
++    m_requestedDataSim = simIdentifier;
++    if (simIdentifier.isEmpty()) {
++        m_requestedDataSimTimer.stop();
++    } else {
++        m_requestedDataSimTimer.start();
++    }
++    Q_EMIT dataModemSwitchingChanged();
 +}
 +
 +static bool isActivating(CellularModem *modem)
@@ -482,11 +621,25 @@ Last-Update: 2026-11-25
 +{
 +    CellularModem *dataModem = nullptr;
 +
++    // the modem chosen for mobile data, until it is connected
++    if (!m_requestedDataSim.isEmpty()) {
++        for (auto modem : std::as_const(m_modemList)) {
++            if (modem->simIdentifier() == m_requestedDataSim) {
++                dataModem = modem;
++                break;
++            }
++        }
++        if (dataModem && dataModem->nmModemDevice() && dataModem->nmModemDevice()->state() == NetworkManager::Device::Activated) {
++            setRequestedDataSim(QString());
++        }
++    }
 +    // the modem that is connected or connecting
-+    for (auto modem : std::as_const(m_modemList)) {
-+        if (isActivating(modem)) {
-+            dataModem = modem;
-+            break;
++    if (!dataModem) {
++        for (auto modem : std::as_const(m_modemList)) {
++            if (isActivating(modem)) {
++                dataModem = modem;
++                break;
++            }
 +        }
 +    }
 +    // the modem that connects by itself, with a connection bound to its SIM first
@@ -575,7 +728,7 @@ Last-Update: 2026-11-25
  bool CellularModemList::modemAvailable() const
  {
      return !m_modemList.empty();
-@@ -49,6 +207,8 @@ QList<CellularSim *> CellularModemList::sims() const
+@@ -49,6 +249,8 @@ QList<CellularSim *> CellularModemList::sims() const
  void CellularModemList::updateModemList()
  {
      // Clean up old modems
@@ -584,7 +737,7 @@ Last-Update: 2026-11-25
      qDeleteAll(m_modemList);
      m_modemList.clear();
  
-@@ -59,6 +219,11 @@ void CellularModemList::updateModemList()
+@@ -59,6 +261,14 @@ void CellularModemList::updateModemList()
  
          auto cellModem = new CellularModem(this, device, modem);
          connect(cellModem, &CellularModem::simsChanged, this, &CellularModemList::simsChanged);
@@ -593,10 +746,13 @@ Last-Update: 2026-11-25
 +        connect(cellModem, &CellularModem::profilesChanged, this, &CellularModemList::updateDataModem);
 +        connect(cellModem, &CellularModem::simsChanged, this, &CellularModemList::updateDefaultModem);
 +        connect(cellModem, &CellularModem::simSlotChanged, this, &CellularModemList::updateDefaultModem);
++        connect(cellModem, &CellularModem::errorOccurred, this, &CellularModemList::errorOccurred);
++        // the SIM identifier of a new modem is known once its SIM is
++        connect(cellModem, &CellularModem::simsChanged, this, &CellularModemList::updateDataModem);
          m_modemList.push_back(cellModem);
      }
  
-@@ -66,8 +231,13 @@ void CellularModemList::updateModemList()
+@@ -66,8 +276,13 @@ void CellularModemList::updateModemList()
          qCDebug(PLASMA_NM_CELLULAR_LOG) << "No modems found.";
      }
  
@@ -612,24 +768,37 @@ Last-Update: 2026-11-25
  }
 --- a/libs/cellular/cellularmodemlist.h
 +++ b/libs/cellular/cellularmodemlist.h
-@@ -24,6 +24,10 @@ class PLASMANM_CELLULAR_EXPORT CellularModemList : public QObject
+@@ -10,6 +10,7 @@
+ 
+ #include <QList>
+ #include <QObject>
++#include <QTimer>
+ #include <QtQmlIntegration>
+ 
+ #include <ModemManagerQt/Manager>
+@@ -24,6 +25,14 @@ class PLASMANM_CELLULAR_EXPORT CellularModemList : public QObject
      QML_ELEMENT
      Q_PROPERTY(QList<CellularModem *> modems READ modems NOTIFY modemsChanged)
      Q_PROPERTY(CellularModem *primaryModem READ primaryModem NOTIFY primaryModemChanged)
-+    // the modem used for mobile data: the one connected or set to connect by itself, else the one used last
++    // the modem used for mobile data: the one chosen with setDataModem() while it connects, else the one connected or
++    // set to connect by itself, else the one used last
 +    Q_PROPERTY(CellularModem *dataModem READ dataModem NOTIFY dataModemChanged)
++    // whether the modem chosen with setDataModem() is not connected yet (for at most two minutes): while mobile data
++    // moves to another SIM, modems may disappear and come back
++    Q_PROPERTY(bool dataModemSwitching READ dataModemSwitching NOTIFY dataModemSwitchingChanged)
 +    // the modem with the SIM for calls and text messages: the chosen SIM if inserted, else the SIM in the first slot
 +    Q_PROPERTY(CellularModem *defaultModem READ defaultModem NOTIFY defaultModemChanged)
      Q_PROPERTY(bool modemAvailable READ modemAvailable NOTIFY modemAvailableChanged)
      Q_PROPERTY(QList<CellularSim *> sims READ sims NOTIFY simsChanged)
  
-@@ -32,17 +36,29 @@ public:
+@@ -32,17 +41,37 @@ public:
  
      QList<CellularModem *> modems() const;
      CellularModem *primaryModem() const;
 +    CellularModem *dataModem() const;
 +    // makes the modem the one for mobile data and enables mobile data on it
 +    Q_INVOKABLE void setDataModem(CellularModem *modem);
++    bool dataModemSwitching() const;
 +    CellularModem *defaultModem() const;
 +    // makes the SIM of the modem the one for calls and text messages
 +    Q_INVOKABLE void setDefaultModem(CellularModem *modem);
@@ -640,18 +809,25 @@ Last-Update: 2026-11-25
      void modemsChanged();
      void primaryModemChanged();
 +    void dataModemChanged();
++    void dataModemSwitchingChanged();
 +    void defaultModemChanged();
      void modemAvailableChanged();
      void simsChanged();
++    // an error of one of the modems or of their SIMs
++    void errorOccurred(const QString &message);
  
  private:
      void updateModemList();
 +    void updateDataModem();
 +    void updateDefaultModem();
++    void setRequestedDataSim(const QString &simIdentifier);
  
      QList<CellularModem *> m_modemList;
 +    CellularModem *m_dataModem = nullptr;
 +    CellularModem *m_defaultModem = nullptr;
++    // SIM (ICCID) of the modem chosen with setDataModem() until it is connected
++    QString m_requestedDataSim;
++    QTimer m_requestedDataSimTimer;
  };
 --- a/libs/cellular/cellularsim.cpp
 +++ b/libs/cellular/cellularsim.cpp
@@ -970,3 +1146,50 @@ Last-Update: 2026-11-25
 +    KSharedConfig::Ptr m_config;
 +    KConfigWatcher::Ptr m_watcher;
 +};
+--- a/libs/editor/mobileproviders.cpp
++++ b/libs/editor/mobileproviders.cpp
+@@ -279,6 +279,33 @@ QStringList MobileProviders::getProvidersFromMCCMNC(const QString &targetMccMnc)
+     return result;
+ }
+ 
++QString MobileProviders::getNetworkProviderName(const QString &targetMccMnc)
++{
++    QString first;
++
++    for (QDomNode n = docElement.firstChild(); !n.isNull(); n = n.nextSibling()) {
++        for (QDomNode n2 = n.firstChild(); !n2.isNull(); n2 = n2.nextSibling()) {
++            QDomElement e2 = n2.toElement(); // <provider ...>
++            if (e2.isNull() || e2.tagName().toLower() != QLatin1String("provider")) {
++                continue;
++            }
++
++            ProviderData data = parseProvider(e2);
++            if (!data.mccmncs.contains(targetMccMnc)) {
++                continue;
++            }
++            if (e2.attribute(QStringLiteral("primary")) == QLatin1String("true")) {
++                return data.name;
++            }
++            if (first.isEmpty()) {
++                first = data.name;
++            }
++        }
++    }
++
++    return first;
++}
++
+ QStringList MobileProviders::getNetworkIds(const QString &provider)
+ {
+     if (mNetworkIds.isEmpty()) {
+--- a/libs/editor/mobileproviders.h
++++ b/libs/editor/mobileproviders.h
+@@ -50,6 +50,8 @@ public:
+     QVariantMap getApnInfo(const QString &apn);
+     QVariantMap getCdmaInfo(const QString &provider);
+     QStringList getProvidersFromMCCMNC(const QString &mccmnc);
++    // name of the provider that runs the network: the one marked as primary, else the first one, empty if none
++    QString getNetworkProviderName(const QString &mccmnc);
+     QString getGsmNumber() const
+     {
+         return QStringLiteral("*99#");
