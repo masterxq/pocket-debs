@@ -15,7 +15,10 @@ Description:
  setting and the initial setup follow the modem chosen for mobile data
  (CellularModemList.dataModem) and name its SIM. While modems go away and
  come back (a modem object restarted by ModemManager) the quick setting
- shows "Not Available" instead of failing on a missing modem.
+ shows "Not Available" instead of failing on a missing modem. The signal
+ indicator lets its row take the implicit widths of the icons and the
+ label instead of binding widths to them (binding loop on the width of the
+ label).
  .
  Needs the cellular library of plasma-nm with CellularModemList.dataModem,
  CellularModem.sim/simSlot/networkType and CellularSim.name.
@@ -82,7 +85,7 @@ Last-Update: 2026-11-25
                          implicitHeight: mainRow.rowHeight
 --- a/components/mobileshell/qml/statusbar/indicators/SignalStrengthIndicator.qml
 +++ b/components/mobileshell/qml/statusbar/indicators/SignalStrengthIndicator.qml
-@@ -14,40 +14,63 @@ import org.kde.kirigami as Kirigami
+@@ -14,40 +14,62 @@ import org.kde.kirigami as Kirigami
  import org.kde.plasma.private.mobileshell as MobileShell
  
  Item {
@@ -101,8 +104,8 @@ Last-Update: 2026-11-25
  
 -    width: strengthIcon.width + label.width
 -    Layout.minimumWidth: strengthIcon.width + label.width
++    // the row takes the implicit width of each visible item, no width is bound to an implicit width
 +    implicitWidth: row.width
-+    width: row.width
 +    Layout.minimumWidth: row.width
  
 -    Kirigami.Icon {
@@ -120,7 +123,7 @@ Last-Update: 2026-11-25
 -        source: MobileShell.SignalStrengthInfo.icon
 +        Kirigami.Icon {
 +            id: strengthIcon
-+            width: visible ? height : 0
++            width: height
 +            height: row.height
  
 -        // don't show mobile indicator icon if the networkmanager one is already showing
@@ -147,8 +150,7 @@ Last-Update: 2026-11-25
 +
 +        PlasmaComponents.Label {
 +            id: label
-+            visible: showLabel
-+            width: visible ? implicitWidth : 0
++            visible: root.showLabel && text.length > 0
 +            anchors.verticalCenter: parent.verticalCenter
  
 -    PlasmaComponents.Label {
