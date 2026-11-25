@@ -1,0 +1,30 @@
+Description: panvk: enable the MT6785 Mali-G76 MC4 by default
+ Keep the experimental opt-in for other devices and retain the Vulkan
+ non-conformance warning. This downstream change targets Mesa 26.3,
+ which exposes Vulkan 1.3 on Bifrost.
+Author: pocket-debs
+Forwarded: no
+License: MIT (as the patched file)
+Last-Update: 2026-11-24
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -452,8 +452,18 @@
+    }
+ 
+    switch (arch) {
++   case 7:
++      /* The MT6785 Mali-G76 MC4 is enabled by the Lisbon build. */
++      if (device->model->gpu_prod_id == PAN_PROD_ID(7, 2, 1) &&
++          core_count == 4 && drm_device->bustype == DRM_BUS_PLATFORM &&
++          drm_device->deviceinfo.platform &&
++          drm_device->deviceinfo.platform->compatible &&
++          drm_device->deviceinfo.platform->compatible[0] &&
++          !strcmp(drm_device->deviceinfo.platform->compatible[0],
++                  "mediatek,mt6785-mali"))
++         break;
++      FALLTHROUGH;
+    case 6:
+-   case 7:
+    case 11:
+    case 14:
+       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {

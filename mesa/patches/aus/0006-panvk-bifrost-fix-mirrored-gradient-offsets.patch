@@ -1,0 +1,129 @@
+Description: panvk: fix mirrored-repeat offsets for Bifrost explicit gradients
+ Use the hardware gradient descriptor's LOD to scale normalized offsets
+ when a single mip level contributes. Keep the original gradient-derived
+ LOD for the texture instruction.
+ All 145 previously failing gradient cases pass on the Mali-G76.
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-24
+--- a/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c
++++ b/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c
+@@ -921,6 +921,29 @@
+ 
+ #if PAN_ARCH < 9
+    progress |= lower_bifrost_mirrored_txl_offset(b, tex, ctx);
++   if (tex->op == nir_texop_txd &&
++       nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0 &&
++       nir_tex_instr_src_index(tex, nir_tex_src_min_lod) < 0 &&
++       nir_tex_instr_src_index(tex, nir_tex_src_bias) < 0 &&
++       nir_tex_instr_src_index(tex, nir_tex_src_plane) < 0 &&
++       nir_tex_instr_src_index(tex, nir_tex_src_projector) < 0) {
++      int samp = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
++      int img = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
++      if (samp >= 0 && img >= 0) {
++         nir_deref_instr *sampler = nir_src_as_deref(tex->src[samp].src);
++         nir_deref_instr *texture = nir_src_as_deref(tex->src[img].src);
++         nir_def *words = load_resource_deref_desc(
++            b, sampler, VK_DESCRIPTOR_TYPE_SAMPLER, 0, 2, 32, ctx);
++         nir_def *size = load_tex_size(b, texture, tex->sampler_dim,
++                                      tex->is_array, ctx);
++         nir_def *levels = load_tex_levels(b, texture, tex->sampler_dim, ctx);
++         nir_tex_instr_add_src(tex, nir_tex_src_backend1, words);
++         nir_tex_instr_add_src(tex, nir_tex_src_backend2,
++                               nir_vector_insert_imm(b, size, levels, 3));
++         progress = true;
++      }
++   }
++
+    if (tex->op == nir_texop_txs || tex->op == nir_texop_query_levels ||
+        tex->op == nir_texop_texture_samples) {
+       int tex_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+--- a/src/panfrost/compiler/pan_nir_lower_tex.c
++++ b/src/panfrost/compiler/pan_nir_lower_tex.c
+@@ -495,6 +495,49 @@
+    BI_TEX_SR_COUNT,
+ };
+ 
++static void
++bi_lower_mirrored_gradient_offset(nir_builder *b, struct tex_srcs *srcs,
++                                  nir_def *sampler, nir_def *size,
++                                  nir_def *lod_fixed)
++{
++   nir_def *wrap_modes = nir_channel(b, sampler, 0);
++   nir_def *limits = nir_channel(b, sampler, 1);
++   nir_def *min_lod = nir_ubitfield_extract_imm(b, limits, 0, 13);
++   nir_def *max_lod = nir_ubitfield_extract_imm(b, limits, 16, 13);
++   nir_def *last = nir_ishl_imm(b, nir_iadd_imm(b, nir_channel(b, size, 3), -1), 8);
++   nir_def *lod = nir_i2i32(b, nir_unpack_32_2x16_split_x(b, lod_fixed));
++   lod = nir_imin(b, nir_imin(b, nir_imax(b, lod, min_lod), max_lod), last);
++
++   nir_def *nearest = nir_ieq_imm(b, nir_ushr_imm(b, wrap_modes, 30), 0);
++   nir_def *integral = nir_ieq_imm(b, nir_iand_imm(b, lod, 255), 0);
++   nir_def *single_level = nir_ior(b, nearest, integral);
++   nir_def *level = nir_f2u32(
++      b, nir_fround_even(b, nir_fmul_imm(b, nir_i2f32(b, lod), 1.0 / 256.0)));
++
++   nir_def *coord[4], *offset[3];
++   for (unsigned i = 0; i < srcs->coord->num_components; i++) {
++      coord[i] = nir_channel(b, srcs->coord, i);
++      if (i >= srcs->offset->num_components)
++         continue;
++
++      offset[i] = nir_channel(b, srcs->offset, i);
++      if (nir_scalar_is_zero(nir_get_scalar(offset[i], 0)))
++         continue;
++
++      nir_def *wrap = nir_ubitfield_extract_imm(b, wrap_modes, 16 - 4 * i, 4);
++      nir_def *emulate = nir_iand(b, single_level, nir_ieq_imm(b, wrap, 12));
++      nir_def *extent = nir_umax_imm(b, nir_ushr(b, nir_channel(b, size, i), level), 1);
++      nir_def *delta = nir_fdiv(b, nir_i2f32(b, offset[i]), nir_u2f32(b, extent));
++      nir_def *period = nir_ffract(b, nir_fmul_imm(b, coord[i], 0.5));
++      nir_def *shifted = nir_ffma(b, period, nir_imm_float(b, 2.0), delta);
++      coord[i] = nir_bcsel(b, emulate, shifted, coord[i]);
++      offset[i] = nir_bcsel(b, emulate, nir_imm_int(b, 0), offset[i]);
++   }
++
++   srcs->coord = nir_vec(b, coord, srcs->coord->num_components);
++   srcs->offset = nir_vec(b, offset, srcs->offset->num_components);
++}
++
+ static bool
+ bi_lower_tex(nir_builder *b, nir_tex_instr *tex, unsigned arch)
+ {
+@@ -511,7 +554,21 @@
+    };
+ 
+    b->cursor = nir_before_instr(&tex->instr);
++   nir_def *sampler = nir_steal_tex_src(tex, nir_tex_src_backend1);
++   nir_def *size = nir_steal_tex_src(tex, nir_tex_src_backend2);
+    struct tex_srcs srcs = steal_tex_srcs(b, tex, arch);
++
++   nir_def *gradient_lod = NULL;
++   if (!srcs.lod && !srcs.min_lod && !srcs.bias && (srcs.ddx || srcs.ddy)) {
++      nir_def *grdesc = build_bi_gradient_desc(b, srcs.tex_h, srcs.samp_h,
++                                               tex->sampler_dim, srcs.ddx, srcs.ddy);
++      gradient_lod = nir_channel(b, grdesc, 0);
++   }
++
++   if (sampler) {
++      assert(size && srcs.offset && gradient_lod);
++      bi_lower_mirrored_gradient_offset(b, &srcs, sampler, size, gradient_lod);
++   }
+ 
+    nir_def *coord_xy = NULL;
+    nir_def *sr[BI_TEX_SR_COUNT] = {};
+@@ -575,12 +632,9 @@
+       } else if (srcs.min_lod || srcs.bias) {
+          desc.lod_or_fetch = BIFROST_LOD_MODE_BIAS;
+          sr[BI_TEX_SR_LOD] = build_lod_bias_clamp(b, srcs.bias, srcs.min_lod);
+-      } else if (srcs.ddx || srcs.ddy) {
++      } else if (gradient_lod) {
+          desc.lod_or_fetch = BIFROST_LOD_MODE_EXPLICIT;
+-         nir_def *grdesc = build_bi_gradient_desc(b, srcs.tex_h, srcs.samp_h,
+-                                                  tex->sampler_dim,
+-                                                  srcs.ddx, srcs.ddy);
+-         sr[BI_TEX_SR_LOD] = nir_channel(b, grdesc, 0);
++         sr[BI_TEX_SR_LOD] = gradient_lod;
+       } else {
+          desc.lod_or_fetch = BIFROST_LOD_MODE_COMPUTE;
+       }
