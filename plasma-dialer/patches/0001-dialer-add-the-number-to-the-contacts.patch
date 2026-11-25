@@ -1,0 +1,112 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] dialer: add the entered number to the contacts
+Description:
+ The dialer page gets the action "Add to Contacts" in its header, next to
+ the settings; it is disabled while no number is entered. It asks for a
+ name and adds a contact with that name and the number through KPeople
+ (PersonPluginManager.addContact() with a vCard), so a number can be saved
+ without leaving the dialer.
+Forwarded: no
+License: LGPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-25
+---
+--- a/plasma-dialer/src/qml/DialerPage.qml
++++ b/plasma-dialer/src/qml/DialerPage.qml
+@@ -10,6 +10,7 @@ import QtQuick.Layouts
+ import QtQuick.Controls as QQC2
+ 
+ import org.kde.kirigami as Kirigami
++import org.kde.people as KPeople
+ import org.kde.telephony
+ import org.kde.plasma.dialer
+ 
+@@ -32,6 +33,15 @@ Kirigami.Page {
+     bottomPadding: 0
+ 
+     actions: [
++        Kirigami.Action {
++            id: addContactAction
++
++            icon.name: "contact-new-symbolic"
++            displayHint: Kirigami.DisplayHint.IconOnly
++            enabled: dialPad.number.length > 0 && !applicationWindow().lockscreenMode
++            text: i18nc("@action:intoolbar", "Add to Contacts")
++            onTriggered: addContactDialog.open()
++        },
+         Kirigami.Action {
+             id: settingsAction
+ 
+@@ -44,6 +54,72 @@ Kirigami.Page {
+         }
+     ]
+ 
++    // a new contact with the number of the dial pad
++    Kirigami.PromptDialog {
++        id: addContactDialog
++
++        // text value of a vCard property
++        function vCardText(value) {
++            return value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/,/g, "\\,").replace(/;/g, "\\;");
++        }
++
++        function addContact() {
++            const name = vCardText(contactName.text.trim());
++            const vcard = "BEGIN:VCARD\r\nVERSION:3.0\r\n"
++                + "FN:" + name + "\r\n"
++                + "N:;" + name + ";;;\r\n"
++                + "TEL;TYPE=CELL:" + vCardText(dialPad.number) + "\r\n"
++                + "END:VCARD\r\n";
++            if (KPeople.PersonPluginManager.addContact({ "vcard": vcard })) {
++                close();
++            } else {
++                addContactError.visible = true;
++            }
++        }
++
++        title: i18nc("@title:dialog", "Add to Contacts")
++        subtitle: CallUtils.formatNumber(dialPad.number)
++        standardButtons: Kirigami.Dialog.Cancel
++        customFooterActions: [
++            Kirigami.Action {
++                text: i18nc("@action:button", "Add")
++                icon.name: "contact-new-symbolic"
++                enabled: contactName.text.trim().length > 0
++                onTriggered: addContactDialog.addContact()
++            }
++        ]
++        onOpened: {
++            contactName.clear();
++            addContactError.visible = false;
++            contactName.forceActiveFocus();
++        }
++
++        ColumnLayout {
++            Layout.fillWidth: true
++            spacing: Kirigami.Units.smallSpacing
++
++            QQC2.TextField {
++                id: contactName
++
++                Layout.fillWidth: true
++                placeholderText: i18nc("@info:placeholder name of the new contact", "Name")
++                onAccepted: {
++                    if (text.trim().length > 0) {
++                        addContactDialog.addContact();
++                    }
++                }
++            }
++
++            Kirigami.InlineMessage {
++                id: addContactError
++
++                Layout.fillWidth: true
++                type: Kirigami.MessageType.Error
++                text: i18n("The contact could not be saved.")
++            }
++        }
++    }
++
+     ColumnLayout {
+         id: dialPadArea
+ 

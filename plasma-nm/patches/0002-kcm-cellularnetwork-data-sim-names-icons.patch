@@ -13,7 +13,17 @@ Description:
  named after its SIM instead of the object number.
  .
  While a modem goes away and comes back (e.g. a modem object restarted by
- ModemManager) the pages show no modem instead of failing on a missing one.
+ ModemManager) the pages show no modem instead of failing on a missing one;
+ while mobile data moves to another SIM they show that the SIM is being
+ switched. Errors of every modem are shown, not only those of the modem
+ for mobile data. A choice in a SIM selection is always passed on, after
+ it the selection shows the SIM actually in use. The list of SIMs is in
+ the order of the slots.
+ .
+ The mobile data switch passes on changes by the user only (toggled):
+ the flag that was to keep the switch from reacting to its own update was
+ never reset after a change that took effect, so the next tap on the
+ switch was ignored.
 Forwarded: no
 License: GPL-2.0-or-later (as the patched files)
 Last-Update: 2026-11-25
@@ -110,12 +120,14 @@ Last-Update: 2026-11-25
  
 --- a/kcms/kcm_cellularnetwork/ui/main.qml
 +++ b/kcms/kcm_cellularnetwork/ui/main.qml
-@@ -30,7 +30,43 @@ KCM.SimpleKCM {
+@@ -30,7 +30,47 @@ KCM.SimpleKCM {
          id: modemList
      }
  
 -    property Cellular.CellularModem selectedModem: modemList.primaryModem
 +    property Cellular.CellularModem selectedModem: modemList.dataModem
++
++    readonly property bool modemMissing: !enabledConnections.wwanHwEnabled || !availableDevices.modemDeviceAvailable || !modemList.modemAvailable
 +
 +    // every modem with a SIM, in the order of the SIM slots (SIMs without a known slot last)
 +    readonly property var simModems: modemList.modems
@@ -147,15 +159,57 @@ Last-Update: 2026-11-25
 +
 +        onActivated: index => {
 +            const modem = model[index] ? model[index].modem : null;
-+            if (modem && modem !== chosenModem) {
++            if (modem) {
 +                modemActivated(modem);
 +            }
++            // show the SIM actually in use, also when the choice did not take effect
++            Qt.callLater(() => simComboBox.syncCurrentIndex());
 +        }
 +    }
  
      PlasmaNM.Handler {
          id: nmHandler
-@@ -86,7 +122,7 @@ KCM.SimpleKCM {
+@@ -44,10 +84,9 @@ KCM.SimpleKCM {
+         id: enabledConnections
+     }
+ 
+-    // Forward error signals from modem to KCM messages
++    // Forward error signals from the modems to KCM messages
+     Connections {
+-        target: selectedModem
+-        enabled: selectedModem !== null
++        target: modemList
+         function onErrorOccurred(message) {
+             kcm.addMessage(InlineMessage.Error, message);
+         }
+@@ -63,15 +102,24 @@ KCM.SimpleKCM {
+         anchors.centerIn: parent
+         width: parent.width - Kirigami.Units.gridUnit * 4
+ 
+-        visible: !enabledConnections.wwanHwEnabled || !availableDevices.modemDeviceAvailable || !modemList.modemAvailable
++        visible: root.modemMissing && !modemList.dataModemSwitching
+         icon.name: "auth-sim-missing"
+         text: i18n("Modem not available")
+     }
+ 
++    // modems may disappear for a while when mobile data moves to another SIM
++    Kirigami.LoadingPlaceholder {
++        anchors.centerIn: parent
++        width: parent.width - Kirigami.Units.gridUnit * 4
++
++        visible: root.modemMissing && modemList.dataModemSwitching
++        text: i18n("Switching the SIM for mobile data…")
++    }
++
+     ColumnLayout {
+         spacing: 0
+         width: root.width
+-        visible: !noModem.visible
++        visible: !root.modemMissing
+ 
+         MessagesList {
+             Layout.fillWidth: true
+@@ -86,7 +134,7 @@ KCM.SimpleKCM {
                  id: mobileDataSwitch
                  text: i18n("Mobile data")
                  description: {
@@ -164,13 +218,34 @@ Last-Update: 2026-11-25
                          return "";
                      } else if (!selectedModem.hasSim) {
                          return i18n("No SIM is inserted.")
-@@ -115,14 +151,45 @@ KCM.SimpleKCM {
-                         return;
+@@ -99,30 +147,53 @@ KCM.SimpleKCM {
                      }
+                 }
  
+-                property bool manuallySet: false
+-                property bool shouldBeChecked: selectedModem && selectedModem.mobileDataEnabled
+-                onShouldBeCheckedChanged: {
+-                    checked = shouldBeChecked;
+-                }
++                readonly property bool shouldBeChecked: selectedModem !== null && selectedModem.mobileDataEnabled
++                // a toggle replaces the binding; the state of the modem is shown again once it reports it
++                onShouldBeCheckedChanged: checked = shouldBeChecked
+ 
+                 enabled: selectedModem && selectedModem.mobileDataSupported && !selectedModem.needsAPNAdded
+                 checked: shouldBeChecked
+ 
+-                onCheckedChanged: {
+-                    // prevent binding loops
+-                    if (manuallySet) {
+-                        manuallySet = false;
+-                        return;
+-                    }
+-
 -                    if (selectedModem.mobileDataEnabled != checked) {
-+                    if (selectedModem && selectedModem.mobileDataEnabled != checked) {
-                         manuallySet = true;
+-                        manuallySet = true;
++                // only a change by the user is passed on: checked also follows the modem
++                onToggled: {
++                    if (selectedModem && selectedModem.mobileDataEnabled !== checked) {
                          selectedModem.mobileDataEnabled = checked;
                      }
                  }
@@ -212,7 +287,17 @@ Last-Update: 2026-11-25
  
              FormCard.FormButtonDelegate {
                  id: dataUsageButton
-@@ -156,9 +223,9 @@ KCM.SimpleKCM {
+@@ -144,7 +215,8 @@ KCM.SimpleKCM {
+ 
+             Repeater {
+                 id: simsRepeater
+-                model: modemList.sims
++                // in the order of the SIM slots
++                model: root.simModems.map(modem => modem.sim)
+ 
+                 delegate: ColumnLayout {
+                     Layout.fillWidth: true
+@@ -156,9 +228,9 @@ KCM.SimpleKCM {
  
                      FormCard.FormButtonDelegate {
                          id: simDelegate
