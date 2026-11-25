@@ -1,0 +1,95 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] telephony: look the contact of a number up in the daemon
+Description:
+ The daemon keeps a map from the normalized phone numbers of all contacts
+ to their KPeople URIs (ContactPhoneNumberMapper), which handles numbers
+ written with and without country code. ContactUtils gets the D-Bus method
+ personUri(), the QML ContactUtils a call of it. The call screen uses it
+ instead of phoneNumberToContactUri(), which built a new PersonsModel and
+ parsed the vCard of every contact for each lookup and compared the digits
+ only.
+Forwarded: no
+License: LicenseRef-KDE-Accepted-GPL (as the patched files)
+Last-Update: 2026-11-25
+---
+--- a/kde-telephony-daemon/src/contact-utils.cpp
++++ b/kde-telephony-daemon/src/contact-utils.cpp
+@@ -37,6 +37,11 @@ QString ContactUtils::imageSource(const QString &contact)
+     return QString();
+ }
+ 
++QString ContactUtils::personUri(const QString &contact)
++{
++    return ContactPhoneNumberMapper::instance().uriForNumber(contact);
++}
++
+ void ContactUtils::changeCountryCode(const QString &countryCode)
+ {
+     ContactPhoneNumberMapper::instance().changeCountry(countryCode);
+--- a/kde-telephony-daemon/src/contact-utils.h
++++ b/kde-telephony-daemon/src/contact-utils.h
+@@ -18,5 +18,7 @@ public:
+ public Q_SLOTS:
+     QString displayString(const QString &contact);
+     QString imageSource(const QString &contact);
++    // KPeople URI of the contact with the phone number, empty if there is none
++    QString personUri(const QString &contact);
+     void changeCountryCode(const QString &countryCode);
+ };
+--- a/kde-telephony-meta/dbus-xmls/manual/org.kde.telephony.ContactUtils.xml
++++ b/kde-telephony-meta/dbus-xmls/manual/org.kde.telephony.ContactUtils.xml
+@@ -9,6 +9,10 @@
+       <arg name="contact" type="s" direction="in"/>
+       <arg name="imageSource" type="s" direction="out"/>
+     </method>
++    <method name="personUri">
++      <arg name="contact" type="s" direction="in"/>
++      <arg name="personUri" type="s" direction="out"/>
++    </method>
+     <method name="changeCountryCode">
+       <arg name="countryCode" type="s" direction="in"/>
+     </method>
+--- a/kde-telephony-plugin-declarative/src/declarative-contact-utils.cpp
++++ b/kde-telephony-plugin-declarative/src/declarative-contact-utils.cpp
+@@ -81,6 +81,18 @@ QString DeclarativeContactUtils::phoneNumberToContactUri(const QString &phoneNum
+     return {};
+ }
+ 
++QString DeclarativeContactUtils::personUri(const QString &phoneNumber)
++{
++    // the daemon keeps a map of the normalized numbers of all contacts
++    QDBusPendingReply<QString> reply = org::kde::telephony::ContactUtils::personUri(phoneNumber);
++    reply.waitForFinished();
++    if (reply.isError()) {
++        qDebug() << Q_FUNC_INFO << reply.error();
++        return {};
++    }
++    return reply.value();
++}
++
+ QString DeclarativeContactUtils::photoImageProviderUri(const QString &contactUri)
+ {
+     return u"image://kpeople-avatar/" % QString::fromUtf8(contactUri.toUtf8().toBase64()) % u"#" % QString::number(QRandomGenerator::system()->generate());
+--- a/kde-telephony-plugin-declarative/src/declarative-contact-utils.h
++++ b/kde-telephony-plugin-declarative/src/declarative-contact-utils.h
+@@ -21,6 +21,8 @@ public:
+     Q_INVOKABLE QString displayString(const QString &contact);
+     Q_INVOKABLE QVariantList phoneNumbers(const QString &kPeopleUri);
+     Q_INVOKABLE QString phoneNumberToContactUri(const QString &phoneNumber);
++    // KPeople URI of the contact with the phone number, empty if there is none
++    Q_INVOKABLE QString personUri(const QString &phoneNumber);
+     Q_INVOKABLE QString photoImageProviderUri(const QString &contactUri);
+     bool isValid() const;
+ 
+--- a/plasma-dialer/src/qml/call/ActiveCallView.qml
++++ b/plasma-dialer/src/qml/call/ActiveCallView.qml
+@@ -20,7 +20,7 @@ Item {
+     Layout.fillHeight: true
+     Layout.minimumHeight: parent.height / 2
+ 
+-    property string contactUri: ContactUtils.phoneNumberToContactUri(ActiveCallModel.communicationWith);
++    property string contactUri: ActiveCallModel.communicationWith !== "" ? ContactUtils.personUri(ActiveCallModel.communicationWith) : ""
+ 
+     KPeople.PersonData {
+         id: personData

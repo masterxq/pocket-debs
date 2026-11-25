@@ -1,0 +1,152 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] contacts: buttons to edit and to call a contact
+Description:
+ Each entry of the contacts page gets a button that opens the contact in
+ the contact view of the dialer and a button that calls the contact right
+ away; a tap on the entry still puts the number into the dial pad. For a
+ contact with several numbers the number is asked for first. The buttons
+ are flat, their icons are drawn in the text colour, and they are two and a
+ half grid units wide and high (RowIconButton), a touch target as Kirigami
+ asks for.
+ .
+ Builds on the contact view (patch 0001 of this series).
+Forwarded: no
+License: as the patched files (LGPL-2.0-or-later, LicenseRef-KDE-Accepted-GPL); new file components/RowIconButton.qml LGPL-2.0-or-later
+Last-Update: 2026-11-25
+---
+--- a/plasma-dialer/src/CMakeLists.txt
++++ b/plasma-dialer/src/CMakeLists.txt
+@@ -18,6 +18,7 @@ qt_target_qml_sources(plasma-dialer QML_FILES
+     qml/Main.qml
+     qml/components/Sidebar.qml
+     qml/components/BottomToolbar.qml
++    qml/components/RowIconButton.qml
+     qml/DialerPage.qml
+     qml/ContactsPage.qml
+     qml/HistoryPage.qml
+--- a/plasma-dialer/src/qml/ContactsPage.qml
++++ b/plasma-dialer/src/qml/ContactsPage.qml
+@@ -14,6 +14,7 @@ import org.kde.kirigamiaddons.components as Components
+ import org.kde.kirigamiaddons.delegates as Delegates
+ import org.kde.telephony
+ import "call"
++import "components"
+ 
+ Kirigami.ScrollablePage {
+     id: contactsPage
+@@ -41,6 +42,21 @@ Kirigami.ScrollablePage {
+         }
+     ]
+ 
++    // runs fn with the number of the contact, asks for one if the contact has several
++    function withNumber(personUri, title, fn) {
++        const phoneNumbers = ContactUtils.phoneNumbers(personUri);
++        if (phoneNumbers.length === 1) {
++            fn(phoneNumbers[0].normalizedNumber);
++        } else if (phoneNumbers.length > 1) {
++            const pop = callPopup.createObject(contactsPage, {
++                "numbers": phoneNumbers,
++                "title": title
++            });
++            pop.onNumberSelected.connect(fn);
++            pop.open();
++        }
++    }
++
+     Component {
+         id: callPopup
+ 
+@@ -95,21 +111,8 @@ Kirigami.ScrollablePage {
+             width: contactsList.width
+             implicitHeight: Kirigami.Units.iconSizes.medium + Kirigami.Units.largeSpacing * 2
+             verticalPadding: 0
+-            onReleased: {
+-                const phoneNumbers = ContactUtils.phoneNumbers(model.personUri);
+-                if (phoneNumbers.length === 1) {
+-                    applicationWindow().call(phoneNumbers[0].normalizedNumber);
+-                } else {
+-                    const pop = callPopup.createObject(this, {
+-                        "numbers": phoneNumbers,
+-                        "title": i18n("Select number to call")
+-                    });
+-                    pop.onNumberSelected.connect((number) => {
+-                        return applicationWindow().call(number);
+-                    });
+-                    pop.open();
+-                }
+-            }
++            // the number goes to the dial pad
++            onReleased: contactsPage.withNumber(model.personUri, i18n("Select number to call"), number => applicationWindow().call(number))
+ 
+             contentItem: RowLayout {
+                 spacing: Kirigami.Units.largeSpacing
+@@ -151,6 +154,22 @@ Kirigami.ScrollablePage {
+ 
+                 }
+ 
++                RowIconButton {
++                    iconSource: "document-edit"
++                    text: i18nc("@action:button", "Edit contact")
++                    enabled: !applicationWindow().lockscreenMode
++                    onClicked: applicationWindow().openContact(model.personUri, "")
++                }
++
++                RowIconButton {
++                    id: contactCallButton
++
++                    iconSource: "call-start"
++                    iconSize: Kirigami.Units.iconSizes.medium
++                    text: i18nc("@action:button", "Call")
++                    onClicked: contactsPage.withNumber(model.personUri, i18n("Select number to call"), number => CallUtils.dial(applicationWindow().selectModem(), number))
++                }
++
+             }
+ 
+         }
+--- /dev/null
++++ b/plasma-dialer/src/qml/components/RowIconButton.qml
+@@ -0,0 +1,43 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: LGPL-2.0-or-later
++
++import QtQuick
++import QtQuick.Controls as Controls
++import org.kde.kirigami as Kirigami
++
++// Flat icon button at the end of a list row. The icon is drawn in the text
++// colour; the button is at least two and a half grid units wide and high, a
++// touch target as Kirigami asks for.
++Controls.ToolButton {
++    id: button
++
++    // icon name, drawn as mask in the text colour
++    property string iconSource: "call-start"
++    // size of the icon
++    property real iconSize: Kirigami.Units.iconSizes.smallMedium
++
++    display: Controls.AbstractButton.IconOnly
++    implicitWidth: Math.max(Kirigami.Units.gridUnit * 2.5, iconSize + leftPadding + rightPadding)
++    implicitHeight: implicitWidth
++    Accessible.name: text
++    Controls.ToolTip.text: text
++    Controls.ToolTip.visible: hovered
++    Controls.ToolTip.delay: Kirigami.Units.toolTipDelay
++
++    contentItem: Item {
++        implicitWidth: button.iconSize
++        implicitHeight: button.iconSize
++
++        Kirigami.Icon {
++            id: icon
++
++            anchors.centerIn: parent
++            width: button.iconSize
++            height: button.iconSize
++            source: button.iconSource
++            isMask: true
++            color: Kirigami.Theme.textColor
++            opacity: button.enabled ? 1 : 0.4
++        }
++    }
++}

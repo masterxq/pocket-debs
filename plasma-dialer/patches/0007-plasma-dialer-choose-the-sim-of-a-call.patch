@@ -16,16 +16,18 @@ Description:
  default SIM and carries the icon of that SIM as a badge; the so far empty
  cell left of it holds a smaller, tinted call button for the other SIM, or
  with three and more SIMs one that opens a choice. One tap is one call,
- nothing is remembered. USSD goes through the default SIM. The call back
- button of the call history calls through the SIM of the call (the SIM
- identifier stored with each call) and shows it as a badge; the call
- button of a contact shows the default SIM. The call screen shows the icon
- and name of the SIM of the active call and controls the call through its
- modem (ActiveCallModel.account, the SIM identifier of the active call).
- With one SIM nothing changes.
+ nothing is remembered. USSD goes through the default SIM. In the call
+ history the button at the end of an entry shows the icon of the SIM of
+ the call instead of the handset, and calling back (tap on the entry or
+ the button) goes through that SIM (the SIM identifier stored with each
+ call). The call button of a contact carries the default SIM as badge,
+ drawn as a disc in the text colour so that it stands out on the list. The
+ call screen shows the icon and name of the SIM of the active call and
+ controls the call through its modem (ActiveCallModel.account, the SIM
+ identifier of the active call). With one SIM nothing changes.
  .
- Builds on the call buttons of the contacts page and of the call history
- (patches 0002 and 0003 of this series).
+ Builds on the contacts and history patches (0002 and 0004 of this
+ series).
 Forwarded: no
 License: as the patched files (LGPL-2.0-or-later, GPL-2.0-or-later, LicenseRef-KDE-Accepted-GPL); new files simutils.*, CallButton.qml, SimBadge.qml LGPL-2.0-or-later, simidentities.* LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
 Last-Update: 2026-11-25
@@ -106,7 +108,7 @@ Last-Update: 2026-11-25
 --- a/plasma-dialer/src/CMakeLists.txt
 +++ b/plasma-dialer/src/CMakeLists.txt
 @@ -6,6 +6,8 @@ set(dialer_SRCS
-     contactsapp.cpp
+     contacteditor.cpp
      lockscreenutils.cpp
      ringtoneutils.cpp
 +    simidentities.cpp
@@ -114,7 +116,7 @@ Last-Update: 2026-11-25
  )
  
  kconfig_add_kcfg_files(dialer_SRCS GENERATE_MOC config.kcfgc)
-@@ -37,6 +39,8 @@ qt_target_qml_sources(plasma-dialer QML_FILES
+@@ -39,6 +41,8 @@ qt_target_qml_sources(plasma-dialer QML_FILES
      qml/dialpad/Dialpad.qml
      qml/dialpad/DialerButton.qml
      qml/dialpad/DialerIconButton.qml
@@ -123,18 +125,18 @@ Last-Update: 2026-11-25
      qml/USSDSheet.qml
      qml/ImeiSheet.qml
      qml/PhoneNumberDialog.qml
-@@ -44,7 +48,7 @@ qt_target_qml_sources(plasma-dialer QML_FILES
+@@ -46,7 +50,7 @@ qt_target_qml_sources(plasma-dialer QML_FILES
  
  
  find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED Core Quick Qml QuickControls2 Multimedia)
--find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS Config Crash CoreAddons I18n DBusAddons KIO Service)
-+find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS Config Crash CoreAddons I18n DBusAddons KIO Service ModemManagerQt)
+-find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS Config Contacts Crash CoreAddons I18n DBusAddons People)
++find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS Config Contacts Crash CoreAddons I18n DBusAddons ModemManagerQt People)
  find_package(KF6KirigamiAddons 1.3 REQUIRED)
  
  if (DIALER_BUILD_SHELL_OVERLAY)
-@@ -80,6 +84,7 @@ target_link_libraries(plasma-dialer PRIVATE
-     Qt::Multimedia
-     KF6::ConfigGui
+@@ -84,6 +88,7 @@ target_link_libraries(plasma-dialer PRIVATE
+     KF6::Contacts
+     KF6::People
      KF6::CoreAddons
 +    KF6::ModemManagerQt
      KF6::Crash
@@ -142,45 +144,32 @@ Last-Update: 2026-11-25
      KF6::I18nQml
 --- a/plasma-dialer/src/qml/ContactsPage.qml
 +++ b/plasma-dialer/src/qml/ContactsPage.qml
-@@ -15,6 +15,7 @@ import org.kde.kirigamiaddons.delegates as Delegates
+@@ -13,6 +13,7 @@ import org.kde.people as KPeople
+ import org.kde.kirigamiaddons.components as Components
+ import org.kde.kirigamiaddons.delegates as Delegates
  import org.kde.telephony
- import org.kde.plasma.dialer
++import org.kde.plasma.dialer
  import "call"
-+import "dialpad"
+ import "components"
  
- Kirigami.ScrollablePage {
-     id: contactsPage
-@@ -159,16 +160,29 @@ Kirigami.ScrollablePage {
-                     Controls.ToolTip.delay: Kirigami.Units.toolTipDelay
+@@ -161,12 +162,16 @@ Kirigami.ScrollablePage {
+                     onClicked: applicationWindow().openContact(model.personUri, "")
                  }
  
 +                // with several SIMs the call goes through the default SIM, shown as badge
-                 Controls.ToolButton {
+                 RowIconButton {
                      id: contactCallButton
  
 +                    readonly property var defaultSim: SimUtils.sims.length > 1 ? SimUtils.simForDevice(SimUtils.defaultDeviceUni) : ({})
 +
-                     display: Controls.AbstractButton.IconOnly
-                     icon.name: "call-start"
+                     iconSource: "call-start"
+                     iconSize: Kirigami.Units.iconSizes.medium
 -                    text: i18nc("@action:button", "Call")
++                    badgeIcon: defaultSim.icon || ""
 +                    text: defaultSim.name ? i18nc("@action:button", "Call through %1", defaultSim.name) : i18nc("@action:button", "Call")
                      onClicked: contactsPage.withNumber(model.personUri, i18n("Select number to call"), number => CallUtils.dial(applicationWindow().selectModem(), number))
-                     Controls.ToolTip.text: text
-                     Controls.ToolTip.visible: hovered
-                     Controls.ToolTip.delay: Kirigami.Units.toolTipDelay
-+
-+                    SimBadge {
-+                        anchors.right: parent.right
-+                        anchors.bottom: parent.bottom
-+                        anchors.rightMargin: Math.round(contactCallButton.rightPadding / 2)
-+                        anchors.bottomMargin: Math.round(contactCallButton.bottomPadding / 2)
-+                        visible: simIcon !== ""
-+                        size: Math.round(Kirigami.Units.iconSizes.smallMedium * 0.8)
-+                        simIcon: contactCallButton.defaultSim.icon || ""
-+                    }
                  }
  
-             }
 --- a/plasma-dialer/src/qml/Main.qml
 +++ b/plasma-dialer/src/qml/Main.qml
 @@ -90,6 +90,7 @@ Kirigami.ApplicationWindow {
@@ -200,7 +189,7 @@ Last-Update: 2026-11-25
 +        return deviceUniList.includes(deviceUni) ? deviceUni : deviceUniList[0];
      }
  
-     function call(number) {
+     // view of the contact personUri; without personUri a new contact with the number
 --- a/plasma-dialer/src/qml/call/ActiveCallView.qml
 +++ b/plasma-dialer/src/qml/call/ActiveCallView.qml
 @@ -10,6 +10,7 @@ import org.kde.kirigami as Kirigami
@@ -255,6 +244,43 @@ Last-Update: 2026-11-25
      }
  
      function activeCallUni() {
+--- a/plasma-dialer/src/qml/components/RowIconButton.qml
++++ b/plasma-dialer/src/qml/components/RowIconButton.qml
+@@ -5,6 +5,8 @@ import QtQuick
+ import QtQuick.Controls as Controls
+ import org.kde.kirigami as Kirigami
+ 
++import "../dialpad"
++
+ // Flat icon button at the end of a list row. The icon is drawn in the text
+ // colour; the button is at least two and a half grid units wide and high, a
+ // touch target as Kirigami asks for.
+@@ -15,6 +17,8 @@ Controls.ToolButton {
+     property string iconSource: "call-start"
+     // size of the icon
+     property real iconSize: Kirigami.Units.iconSizes.smallMedium
++    // icon of a SIM shown as badge on the icon, empty for no badge
++    property string badgeIcon: ""
+ 
+     display: Controls.AbstractButton.IconOnly
+     implicitWidth: Math.max(Kirigami.Units.gridUnit * 2.5, iconSize + leftPadding + rightPadding)
+@@ -39,5 +43,16 @@ Controls.ToolButton {
+             color: Kirigami.Theme.textColor
+             opacity: button.enabled ? 1 : 0.4
+         }
++
++        // filled with the text colour, readable on any list background
++        SimBadge {
++            visible: button.badgeIcon !== ""
++            contrast: true
++            size: Math.round(button.iconSize * 0.7)
++            x: icon.x + icon.width - Math.round(width * 0.7)
++            y: icon.y + icon.height - Math.round(height * 0.7)
++            simIcon: button.badgeIcon
++            opacity: button.enabled ? 1 : 0.4
++        }
+     }
+ }
 --- /dev/null
 +++ b/plasma-dialer/src/qml/dialpad/CallButton.qml
 @@ -0,0 +1,56 @@
@@ -444,7 +470,7 @@ Last-Update: 2026-11-25
      DialerIconButton {
 --- /dev/null
 +++ b/plasma-dialer/src/qml/dialpad/SimBadge.qml
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,46 @@
 +// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
 +// SPDX-License-Identifier: LGPL-2.0-or-later
 +
@@ -452,7 +478,9 @@ Last-Update: 2026-11-25
 +import org.kde.kirigami as Kirigami
 +
 +// Badge with the icon of a SIM (or three dots for a choice of SIMs), placed
-+// on a call button: ring in the window colour, disc, icon.
++// on a call button: ring in the window colour, disc, icon. With contrast the
++// disc has the text colour and the icon the window colour, for badges on
++// symbols in the text colour (list rows).
 +Rectangle {
 +    id: badge
 +
@@ -460,6 +488,8 @@ Last-Update: 2026-11-25
 +    property string simIcon: ""
 +    // three dots instead of a SIM icon
 +    property bool showChoice: false
++    // disc in the text colour, icon in the window colour
++    property bool contrast: false
 +    // outer diameter, diameter of the disc and size of the icon
 +    property real size: Kirigami.Units.iconSizes.small
 +    property real discSize: size - 2
@@ -475,66 +505,56 @@ Last-Update: 2026-11-25
 +        width: badge.discSize
 +        height: width
 +        radius: width / 2
-+        color: Kirigami.ColorUtils.linearInterpolation(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, 0.12)
++        color: badge.contrast ? Kirigami.Theme.textColor : Kirigami.ColorUtils.linearInterpolation(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, 0.12)
 +
 +        Kirigami.Icon {
 +            anchors.centerIn: parent
 +            width: badge.iconSize
 +            height: width
 +            source: badge.showChoice ? "overflow-menu" : badge.simIcon
-+            color: Kirigami.Theme.textColor
++            color: badge.contrast ? Kirigami.Theme.backgroundColor : Kirigami.Theme.textColor
 +            isMask: true
 +        }
 +    }
 +}
 --- a/plasma-dialer/src/qml/history/HistoryDelegate.qml
 +++ b/plasma-dialer/src/qml/history/HistoryDelegate.qml
-@@ -6,6 +6,9 @@ import QtQuick.Layouts
- import QtQuick.Controls as Controls
+@@ -7,6 +7,7 @@ import QtQuick.Controls as Controls
  import org.kde.kirigami as Kirigami
+ import org.kde.kirigamiaddons.components as Components
  import org.kde.telephony
 +import org.kde.plasma.dialer
-+
-+import "../dialpad"
  
- Controls.ItemDelegate {
-     id: root
-@@ -71,18 +74,33 @@ Controls.ItemDelegate {
+ import "../components"
  
+@@ -18,9 +19,10 @@ Controls.ItemDelegate {
+     readonly property string displayName: model.communicationWith ? ContactUtils.displayString(model.communicationWith) : ""
+     readonly property bool missed: model.direction == DialerTypes.CallDirection.Incoming && model.duration <= 0
+ 
+-    // calls the number back
++    // calls the number back, with several SIMs through the SIM of the call
+     function callBack() {
+-        CallUtils.dial(applicationWindow().selectModem(), model.communicationWith);
++        const simDevice = SimUtils.sims.length > 1 && model.account ? SimUtils.deviceForSim(model.account) : "";
++        CallUtils.dial(simDevice !== "" ? simDevice : applicationWindow().selectModem(), model.communicationWith);
+     }
+ 
+     highlighted: false
+@@ -115,10 +117,13 @@ Controls.ItemDelegate {
+             }
          }
  
--        // a tap on the entry puts the number into the dial pad, this calls it right away
-+        // a tap on the entry puts the number into the dial pad, this calls it right away; with several
-+        // SIMs through the SIM the call came in on or went out through
-         Controls.ToolButton {
++        // with several SIMs the icon of the SIM the call came in on or went out through
+         RowIconButton {
              id: callBackButton
  
-+            readonly property bool severalSims: SimUtils.sims.length > 1
-+            readonly property string simDevice: severalSims && model.account ? SimUtils.deviceForSim(model.account) : ""
+-            iconSource: "call-start"
++            readonly property string simIcon: SimUtils.sims.length > 1 && model.account ? SimUtils.iconForSim(model.account) : ""
 +
-             display: Controls.AbstractButton.IconOnly
-             icon.name: "call-start"
++            iconSource: simIcon !== "" ? simIcon : "call-start"
+             iconSize: Kirigami.Units.iconSizes.medium
              text: i18nc("@action:button", "Call back")
-             enabled: model.communicationWith.length > 0
--            onClicked: CallUtils.dial(applicationWindow().selectModem(), model.communicationWith)
-+            onClicked: CallUtils.dial(simDevice !== "" ? simDevice : applicationWindow().selectModem(), model.communicationWith)
-             Controls.ToolTip.text: text
-             Controls.ToolTip.visible: hovered
-             Controls.ToolTip.delay: Kirigami.Units.toolTipDelay
-+
-+            SimBadge {
-+                anchors.right: parent.right
-+                anchors.bottom: parent.bottom
-+                anchors.rightMargin: Math.round(callBackButton.rightPadding / 2)
-+                anchors.bottomMargin: Math.round(callBackButton.bottomPadding / 2)
-+                visible: callBackButton.severalSims && simIcon !== ""
-+                size: Math.round(Kirigami.Units.iconSizes.smallMedium * 0.8)
-+                simIcon: model.account ? SimUtils.iconForSim(model.account) : ""
-+                opacity: callBackButton.enabled ? 1 : 0.6
-+            }
-         }
- 
-     }
+             onClicked: root.callBack()
 --- a/plasma-dialer/src/qml/settings/SettingsPage.qml
 +++ b/plasma-dialer/src/qml/settings/SettingsPage.qml
 @@ -44,6 +44,38 @@ FormCard.FormCardPage {

@@ -1,0 +1,390 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] modem-daemon: connect to each modem once
+Description:
+ The controller connected to the signals of every modem again whenever a
+ modem was added or removed, without removing the earlier connections, and
+ the connections kept the modem objects alive (QSharedPointer captures)
+ after ModemManagerQt had dropped them. After ModemManager restarted, the
+ old objects listened on the same object paths as the new ones: one call
+ was announced and deleted as often as modems had appeared before (ten
+ times after a few restarts), and its SIM was taken from an outdated
+ object.
+ .
+ Each modem object now gets one receiver object for all its connections;
+ it is deleted when the modem is removed or replaced by a new object under
+ the same path, which disconnects and releases the interfaces. The
+ lambdas capture the modem path instead of the modem object. A modem that
+ ModemManagerQt announces again because it got more interfaces keeps its
+ calls. A removed modem takes its calls with it (callDeleted), and finished
+ call objects are freed.
+Forwarded: no
+License: LicenseRef-KDE-Accepted-GPL (as the patched files)
+Last-Update: 2026-11-25
+---
+--- a/modem-daemon/src/mm-modem-controller.cpp
++++ b/modem-daemon/src/mm-modem-controller.cpp
+@@ -7,15 +7,10 @@
+ ModemManagerController::ModemManagerController(QObject *parent)
+     : ModemController(parent)
+ {
++    // queued: the modem object handles the new interfaces before it is used
++    connect(ModemManager::notifier(), &ModemManager::Notifier::modemAdded, this, &ModemManagerController::onModemAdded, Qt::QueuedConnection);
++    connect(ModemManager::notifier(), &ModemManager::Notifier::modemRemoved, this, &ModemManagerController::onModemRemoved);
+     init();
+-    connect(ModemManager::notifier(), &ModemManager::Notifier::modemAdded, this, [this](const QString &udi) {
+-        Q_UNUSED(udi);
+-        init();
+-    });
+-    connect(ModemManager::notifier(), &ModemManager::Notifier::modemRemoved, this, [this](const QString &udi) {
+-        Q_UNUSED(udi);
+-        init();
+-    });
+ }
+ 
+ QString ModemManagerController::subsystem()
+@@ -247,107 +242,187 @@ void ModemManagerController::onServiceDisappeared()
+ 
+ void ModemManagerController::onModemAdded(const QString &udi)
+ {
+-    Q_UNUSED(udi);
++    const auto device = ModemManager::findModemDevice(udi);
++    if (!device.isNull()) {
++        addModem(device);
++    }
++    updateDeviceUniList();
+ }
+ 
+ void ModemManagerController::onModemRemoved(const QString &udi)
+ {
+-    Q_UNUSED(udi);
++    removeModem(udi);
++    updateDeviceUniList();
+ }
+ 
+ void ModemManagerController::init()
+ {
+-    setDeviceUniList(QStringList());
+     const auto modemDevices = ModemManager::modemDevices();
+     if (modemDevices.isEmpty()) {
+         qWarning() << "Could not find modem devices";
+-        return;
+     }
+     for (const auto &device : modemDevices) {
+-        appendDeviceUni(device->uni());
+-        // 3GPP
+-        const auto modem3gppInterface = this->modem3gppInterface(device);
+-        if (modem3gppInterface.isNull()) {
+-            qDebug() << "Skipping 3GPP-related connections";
+-            continue;
++        addModem(device);
++    }
++    updateDeviceUniList();
++}
++
++void ModemManagerController::updateDeviceUniList()
++{
++    // ModemManagerQt still lists a modem while it announces its removal
++    QStringList deviceUniList = m_modemContexts.keys();
++    deviceUniList.sort();
++    setDeviceUniList(deviceUniList);
++}
++
++void ModemManagerController::addModem(const QSharedPointer<ModemManager::ModemDevice> &device)
++{
++    const QString deviceUni = device->uni();
++
++    // receiver of all connections to the modem: deleting it disconnects them
++    // and releases the interfaces of the modem
++    auto modemContext = new QObject(this);
++
++    // ModemManagerQt announces a modem again when it gets more interfaces:
++    // the calls of the same modem object stay, a new object under the same
++    // path (ModemManager restarted) replaces the old one and its calls
++    QObject *oldContext = m_modemContexts.value(deviceUni);
++    if (oldContext && m_modemDevices.value(deviceUni) == device.get()) {
++        for (CallObject *callObject : std::as_const(m_calls)) {
++            if (callObject->parent() == oldContext) {
++                callObject->setParent(modemContext);
++            }
+         }
+-        connect(modem3gppInterface.get(), &ModemManager::Modem3gpp::countryCodeChanged, this, [this](const QString &countryCode) {
++    }
++    removeModem(deviceUni);
++    m_modemContexts.insert(deviceUni, modemContext);
++    m_modemDevices.insert(deviceUni, device.get());
++
++    // 3GPP
++    const auto modem3gppInterface = this->modem3gppInterface(device);
++    if (modem3gppInterface.isNull()) {
++        qDebug() << "Skipping 3GPP-related connections";
++    } else {
++        connect(modem3gppInterface.get(), &ModemManager::Modem3gpp::countryCodeChanged, modemContext, [this](const QString &countryCode) {
+             Q_EMIT countryCodeChanged(countryCode);
+         });
++    }
+ 
+-        // 3GPPUSSD
+-        const auto modem3gppUssdInterface = this->modem3gppUssdInterface(device);
+-        if (modem3gppInterface.isNull()) {
+-            qDebug() << "Skipping USSD-related connections";
+-            continue;
+-        }
++    // 3GPPUSSD
++    const auto modem3gppUssdInterface = this->modem3gppUssdInterface(device);
++    if (modem3gppUssdInterface.isNull()) {
++        qDebug() << "Skipping USSD-related connections";
++    } else {
+         connect(modem3gppUssdInterface.get(),
+                 &ModemManager::Modem3gppUssd::networkNotificationChanged,
+-                this,
+-                [this, device](const QString &networkNotification) {
+-                    Q_EMIT ussdNotificationReceived(device->uni(), networkNotification);
++                modemContext,
++                [this, deviceUni](const QString &networkNotification) {
++                    Q_EMIT ussdNotificationReceived(deviceUni, networkNotification);
+                 });
+-        connect(modem3gppUssdInterface.get(), &ModemManager::Modem3gppUssd::networkRequestChanged, this, [this, device](const QString &networkRequest) {
+-            Q_EMIT ussdRequestReceived(device->uni(), networkRequest);
+-        });
+-        connect(modem3gppUssdInterface.get(), &ModemManager::Modem3gppUssd::stateChanged, this, [this, device](MMModem3gppUssdSessionState state) {
+-            QString stateString = QStringLiteral("unknown");
+-            switch (state) {
+-            case (MM_MODEM_3GPP_USSD_SESSION_STATE_IDLE):
+-                stateString = QStringLiteral("idle");
+-                break;
+-            case (MM_MODEM_3GPP_USSD_SESSION_STATE_ACTIVE):
+-                stateString = QStringLiteral("active");
+-                break;
+-            case (MM_MODEM_3GPP_USSD_SESSION_STATE_USER_RESPONSE):
+-                stateString = QStringLiteral("user-response");
+-                break;
+-            default:
+-                break;
+-            }
+-            Q_EMIT ussdStateChanged(device->uni(), stateString);
+-        });
++        connect(modem3gppUssdInterface.get(),
++                &ModemManager::Modem3gppUssd::networkRequestChanged,
++                modemContext,
++                [this, deviceUni](const QString &networkRequest) {
++                    Q_EMIT ussdRequestReceived(deviceUni, networkRequest);
++                });
++        connect(modem3gppUssdInterface.get(),
++                &ModemManager::Modem3gppUssd::stateChanged,
++                modemContext,
++                [this, deviceUni](MMModem3gppUssdSessionState state) {
++                    QString stateString = QStringLiteral("unknown");
++                    switch (state) {
++                    case (MM_MODEM_3GPP_USSD_SESSION_STATE_IDLE):
++                        stateString = QStringLiteral("idle");
++                        break;
++                    case (MM_MODEM_3GPP_USSD_SESSION_STATE_ACTIVE):
++                        stateString = QStringLiteral("active");
++                        break;
++                    case (MM_MODEM_3GPP_USSD_SESSION_STATE_USER_RESPONSE):
++                        stateString = QStringLiteral("user-response");
++                        break;
++                    default:
++                        break;
++                    }
++                    Q_EMIT ussdStateChanged(deviceUni, stateString);
++                });
++    }
+ 
+-        // Voice
+-        const auto voiceInterface = this->voiceInterface(device);
+-        if (voiceInterface.isNull()) {
+-            qDebug() << "Skipping Voice-related connections";
+-            continue;
+-        }
+-        connect(voiceInterface.get(), &ModemManager::ModemVoice::callAdded, this, [this, device, voiceInterface](const QString &callUni) {
++    // Voice
++    const auto voiceInterface = this->voiceInterface(device);
++    if (voiceInterface.isNull()) {
++        qDebug() << "Skipping Voice-related connections";
++    } else {
++        ModemManager::ModemVoice *voice = voiceInterface.get();
++        connect(voice, &ModemManager::ModemVoice::callAdded, modemContext, [this, deviceUni, voice](const QString &callUni) {
+             qDebug() << Q_FUNC_INFO << "call added, initiating";
+-            ModemManager::Call::Ptr call = voiceInterface->findCall(callUni);
++            const auto device = ModemManager::findModemDevice(deviceUni);
++            const ModemManager::Call::Ptr call = voice->findCall(callUni);
++            if (device.isNull() || call.isNull()) {
++                qDebug() << Q_FUNC_INFO << "call or modem not found" << deviceUni << callUni;
++                return;
++            }
+             initAddedCall(device, call);
+         });
+-        connect(voiceInterface.get(), &ModemManager::ModemVoice::callDeleted, this, [this, device](const QString &callUni) {
++        connect(voice, &ModemManager::ModemVoice::callDeleted, modemContext, [this, deviceUni](const QString &callUni) {
+             removeCall(callUni);
+-            Q_EMIT callDeleted(device->uni(), callUni);
++            Q_EMIT callDeleted(deviceUni, callUni);
+         });
++    }
+ 
+-        // SMS/MMS
+-        const auto msgManager = device->messagingInterface();
+-        connect(msgManager.get(), &ModemManager::ModemMessaging::messageAdded, this, [this, device, msgManager](const QString &uni, bool received) {
+-            ModemManager::Sms::Ptr msg = msgManager->findMessage(uni);
+-            Q_ASSERT(msg);
++    // SMS/MMS
++    const auto msgManager = device->messagingInterface();
++    if (!msgManager.isNull()) {
++        ModemManager::ModemMessaging *messaging = msgManager.get();
++        connect(messaging, &ModemManager::ModemMessaging::messageAdded, modemContext, [this, deviceUni, messaging](const QString &uni, bool received) {
++            ModemManager::Sms::Ptr msg = messaging->findMessage(uni);
++            if (!msg) {
++                return;
++            }
+             QVariantMap message;
+             message[QStringLiteral("number")] = msg->number();
+             message[QStringLiteral("text")] = msg->text();
+             message[QStringLiteral("data")] = msg->data();
+-            Q_EMIT messageAdded(device->uni(), message, received);
++            Q_EMIT messageAdded(deviceUni, message, received);
+         });
+     }
+ 
+-    fetchModemCalls();
++    // calls the modem has already
++    if (!voiceInterface.isNull()) {
++        const auto voiceCalls = voiceInterface->calls();
++        for (const auto &call : voiceCalls) {
++            initAddedCall(device, call);
++        }
++    }
++}
++
++void ModemManagerController::removeModem(const QString &deviceUni)
++{
++    m_modemDevices.remove(deviceUni);
++    QObject *modemContext = m_modemContexts.take(deviceUni);
++    if (!modemContext) {
++        return;
++    }
++    // the calls of the modem are gone with it
++    const auto calls = m_calls;
++    for (CallObject *callObject : calls) {
++        if (callObject->parent() == modemContext) {
++            const QString callUni = callObject->id();
++            removeCall(callUni);
++            Q_EMIT callDeleted(deviceUni, callUni);
++        }
++    }
++    delete modemContext;
+ }
+ 
+ void ModemManagerController::removeCall(const QString &callId)
+ {
+-    m_calls.erase(std::remove_if(m_calls.begin(),
+-                                 m_calls.end(),
+-                                 [callId](CallObject *callObject) {
+-                                     return (callObject->id() == callId);
+-                                 }),
+-                  m_calls.end());
++    const auto removed = std::stable_partition(m_calls.begin(), m_calls.end(), [callId](CallObject *callObject) {
++        return (callObject->id() != callId);
++    });
++    for (auto it = removed; it != m_calls.end(); ++it) {
++        (*it)->deleteLater();
++    }
++    m_calls.erase(removed, m_calls.end());
+ }
+ 
+ QSharedPointer<ModemManager::Modem3gpp> ModemManagerController::modem3gppInterface(const QSharedPointer<ModemManager::ModemDevice> modemDevice)
+@@ -404,27 +479,6 @@ DialerTypes::CallData ModemManagerController::voiceCallData(CallObject *callObje
+     return callData;
+ }
+ 
+-void ModemManagerController::fetchModemCalls()
+-{
+-    m_calls.clear();
+-    const auto modemDevices = ModemManager::modemDevices();
+-    if (modemDevices.isEmpty()) {
+-        qWarning() << "Could not find modem devices";
+-        return;
+-    }
+-    for (const auto &device : modemDevices) {
+-        const auto voiceInterface = this->voiceInterface(device);
+-        if (voiceInterface.isNull()) {
+-            qDebug() << "Skipping device without voice interface";
+-            continue;
+-        }
+-        const auto voiceCalls = voiceInterface->calls();
+-        for (const auto &call : voiceCalls) {
+-            initAddedCall(device, call);
+-        };
+-    };
+-}
+-
+ CallObject *ModemManagerController::getVoiceCallObject(const QString &deviceUni, const QString &callUni)
+ {
+     Q_UNUSED(deviceUni);
+@@ -445,20 +499,21 @@ void ModemManagerController::initAddedCall(const QSharedPointer<ModemManager::Mo
+         // voice call object already exists, we do not need to append to list again
+         return;
+     }
+-    auto voiceCallObject = this->voiceCallObject(device, call, this);
++    // the call object goes with the modem
++    auto voiceCallObject = this->voiceCallObject(device, call, m_modemContexts.value(device->uni(), this));
+     m_calls.append(voiceCallObject);
+-    connect(call.get(),
++    const QString deviceUni = device->uni();
++    ModemManager::Call *callPtr = call.get();
++    connect(callPtr,
+             &ModemManager::Call::stateChanged,
+-            this,
+-            [this, device, call, voiceCallObject](MMCallState oldState, MMCallState newState, MMCallStateReason reason) {
++            voiceCallObject,
++            [this, deviceUni, callPtr, voiceCallObject](MMCallState oldState, MMCallState newState, MMCallStateReason reason) {
+                 Q_UNUSED(oldState);
+                 qDebug() << Q_FUNC_INFO << "call state changed, initiating";
+-                auto callDirection = static_cast<DialerTypes::CallDirection>(call->direction());
++                auto callDirection = static_cast<DialerTypes::CallDirection>(callPtr->direction());
+                 auto callState = static_cast<DialerTypes::CallState>(newState);
+                 auto callReason = static_cast<DialerTypes::CallStateReason>(reason);
+-                if (voiceCallObject) {
+-                    voiceCallObject->onCallStateChanged(device->uni(), call->uni(), callDirection, callState, callReason);
+-                }
++                voiceCallObject->onCallStateChanged(deviceUni, callPtr->uni(), callDirection, callState, callReason);
+                 Q_EMIT callStateChanged(voiceCallData(voiceCallObject));
+             });
+     Q_EMIT callAdded(device->uni(),
+--- a/modem-daemon/src/mm-modem-controller.h
++++ b/modem-daemon/src/mm-modem-controller.h
+@@ -14,6 +14,8 @@
+ #include <ModemManagerQt/ModemVoice>
+ #include <ModemManagerQt/Sms>
+ 
++#include <QHash>
++
+ #include "call-object.h"
+ 
+ class ModemManagerController : public ModemController
+@@ -50,6 +52,16 @@ private Q_SLOTS:
+ 
+ private:
+     void init();
++    // connects to the signals of the modem, once per modem object
++    void addModem(const QSharedPointer<ModemManager::ModemDevice> &device);
++    // disconnects from the modem and drops its calls
++    void removeModem(const QString &deviceUni);
++    void updateDeviceUniList();
++
++    // per modem path: receiver of the connections to the modem and parent of its calls
++    QHash<QString, QObject *> m_modemContexts;
++    // per modem path: the modem object the connections belong to
++    QHash<QString, const ModemManager::ModemDevice *> m_modemDevices;
+ 
+     QVector<CallObject *> m_calls;
+     void removeCall(const QString &callId);
+@@ -65,7 +77,6 @@ private:
+ 
+     DialerTypes::CallData voiceCallData(CallObject *callObject);
+ 
+-    void fetchModemCalls();
+     CallObject *getVoiceCallObject(const QString &deviceUni, const QString &callUni);
+     void initAddedCall(const QSharedPointer<ModemManager::ModemDevice> &device, const QSharedPointer<ModemManager::Call> &call);
+ };
