@@ -1,0 +1,23 @@
+Description: pan/libpan: turn an empty index range into a null draw
+ When every index of an indexed indirect draw is a restart index (or the
+ count is zero), the min/max search leaves min above max and the vertex
+ range wrapped around. Use a range of zero so the jobs become null jobs.
+Author: pocket-debs
+Origin: https://github.com/masterxq/mesa-lisbon (branch lisbon/26.3)
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-25
+diff --git a/src/panfrost/libpan/draw_helper.cl b/src/panfrost/libpan/draw_helper.cl
+index 0c185969800..77c6b12c043 100644
+--- a/src/panfrost/libpan/draw_helper.cl
++++ b/src/panfrost/libpan/draw_helper.cl
+@@ -536,7 +536,8 @@ panlib_draw_indexed_indirect_helper(
+    const int32_t vertex_offset = cmd->vertexOffset;
+    const uint32_t min_vertex = index_min_max_res->min;
+    const uint32_t max_vertex = index_min_max_res->max;
+-   const uint32_t vertex_range = max_vertex - min_vertex + 1;
++   const uint32_t vertex_range =
++      max_vertex >= min_vertex ? max_vertex - min_vertex + 1 : 0;
+ 
+    struct panlib_draw_info draw = {
+       .idvs_job = idvs_job,

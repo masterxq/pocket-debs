@@ -9,7 +9,7 @@ License: MIT (as the patched file)
 Last-Update: 2026-11-19
 --- a/src/gallium/drivers/panfrost/pan_resource.c
 +++ b/src/gallium/drivers/panfrost/pan_resource.c
-@@ -471,6 +471,11 @@
+@@ -443,6 +443,11 @@ panfrost_resource_get_handle(struct pipe
     if (handle->type == WINSYS_HANDLE_TYPE_KMS && dev->ro) {
        return renderonly_get_handle(scanout, handle);
     } else if (handle->type == WINSYS_HANDLE_TYPE_KMS) {

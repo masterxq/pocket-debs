@@ -1,0 +1,22 @@
+Description: panvk/jm: allow indirect and indexed draws without vertex buffers
+ With no vertex buffer bound, the zero-sized attribute buffer info
+ allocation returns no memory and the draw failed with
+ VK_ERROR_OUT_OF_DEVICE_MEMORY. Only require it when there are buffers.
+Author: pocket-debs
+Origin: https://github.com/masterxq/mesa-lisbon (branch lisbon/26.3)
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-25
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 7df80b33d1b..b0dc7c3427c 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -636,7 +636,7 @@ panvk_draw_prepare_vs_attribs(struct panvk_cmd_buffer *cmdbuf,
+          cmdbuf, desc,
+          num_vs_attribs * sizeof(struct libpan_draw_helper_attrib_info), 8);
+ 
+-      if (!bufs_infos_storage.gpu ||
++      if ((num_vbs && !bufs_infos_storage.gpu) ||
+           (num_vs_attribs && !attribs_infos_storage.gpu))
+          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ 

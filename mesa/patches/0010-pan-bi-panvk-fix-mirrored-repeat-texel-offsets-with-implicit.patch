@@ -1,0 +1,220 @@
+Description: pan/bi, panvk: fix MIRRORED_REPEAT texel offsets with implicit LOD
+ Compute the implicit LOD on the original coordinates. For isotropic
+ sampling from a single level, move the offset into the coordinate and
+ sample with that LOD; otherwise keep the hardware implicit sample.
+Author: pocket-debs
+Origin: https://github.com/masterxq/mesa-lisbon (branch lisbon/26.3)
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-25
+--- a/src/panfrost/compiler/pan_nir_lower_tex.c
++++ b/src/panfrost/compiler/pan_nir_lower_tex.c
+@@ -495,10 +495,10 @@ enum bifrost_tex_sreg {
+    BI_TEX_SR_COUNT,
+ };
+ 
+-static void
+-bi_lower_mirrored_gradient_offset(nir_builder *b, struct tex_srcs *srcs,
+-                                  nir_def *sampler, nir_def *size,
+-                                  nir_def *lod_fixed)
++static nir_def *
++bi_lower_mirrored_offset(nir_builder *b, struct tex_srcs *srcs,
++                         nir_def *sampler, nir_def *size,
++                         nir_def *lod_fixed, nir_def *enable)
+ {
+    nir_def *wrap_modes = nir_channel(b, sampler, 0);
+    nir_def *limits = nir_channel(b, sampler, 1);
+@@ -510,10 +510,11 @@ bi_lower_mirrored_gradient_offset(nir_bu
+ 
+    nir_def *nearest = nir_ieq_imm(b, nir_ushr_imm(b, wrap_modes, 30), 0);
+    nir_def *integral = nir_ieq_imm(b, nir_iand_imm(b, lod, 255), 0);
+-   nir_def *single_level = nir_ior(b, nearest, integral);
++   nir_def *single_level = nir_iand(b, enable, nir_ior(b, nearest, integral));
+    nir_def *level = nir_f2u32(
+       b, nir_fround_even(b, nir_fmul_imm(b, nir_i2f32(b, lod), 1.0 / 256.0)));
+ 
++   nir_def *changed = nir_imm_false(b);
+    nir_def *coord[4], *offset[3];
+    for (unsigned i = 0; i < srcs->coord->num_components; i++) {
+       coord[i] = nir_channel(b, srcs->coord, i);
+@@ -526,6 +527,8 @@ bi_lower_mirrored_gradient_offset(nir_bu
+ 
+       nir_def *wrap = nir_ubitfield_extract_imm(b, wrap_modes, 16 - 4 * i, 4);
+       nir_def *emulate = nir_iand(b, single_level, nir_ieq_imm(b, wrap, 12));
++      emulate = nir_iand(b, emulate, nir_ine_imm(b, offset[i], 0));
++      changed = nir_ior(b, changed, emulate);
+       nir_def *extent = nir_umax_imm(b, nir_ushr(b, nir_channel(b, size, i), level), 1);
+       nir_def *delta = nir_fdiv(b, nir_i2f32(b, offset[i]), nir_u2f32(b, extent));
+       nir_def *period = nir_ffract(b, nir_fmul_imm(b, coord[i], 0.5));
+@@ -536,40 +539,17 @@ bi_lower_mirrored_gradient_offset(nir_bu
+ 
+    srcs->coord = nir_vec(b, coord, srcs->coord->num_components);
+    srcs->offset = nir_vec(b, offset, srcs->offset->num_components);
++   return changed;
+ }
+ 
+-static bool
+-bi_lower_tex(nir_builder *b, nir_tex_instr *tex, unsigned arch)
++static nir_def *
++bi_emit_tex(nir_builder *b, nir_tex_instr *tex, struct tex_srcs srcs,
++            nir_def *fixed_lod)
+ {
+-   /* If txf is used, we assume there is a valid sampler bound at index 0. Use
+-    * it for txf operations, since there may be no other valid samplers. This is
+-    * a workaround: txf does not require a sampler in NIR (so sampler_index is
+-    * undefined) but we need one in the hardware. This is ABI with the driver.
+-    */
+-   if (!nir_tex_instr_need_sampler(tex))
+-      tex->sampler_index = 0;
+-
+    struct bifrost_texture_operation desc = {
+       .mask = nir_def_components_read(&tex->def),
+    };
+ 
+-   b->cursor = nir_before_instr(&tex->instr);
+-   nir_def *sampler = nir_steal_tex_src(tex, nir_tex_src_backend1);
+-   nir_def *size = nir_steal_tex_src(tex, nir_tex_src_backend2);
+-   struct tex_srcs srcs = steal_tex_srcs(b, tex, arch);
+-
+-   nir_def *gradient_lod = NULL;
+-   if (!srcs.lod && !srcs.min_lod && !srcs.bias && (srcs.ddx || srcs.ddy)) {
+-      nir_def *grdesc = build_bi_gradient_desc(b, srcs.tex_h, srcs.samp_h,
+-                                               tex->sampler_dim, srcs.ddx, srcs.ddy);
+-      gradient_lod = nir_channel(b, grdesc, 0);
+-   }
+-
+-   if (sampler) {
+-      assert(size && srcs.offset && gradient_lod);
+-      bi_lower_mirrored_gradient_offset(b, &srcs, sampler, size, gradient_lod);
+-   }
+-
+    nir_def *coord_xy = NULL;
+    nir_def *sr[BI_TEX_SR_COUNT] = {};
+ 
+@@ -632,9 +612,9 @@ bi_lower_tex(nir_builder *b, nir_tex_ins
+       } else if (srcs.min_lod || srcs.bias) {
+          desc.lod_or_fetch = BIFROST_LOD_MODE_BIAS;
+          sr[BI_TEX_SR_LOD] = build_lod_bias_clamp(b, srcs.bias, srcs.min_lod);
+-      } else if (gradient_lod) {
++      } else if (fixed_lod) {
+          desc.lod_or_fetch = BIFROST_LOD_MODE_EXPLICIT;
+-         sr[BI_TEX_SR_LOD] = gradient_lod;
++         sr[BI_TEX_SR_LOD] = fixed_lod;
+       } else {
+          desc.lod_or_fetch = BIFROST_LOD_MODE_COMPUTE;
+       }
+@@ -676,7 +656,7 @@ bi_lower_tex(nir_builder *b, nir_tex_ins
+          sr[sr_count++] = sr[i];
+    }
+ 
+-   const bool explicit_lod = !nir_tex_instr_has_implicit_derivative(tex);
++   const bool explicit_lod = fixed_lod || !nir_tex_instr_has_implicit_derivative(tex);
+    nir_def *res = build_bi_texc(b, tex->dest_type | tex->def.bit_size,
+                                 srcs.tex_h, srcs.samp_h, tex->sampler_dim,
+                                 coord_xy, desc, explicit_lod, sr, sr_count);
+@@ -685,6 +665,79 @@ bi_lower_tex(nir_builder *b, nir_tex_ins
+    if (tex->def.num_components < res->num_components)
+       res = nir_trim_vector(b, res, tex->def.num_components);
+ 
++   return res;
++}
++
++static nir_def *
++bi_get_implicit_lod(nir_builder *b, nir_tex_instr *tex, struct tex_srcs srcs)
++{
++   struct bifrost_texture_operation desc = {
++      .op = BIFROST_TEX_OP_GRDESC,
++      .mask = 1,
++      .shadow_or_clamp_disable = true,
++   };
++   unsigned comps = tex->coord_components - tex->is_array;
++   nir_def *xy = nir_trim_vector(b, srcs.coord, MIN2(comps, 2));
++   nir_def *z = comps == 3 ? nir_channel(b, srcs.coord, 2) : NULL;
++   nir_def *grdesc = build_bi_texc(b, nir_type_float32, srcs.tex_h, srcs.samp_h,
++                                 tex->sampler_dim, xy, desc, false, &z, z ? 1 : 0);
++   nir_def *lod = nir_unpack_32_2x16_split_x(b, grdesc);
++   if (srcs.bias)
++      lod = nir_iadd_sat(b, lod, build_sfixed_8_8(b, srcs.bias));
++
++   return nir_u2u32(b, lod);
++}
++
++static bool
++bi_lower_tex(nir_builder *b, nir_tex_instr *tex, unsigned arch)
++{
++   /* If txf is used, we assume there is a valid sampler bound at index 0. Use
++    * it for txf operations, since there may be no other valid samplers. This is
++    * a workaround: txf does not require a sampler in NIR (so sampler_index is
++    * undefined) but we need one in the hardware. This is ABI with the driver.
++    */
++   if (!nir_tex_instr_need_sampler(tex))
++      tex->sampler_index = 0;
++
++   b->cursor = nir_before_instr(&tex->instr);
++   nir_def *sampler = nir_steal_tex_src(tex, nir_tex_src_backend1);
++   nir_def *size = nir_steal_tex_src(tex, nir_tex_src_backend2);
++   struct tex_srcs srcs = steal_tex_srcs(b, tex, arch);
++
++   nir_def *gradient_lod = NULL;
++   if (!srcs.lod && !srcs.min_lod && !srcs.bias && (srcs.ddx || srcs.ddy)) {
++      nir_def *grdesc = build_bi_gradient_desc(b, srcs.tex_h, srcs.samp_h,
++                                               tex->sampler_dim, srcs.ddx, srcs.ddy);
++      gradient_lod = nir_channel(b, grdesc, 0);
++   }
++
++   nir_def *res;
++   if (sampler && nir_tex_instr_has_implicit_derivative(tex)) {
++      assert(size && srcs.offset && !gradient_lod && !srcs.min_lod);
++      nir_def *lod = bi_get_implicit_lod(b, tex, srcs);
++      nir_def *isotropic = nir_ieq_imm(
++         b, nir_ubitfield_extract_imm(b, nir_channel(b, sampler, 2), 24, 2), 0);
++
++      /* GRDESC uses the original coordinates for derivatives. Keep TEXC's
++       * implicit sample for anisotropic or multi-level filtering and for
++       * samplers without a mirrored offset.
++       */
++      struct tex_srcs adjusted = srcs;
++      nir_def *emulate = bi_lower_mirrored_offset(b, &adjusted, sampler, size,
++                                                 lod, isotropic);
++      adjusted.bias = NULL;
++      nir_def *native = bi_emit_tex(b, tex, srcs, NULL);
++      nir_def *shifted = bi_emit_tex(b, tex, adjusted, lod);
++      res = nir_bcsel(b, emulate, shifted, native);
++   } else {
++      if (sampler) {
++         assert(size && srcs.offset && gradient_lod);
++         bi_lower_mirrored_offset(b, &srcs, sampler, size, gradient_lod,
++                                   nir_imm_true(b));
++      }
++      res = bi_emit_tex(b, tex, srcs, gradient_lod);
++   }
++
+    nir_def_replace(&tex->def, res);
+    return true;
+ }
+--- a/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c
++++ b/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c
+@@ -921,10 +921,11 @@ lower_tex(nir_builder *b, nir_tex_instr
+ 
+ #if PAN_ARCH < 9
+    progress |= lower_bifrost_mirrored_txl_offset(b, tex, ctx);
+-   if (tex->op == nir_texop_txd &&
++   bool implicit_lod = tex->op == nir_texop_tex || tex->op == nir_texop_txb;
++   if ((tex->op == nir_texop_txd || implicit_lod) &&
+        nir_tex_instr_src_index(tex, nir_tex_src_offset) >= 0 &&
+        nir_tex_instr_src_index(tex, nir_tex_src_min_lod) < 0 &&
+-       nir_tex_instr_src_index(tex, nir_tex_src_bias) < 0 &&
++       (implicit_lod || nir_tex_instr_src_index(tex, nir_tex_src_bias) < 0) &&
+        nir_tex_instr_src_index(tex, nir_tex_src_plane) < 0 &&
+        nir_tex_instr_src_index(tex, nir_tex_src_projector) < 0) {
+       int samp = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+@@ -933,7 +934,8 @@ lower_tex(nir_builder *b, nir_tex_instr
+          nir_deref_instr *sampler = nir_src_as_deref(tex->src[samp].src);
+          nir_deref_instr *texture = nir_src_as_deref(tex->src[img].src);
+          nir_def *words = load_resource_deref_desc(
+-            b, sampler, VK_DESCRIPTOR_TYPE_SAMPLER, 0, 2, 32, ctx);
++            b, sampler, VK_DESCRIPTOR_TYPE_SAMPLER, 0, implicit_lod ? 3 : 2, 32,
++            ctx);
+          nir_def *size = load_tex_size(b, texture, tex->sampler_dim,
+                                       tex->is_array, ctx);
+          nir_def *levels = load_tex_levels(b, texture, tex->sampler_dim, ctx);

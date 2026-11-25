@@ -1,0 +1,33 @@
+Description: panvk: enable the MT6785 Mali-G76 MC4 without the opt-in
+ Expose the Mali-G76 MC4 of the MT6785 (platform compatible
+ "mediatek,mt6785-mali") without PAN_I_WANT_A_BROKEN_VULKAN_DRIVER.
+ Other v6/v7 GPUs keep the opt-in and the non-conformance warning.
+Author: pocket-debs
+Origin: https://github.com/masterxq/mesa-lisbon (branch lisbon/26.3)
+Forwarded: no
+License: MIT (as the patched files)
+Last-Update: 2026-11-25
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index f500314c1c4..5350d30c9d0 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -452,8 +452,18 @@ panvk_physical_device_init(struct panvk_physical_device *device,
+    }
+ 
+    switch (arch) {
+-   case 6:
+    case 7:
++      /* The MT6785 Mali-G76 MC4 is enabled by the Lisbon build. */
++      if (device->model->gpu_prod_id == PAN_PROD_ID(7, 2, 1) &&
++          core_count == 4 && drm_device->bustype == DRM_BUS_PLATFORM &&
++          drm_device->deviceinfo.platform &&
++          drm_device->deviceinfo.platform->compatible &&
++          drm_device->deviceinfo.platform->compatible[0] &&
++          !strcmp(drm_device->deviceinfo.platform->compatible[0],
++                  "mediatek,mt6785-mali"))
++         break;
++      FALLTHROUGH;
++   case 6:
+    case 11:
+    case 14:
+       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
