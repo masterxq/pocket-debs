@@ -1,0 +1,59 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] kded/autodetectapn: bind the connection to the SIM, no autoconnect with several modems
+Description:
+ The detected connection is bound to the SIM it was detected for
+ (gsm.sim-id), so a SIM swapped in later is detected again instead of
+ reusing the connection of the old SIM. With several modems a connection
+ was added with autoconnect and activated for every modem, so mobile data
+ was started on all of them; there it is only added, without autoconnect,
+ and the user enables mobile data on the SIM of choice.
+Forwarded: no
+License: GPL-2.0-or-later OR LicenseRef-KDE-Accepted-GPL (as the patched file)
+Last-Update: 2026-11-25
+---
+--- a/kded/autodetectapn/autodetectapn.cpp
++++ b/kded/autodetectapn/autodetectapn.cpp
+@@ -46,6 +46,9 @@ QCoro::Task<void> AutoDetectAPN::checkAndAddAutodetectedAPN()
+ 
+     qCDebug(AUTODETECTAPN_LOG) << "Running APN autodetection...";
+ 
++    // with several modems, mobile data is enabled on one of them by the user: connections are only added
++    const bool severalModems = ModemManager::modemDevices().count() > 1;
++
+     for (ModemManager::ModemDevice::Ptr mmDevice : ModemManager::modemDevices()) {
+         ModemManager::Modem::Ptr mmModem = mmDevice->modemInterface();
+ 
+@@ -87,7 +90,7 @@ QCoro::Task<void> AutoDetectAPN::checkAndAddAutodetectedAPN()
+         NetworkManager::ConnectionSettings::Ptr settings{new NetworkManager::ConnectionSettings(NetworkManager::ConnectionSettings::Gsm)};
+         settings->setId(detectedAPN.carrier);
+         settings->setUuid(NetworkManager::ConnectionSettings::createNewUuid());
+-        settings->setAutoconnect(true);
++        settings->setAutoconnect(!severalModems);
+         settings->addToPermissions(KUser().loginName(), QString());
+ 
+         NetworkManager::GsmSetting::Ptr gsmSetting = settings->setting(NetworkManager::Setting::Gsm).dynamicCast<NetworkManager::GsmSetting>();
+@@ -95,6 +98,9 @@ QCoro::Task<void> AutoDetectAPN::checkAndAddAutodetectedAPN()
+         gsmSetting->setPasswordFlags(NetworkManager::Setting::NotRequired);
+         gsmSetting->setNetworkType(NetworkManager::GsmSetting::NetworkType::Prefer4GLte);
+         gsmSetting->setHomeOnly(false); // TODO respect modem roaming settings?
++        if (!mmSim->simIdentifier().isEmpty()) {
++            gsmSetting->setSimId(mmSim->simIdentifier()); // the connection is only used with this SIM
++        }
+         gsmSetting->setInitialized(true);
+ 
+         if (
+@@ -107,7 +113,12 @@ QCoro::Task<void> AutoDetectAPN::checkAndAddAutodetectedAPN()
+         }
+ 
+         QPointer<AutoDetectAPN> guard(this);
+-        QDBusReply<QDBusObjectPath> reply = co_await NetworkManager::addAndActivateConnection(settings->toMap(), nmModem->uni(), "");
++        QDBusReply<QDBusObjectPath> reply;
++        if (severalModems) {
++            reply = co_await NetworkManager::addConnection(settings->toMap());
++        } else {
++            reply = co_await NetworkManager::addAndActivateConnection(settings->toMap(), nmModem->uni(), "");
++        }
+ 
+         if (!guard) {
+             co_return;
