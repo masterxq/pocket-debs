@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+# All crates come from vendor/ of the release tarball (.cargo/config replaces crates.io and the git sources).
+export CARGO_NET_OFFLINE = true
+
+%:
+	dh $@ --buildsystem=meson
+
+# vendor/*/Cargo.toml.orig are listed in .cargo-checksum.json; dh_clean would delete them as *.orig.
+override_dh_clean:
+	dh_clean -XCargo.toml.orig
+
+override_dh_auto_configure:
+	dh_auto_configure -- -Dprofile=default
+
+execute_after_dh_auto_install:
+	sh debian/vendor-licenses vendor > debian/vendor-licenses.txt
+
+execute_after_dh_installdocs:
+	install -m 644 debian/vendor-licenses.txt debian/flare-signal/usr/share/doc/flare-signal/vendor-licenses

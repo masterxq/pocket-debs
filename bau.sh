@@ -2,6 +2,9 @@
 # pocket-debs: eigene Fassungen von Debian-Paketen fuer Telefone mit Mainline-Linux. Debian-Quellpaket holen und
 # pruefen, unsere Patches und Dateien anwenden, arm64-Pakete bauen, ins APT-Repository legen. Ein Einstieg, nicht
 # interaktiv. Laeuft auf amd64 (Bau unter qemu-user-binfmt) und nativ auf arm64.
+# Zwei Arten von Rezepten: Debian (DEBIAN= in paket.conf: Quellpaket der Suite plus Patches, Fassung
+# <debian>+pd<n>) und Upstream (UPSTREAM= in paket.conf: Upstream-Tarball plus eigenes <quelle>/debian/, Fassung
+# <upstream>-0pd<n>, fuer Software ohne Debian-Quellpaket).
 #
 #   ./bau.sh bau <quelle...>|alle|image [--neu]   bauen und ins Repo legen; uebersprungen, wenn eine Fassung mit
 #                                                  gleichem Eingabeschluessel schon im Repo liegt (--neu erzwingt)
@@ -9,9 +12,11 @@
 #                                                  fertige Pakete aus der CI (GitHub Actions, Artefakt je Paket, gh)
 #                                                  pruefen und ins Repo legen, statt sie zu bauen
 #   ./bau.sh einlegen <ordner...>                 Ergebnisordner (PAKETE_ERGEBNIS oder ein CI-Artefakt) ins Repo
-#   ./bau.sh pruefen                              Debian-Fassung der Suite mit unserer Basis vergleichen (rc 3: neuer)
+#   ./bau.sh pruefen                              Debian-Fassung der Suite mit unserer Basis vergleichen (rc 3: neuer);
+#                                                  Upstream-Rezepte mit GITLAB=: neueste Release dort (nur Meldung)
 #   ./bau.sh nachziehen <quelle> [<fassung>] [--suite <suite>] [--uebernehmen]
-#                                                  neue Debian-Fassung holen, Patches darauf anwenden (ohne Bau);
+#                                                  neue Debian-Fassung holen, Patches darauf anwenden (ohne Bau;
+#                                                  nur Debian-Rezepte, Upstream-Rezepte werden von Hand gehoben);
 #                                                  --uebernehmen schreibt paket.conf und aufgefrischte Patches
 #   ./bau.sh anlegen <quelle> [<fassung>]          neues Rezept, Fassung und .dsc-Pruefsumme aus Debian
 #   ./bau.sh liste                                Pakete, Fassungen, Stand im Repo
@@ -19,14 +24,14 @@
 #   ./bau.sh schluessel <quelle>                  Eingabeschluessel und seine Bestandteile (ohne Docker)
 #
 # alle = Pakete mit STATUS=aktiv, image = Pakete mit IMAGE_AN=1 (die ein Rootfs-Bau installiert).
-# Ausgaben unter $PAKETE_OUT (Standard: out/ in diesem Repo): dl/ (Debian-Quellen), bau/<quelle>/<fassung>/,
+# Ausgaben unter $PAKETE_OUT (Standard: out/ in diesem Repo): dl/ (Debian- und Upstream-Quellen), bau/<quelle>/<fassung>/,
 # repo/ (reprepro, Suite wie in pakete.conf, arm64 + source; repo/stand/<quelle> = Fassung und Schluessel), nachziehen/.
 # Umgebung: PAKETE_OUT, PAKETE_ERGEBNIS (Ordner: Ergebnis jedes Baus zusaetzlich nach <ordner>/<quelle>/, fuer einlegen),
 #   PAKETE_STRENG=1 (gleiche Fassung mit anderem Inhalt ist ein Fehler statt einer Warnung),
 #   PAKETE_GPG_KEY (Schluessel zum Signieren des Repos) mit PAKETE_GNUPGHOME (Standard $GNUPGHOME bzw. ~/.gnupg),
 #   PAKETE_TIMEOUT (Sekunden je Containerlauf, Standard 21600), NICE (Standard 10),
 #   PAKETE_CCACHE=0 (ohne Compiler-Cache bauen), PAKETE_CCACHE_MAX (Obergrenze je Paket, Standard 2G),
-#   PAKETE_TEST=<commit> (lokaler Testbau: Fassung <debian>+pd<n>~test.<7 Zeichen des Commits>; sie sortiert vor
+#   PAKETE_TEST=<commit> (lokaler Testbau: Fassung <fassung>~test.<7 Zeichen des Commits>; sie sortiert vor
 #   der Fassung aus main, apt ersetzt einen Testbau also durch den spaeteren Bau aus main. Geht nicht in den
 #   Schluessel ein. Die CI setzt es nicht: Pull Requests bauen die endgueltige Fassung.)
 # Compiler-Cache: $PAKETE_OUT/ccache/<quelle>/ (ccache), bleibt ueber Bauten erhalten; geht nicht in den Schluessel ein,
@@ -63,15 +68,34 @@ bild() {   # bild <name> [<docker-build-optionen...>]
 }
 images() { bild "$BAUIMG" --platform linux/arm64; bild "$REPOIMG"; }
 
-lade_conf() {   # lade_conf <quelle>: Variablen aus <quelle>/paket.conf
-	local q=$1
+lade_conf() {   # lade_conf <quelle>: Variablen aus <quelle>/paket.conf; ART=debian oder upstream
+	local q=$1 x
 	[ -f "$R/$q/paket.conf" ] || fehler "unbekanntes Paket $q ($R/$q/paket.conf fehlt)"
 	QUELLE= DEBIAN= DSC_SHA256= REVISION= OPTIONEN=nocheck PROFILE= BAUART=source,any IMAGE= IMAGE_AN=0 STATUS=aktiv DATEIEN_KOPF= CHANGELOG= PRUEFEN= FEHLT_ERLAUBT=
+	UPSTREAM= TARBALL= TARBALL_SHA256= GITLAB=
 	. "$R/$q/paket.conf"
 	[ "$QUELLE" = "$q" ] || fehler "$q/paket.conf: QUELLE=$QUELLE passt nicht zum Ordner"
 	[ -n "$REVISION" ] || fehler "$q/paket.conf: REVISION fehlt"
+	if [ -n "$UPSTREAM" ]; then
+		# Upstream-Rezept: Tarball mit Pruefsumme, Paketierung in <quelle>/debian/, Fassung <upstream>-0<tag><n>
+		# (die Revision 0<tag><n> sortiert vor einer Debian-Fassung <upstream>-1 desselben Upstream-Stands)
+		ART=upstream
+		[ -z "$DEBIAN$DSC_SHA256" ] || fehler "$q/paket.conf: UPSTREAM und DEBIAN schliessen sich aus"
+		[ -n "$TARBALL" ] && [ -n "$TARBALL_SHA256" ] || fehler "$q/paket.conf: TARBALL oder TARBALL_SHA256 fehlt"
+		[ -f "$R/$q/debian/control" ] && [ -f "$R/$q/debian/rules" ] || fehler "$q/debian/control oder debian/rules fehlt"
+		for x in patches debian-patches dateien; do
+			[ ! -e "$R/$q/$x" ] || fehler "$q/$x: bei Upstream-Rezepten gehoeren Patches nach $q/debian/patches/"
+		done
+		case $UPSTREAM in [0-9]*) ;; *) fehler "$q/paket.conf: UPSTREAM=$UPSTREAM beginnt nicht mit einer Ziffer" ;; esac
+		case $UPSTREAM in *[!A-Za-z0-9.+~]*) fehler "$q/paket.conf: UPSTREAM=$UPSTREAM enthaelt Zeichen ausserhalb [A-Za-z0-9.+~]" ;; esac
+		FASSUNG=$UPSTREAM-0$VERSION_TAG$REVISION${PAKETE_TEST:+~test.${PAKETE_TEST:0:7}}
+		export UPSTREAM
+	else
+		ART=debian
+		[ -n "$DEBIAN" ] || fehler "$q/paket.conf: weder DEBIAN noch UPSTREAM gesetzt"
+		FASSUNG=$DEBIAN+$VERSION_TAG$REVISION${PAKETE_TEST:+~test.${PAKETE_TEST:0:7}}
+	fi
 	OHNE_EPOCHE=${DEBIAN#*:}
-	FASSUNG=$DEBIAN+$VERSION_TAG$REVISION${PAKETE_TEST:+~test.${PAKETE_TEST:0:7}}
 	FASSUNG_DATEI=${FASSUNG#*:}
 	export QUELLE DEBIAN FASSUNG OPTIONEN PROFILE BAUART MAINTAINER SUITE CHANGELOG DATEIEN_KOPF FEHLT_ERLAUBT
 	POOL=$(pool "$QUELLE")
@@ -126,15 +150,37 @@ quelle_holen() {
 	done
 }
 
+# ---------------- Upstream-Tarball holen und pruefen (Upstream-Rezepte) ----------------
+# Abgelegt als <quelle>_<upstream>.orig.tar.<komp>; dpkg-buildpackage nimmt es als Grundlage des Quellpakets.
+upstream_holen() {
+	local komp=${TARBALL##*.tar.} f
+	case $komp in gz|xz|bz2|zst) ;; *) fehler "$QUELLE: TARBALL muss auf .tar.gz, .tar.xz, .tar.bz2 oder .tar.zst enden" ;; esac
+	D=$O/dl/$QUELLE/$UPSTREAM
+	f=${QUELLE}_$UPSTREAM.orig.tar.$komp
+	mkdir -p "$D"
+	echo "$TARBALL_SHA256  $D/$f" | sha256sum -c --status 2>/dev/null && return 0
+	rm -f "${D:?}/${f:?}"
+	echo "lade $TARBALL"
+	hole "$TARBALL" "$D/$f" || fehler "$TARBALL nicht ladbar"
+	echo "$TARBALL_SHA256  $D/$f" | sha256sum -c --status || fehler "Pruefsumme von $f passt nicht zu TARBALL_SHA256"
+}
+
 # ---------------- Eingabeschluessel ----------------
 # Alles, was das Ergebnis bestimmt: Suite/Spiegel/Snapshot, Rezept (pakete.conf, Dockerfile, bau-innen.sh), paket.conf
-# (Debian-Fassung, .dsc-Pruefsumme, Revision, Profile), Patches, zusaetzliche Dateien. Haengt nur von Dateien im Repo
-# ab (kein Docker noetig), deshalb auf jedem Rechner und in der CI derselbe Schluessel.
+# (Debian-Fassung, .dsc-Pruefsumme, Revision, Profile), Patches, zusaetzliche Dateien. Bei Upstream-Rezepten statt
+# bau-innen.sh, Patches und Dateien: bau-innen-upstream.sh und alle Dateien unter <quelle>/debian/ (Tarball-URL und
+# Pruefsumme stehen in paket.conf). Haengt nur von Dateien im Repo ab (kein Docker noetig), deshalb auf jedem
+# Rechner und in der CI derselbe Schluessel.
 # Nicht enthalten: bau.sh (Aufrufschicht), der Stand des Bau-Images und der Bauabhaengigkeiten im Spiegel zum
 # Bauzeitpunkt (fest nur mit SNAPSHOT); nach einem neuen Bau-Image mit --neu bauen.
 schluessel_teile() {
 	local f
 	echo "suite=$SUITE snapshot=${SNAPSHOT:--} spiegel=$MIRROR"
+	if [ "$ART" = upstream ]; then
+		(cd "$R" && sha256sum pakete.conf Dockerfile bau-innen-upstream.sh "$QUELLE/paket.conf" \
+			&& find "$QUELLE/debian" -type f | LC_ALL=C sort | xargs -r sha256sum)
+		return
+	fi
 	(cd "$R" && sha256sum pakete.conf Dockerfile bau-innen.sh "$QUELLE/paket.conf" && { find "$QUELLE/patches" "$QUELLE/debian-patches" -maxdepth 1 -type f -name '*.patch' 2>/dev/null || true; } | LC_ALL=C sort | xargs -r sha256sum)
 	dateien | while read -r f; do echo "$(sha256sum < "$R/$QUELLE/dateien/$f" | cut -d' ' -f1)  $f"; done
 }
@@ -215,7 +261,8 @@ bau() {   # bau <quelle> <neu 0|1>
 		return 0
 	fi
 	log "$QUELLE $FASSUNG: bauen (Schluessel $K)"
-	quelle_holen
+	local innen=bau-innen.sh
+	if [ "$ART" = upstream ]; then upstream_holen; innen=bau-innen-upstream.sh; else quelle_holen; fi
 	W=$O/bau/$QUELLE/$FASSUNG_DATEI
 	rm -rf "$W"; mkdir -p "$W/out" "$W/dateien"
 	dateien_kopieren "$W/dateien"
@@ -224,11 +271,11 @@ bau() {   # bau <quelle> <neu 0|1>
 	if [ "${PAKETE_CCACHE:-1}" != 0 ]; then mkdir -p "$O/ccache/$QUELLE"; cc="$O/ccache/$QUELLE"; fi
 	rc=0
 	timeout "$TIMEOUT" docker run --rm --platform linux/arm64 \
-		-e QUELLE -e DEBIAN -e FASSUNG -e MODUS=bau -e OPTIONEN -e PROFILE -e BAUART -e MAINTAINER -e SUITE -e CHANGELOG -e DATEIEN_KOPF -e FEHLT_ERLAUBT \
+		-e QUELLE -e DEBIAN -e UPSTREAM -e FASSUNG -e MODUS=bau -e OPTIONEN -e PROFILE -e BAUART -e MAINTAINER -e SUITE -e CHANGELOG -e DATEIEN_KOPF -e FEHLT_ERLAUBT \
 		-e DATUM="$(datum)" -e APT_QUELLE="deb $APT_OPT$APT_BASIS $SUITE main" -e HUID="$(id -u)" -e HGID="$(id -g)" \
 		-v "$R:/pakete:ro" -v "$R/$QUELLE:/rezept:ro" -v "$D:/dl:ro" -v "$W/dateien:/dateien:ro" -v "$W/out:/out" \
 		${cc:+-v "$cc:/ccache" -e CCACHE_MAXSIZE="${PAKETE_CCACHE_MAX:-2G}"} \
-		"$BAUIMG" $NI sh /pakete/bau-innen.sh || rc=$?
+		"$BAUIMG" $NI sh "/pakete/$innen" || rc=$?
 	[ $rc = 0 ] || fehler "$QUELLE: Bau fehlgeschlagen (rc $rc, Logs in $W/out/log)"
 	local min=$(( (SECONDS - t0) / 60 )) cct=-
 	[ ! -f "$W/out/log/ccache.txt" ] || cct=$(sed -n 's/^ *Hits: *//p' "$W/out/log/ccache.txt" | head -1 | tr -d ' ')
@@ -321,9 +368,21 @@ done
 echo \"\$q \$max\"; done"
 }
 
+# Neueste Release eines GitLab-Projekts (GITLAB=https://<host>/<pfad>), ohne fuehrendes v; leer, wenn nicht abfragbar
+gitlab_release() {
+	local h=${1#https://} p
+	p=${h#*/} h=${h%%/*}
+	{ timeout 60 curl -fsSL "https://$h/api/v4/projects/${p//\//%2F}/releases/permalink/latest" \
+		| python3 -I -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].removeprefix("v"))'; } 2>/dev/null || true
+}
+
 pruefen() {
-	local qs="" q v rc=0
-	for f in "$R"/*/paket.conf; do qs="$qs $(basename "$(dirname "$f")")"; done
+	local qs="" us="" q v s rc=0
+	for f in "$R"/*/paket.conf; do
+		q=$(basename "$(dirname "$f")")
+		lade_conf "$q"
+		if [ "$ART" = upstream ]; then us="$us $q"; else qs="$qs $q"; fi
+	done
 	images
 	printf '%-14s %-22s %-22s %s\n' QUELLE "UNSERE BASIS" "DEBIAN $SUITE" STAND
 	while read -r q v; do
@@ -334,6 +393,18 @@ pruefen() {
 		else s="aelter in Debian"; fi
 		printf '%-14s %-22s %-22s %s\n' "$q" "$DEBIAN" "$v" "$s"
 	done < <(debian_fassung "$SUITE" $qs)
+	# Upstream-Rezepte: nur Meldung, kein rc 3 (nachziehen gilt nur fuer Debian-Rezepte)
+	for q in $us; do
+		lade_conf "$q"
+		v=
+		[ -z "$GITLAB" ] || v=$(gitlab_release "$GITLAB")
+		if [ -z "$GITLAB" ]; then s="nicht abgefragt (GITLAB fehlt in paket.conf)"
+		elif [ -z "$v" ]; then s="nicht abfragbar ($GITLAB)"
+		elif [ "$v" = "$UPSTREAM" ]; then s=aktuell
+		elif dpkg --compare-versions "$v" gt "$UPSTREAM"; then s="upstream neuer: UPSTREAM und TARBALL_SHA256 in $q/paket.conf heben"
+		else s="aelter upstream"; fi
+		printf '%-14s %-22s %-22s %s\n' "$q" "$UPSTREAM" "upstream ${v:--}" "$s"
+	done
 	return $rc
 }
 
@@ -345,6 +416,7 @@ nachziehen() {   # nachziehen <quelle> [<fassung>] [--suite <s>] [--uebernehmen]
 		shift
 	done
 	lade_conf "$q"
+	[ "$ART" = debian ] || fehler "$q ist ein Upstream-Rezept: UPSTREAM und TARBALL_SHA256 in $q/paket.conf von Hand heben"
 	images
 	[ -n "$ziel" ] || ziel=$(debian_fassung "$s" "$q" | awk '{print $2}')
 	[ -n "$ziel" ] && [ "$ziel" != - ] || fehler "$q nicht in Debian $s"

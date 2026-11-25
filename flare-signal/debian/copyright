@@ -1,0 +1,43 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Flare
+Upstream-Contact: Julian Schmidhuber <mobile@schmidhuberj.de>
+Source: https://gitlab.com/schmiddi-on-mobile/flare
+Comment: The source is the upstream release tarball, which carries the Rust
+ crates the program is built from under vendor/.
+
+Files: *
+Copyright: 2022-2026 Julian Schmidhuber <mobile@schmidhuberj.de> and the Flare contributors
+License: AGPL-3.0-only
+
+Files: vendor/*
+Copyright: The authors of each crate, named in vendor/<crate>/Cargo.toml and in
+ the license files of the crate.
+License: other
+ Each crate is under the license expression in the field "license" of its
+ Cargo.toml. Most crates are under MIT, Apache-2.0 or a choice of both; presage,
+ libsignal-service and the libsignal crates are under AGPL-3.0-only; others are
+ under BSD-2-Clause, BSD-3-Clause, ISC, MPL-2.0, Unicode-3.0, Zlib, Unlicense,
+ CC0-1.0 or CDLA-Permissive-2.0, mostly as one choice among several. Some
+ crates carry C libraries with their own license files: libsqlite3-sys builds
+ the bundled SQLCipher (BSD-3-Clause, Zetetic LLC), aws-lc-sys and ring build
+ AWS-LC and BoringSSL derived code (ISC, Apache-2.0, MIT, BSD-3-Clause).
+ /usr/share/doc/flare-signal/vendor-licenses.gz lists every crate with version
+ and license expression and contains the license texts the crates ship.
+
+Files: debian/*
+Copyright: 2026 pocket-debs <masterxq@users.noreply.github.com>
+License: AGPL-3.0-only
+
+License: AGPL-3.0-only
+ This program is free software: you can redistribute it and/or modify it under
+ the terms of the GNU Affero General Public License as published by the Free
+ Software Foundation, version 3 of the License.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+ details.
+ .
+ The full text of the GNU Affero General Public License version 3 is in
+ /usr/share/doc/flare-signal/LICENSE.gz (the file LICENSE of the upstream
+ source).
