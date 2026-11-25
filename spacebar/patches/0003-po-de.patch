@@ -1,0 +1,44 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] po/de: German translation of the strings for several SIMs
+Description:
+ German translation of the strings added by the patches for several SIMs:
+ the SIM choice of the messaging application (send button, menu,
+ settings, SIM names of the daemon).
+Forwarded: not-needed
+License: as the patched files (the translations are under the license of the translated program)
+Last-Update: 2026-11-25
+---
+--- a/po/de/spacebar.po
++++ b/po/de/spacebar.po
+@@ -529,6 +529,30 @@ msgstr "Spacebar-SMS/MMS-Programm"
+ msgid "Open a chat with the given phone number"
+ msgstr "Einen Chat mit der angegebenen Telefonnummern öffnen"
+ 
++#, kde-format
++msgctxt "@label name of a SIM card after its slot"
++msgid "SIM %1"
++msgstr "SIM %1"
++
++msgctxt "@label name of a SIM card"
++msgid "SIM"
++msgstr "SIM"
++
++#, kde-format
++msgctxt "@action:button %1 is the name of a SIM"
++msgid "Send through %1"
++msgstr "Über %1 senden"
++
++msgctxt "@title:menu"
++msgid "Send Through"
++msgstr "Senden über"
++
++msgid "SIM for calls and messages"
++msgstr "SIM für Anrufe und Nachrichten"
++
++msgid "Used for new conversations; replies go through the SIM the last message came in on."
++msgstr "Für neue Unterhaltungen; Antworten gehen über die SIM, auf der die letzte Nachricht ankam."
++
+ #~ msgctxt "Open chat conversation window"
+ #~ msgid "Next"
+ #~ msgstr "Weiter"
