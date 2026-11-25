@@ -3,48 +3,46 @@ Date: Tue, 25 Nov 2026 12:00:00 +0100
 Subject: [PATCH] spacebar: choose the SIM of a message
 Description:
  With several SIMs a message goes through the SIM the latest received
- message of the conversation came in on, else through the default SIM (a
- new setting, the first SIM without a choice). A button next to the send
- button shows the icon of that SIM and lets the user send the next message
- through another SIM; the choice is not remembered. With one SIM nothing
- changes.
+ message of the conversation came in on, else through the default SIM: the
+ SIM chosen for calls and text messages, shared with the cellular network
+ settings and the dialer (simidentitiesrc), the SIM in the first slot
+ without a choice; the settings page offers the same choice. A button next
+ to the send button shows the icon of that SIM and lets the user send the
+ next message through another SIM; the choice is not remembered. With one
+ SIM nothing changes.
  .
  Needs the daemon of this version (sendMessage with the SIM, sims()).
 Forwarded: no
 License: as the patched files (GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL)
 Last-Update: 2026-11-25
 ---
---- a/lib/config/settingsmanager.kcfg
-+++ b/lib/config/settingsmanager.kcfg
-@@ -94,4 +94,10 @@
-             <default>true</default>
-         </entry>
-     </group>
-+    <group name="Messages">
-+        <entry name="defaultSim" type="String">
-+            <label>Identifier (ICCID) of the SIM used for new conversations by default</label>
-+            <default></default>
-+        </entry>
-+    </group>
- </kcfg>
 --- a/src/channelhandler.cpp
 +++ b/src/channelhandler.cpp
-@@ -4,9 +4,14 @@
- // SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+@@ -5,8 +5,13 @@
  
  #include "channelhandler.h"
-+#include "settingsmanager.h"
  
 +#include <QDBusPendingCallWatcher>
 +#include <QDBusPendingReply>
  #include <QLocale>
  
 +#include <database.h>
++#include <simidentities.h>
 +
  #include <global.h>
  
  const QString DAEMON_DBUS_SERVICE = QStringLiteral("org.kde.spacebar.Daemon");
-@@ -72,6 +77,65 @@ void ChannelHandler::connectInterfaceSignals()
+@@ -14,6 +19,9 @@ const QString DAEMON_DBUS_SERVICE = QStringLiteral("org.kde.spacebar.Daemon");
+ ChannelHandler::ChannelHandler(QObject *parent)
+     : QObject(parent)
+ {
++    // the default SIM is shared with the other applications
++    connect(SimIdentities::instance(), &SimIdentities::changed, this, &ChannelHandler::defaultSimChanged);
++
+     // Daemon DBus interface
+     connectInterface();
+     m_isInterfaceAvailable = m_interface->isValid();
+@@ -72,6 +80,64 @@ void ChannelHandler::connectInterfaceSignals()
          Q_UNUSED(id);
          Q_EMIT messagesChanged(PhoneNumberList(phoneNumber));
      });
@@ -73,6 +71,7 @@ Last-Update: 2026-11-25
 +        if (sims != m_sims) {
 +            m_sims = sims;
 +            Q_EMIT simsChanged();
++            Q_EMIT defaultSimChanged();
 +        }
 +    });
 +}
@@ -95,14 +94,12 @@ Last-Update: 2026-11-25
 +
 +void ChannelHandler::setDefaultSim(const QString &simIdentifier)
 +{
-+    SettingsManager::self()->setDefaultSim(simIdentifier);
-+    SettingsManager::self()->save();
-+    Q_EMIT simsChanged();
++    SimIdentities::instance()->setDefaultSim(simIdentifier);
 +}
 +
 +QString ChannelHandler::defaultSim() const
 +{
-+    const QString chosen = SettingsManager::self()->defaultSim();
++    const QString chosen = SimIdentities::instance()->defaultSim();
 +    if (!sim(chosen).isEmpty()) {
 +        return chosen;
 +    }
@@ -112,18 +109,19 @@ Last-Update: 2026-11-25
  org::kde::spacebar::Daemon *ChannelHandler::interface()
 --- a/src/channelhandler.h
 +++ b/src/channelhandler.h
-@@ -14,6 +14,10 @@ class ChannelHandler : public QObject
+@@ -14,6 +14,11 @@ class ChannelHandler : public QObject
  {
      Q_OBJECT
      Q_PROPERTY(bool isDaemonAvailable READ isInterfaceAvailable NOTIFY isInterfaceAvailableChanged)
 +    // active SIM of every modem: simIdentifier, deviceUni, slot, name, icon
 +    Q_PROPERTY(QVariantList sims READ sims NOTIFY simsChanged)
-+    // SIM for messages without a reply SIM: the chosen default SIM if inserted, else the first SIM
-+    Q_PROPERTY(QString defaultSim READ defaultSim NOTIFY simsChanged)
++    // SIM for messages without a reply SIM: the SIM chosen for calls and text messages (shared with
++    // other applications) if inserted, else the first SIM
++    Q_PROPERTY(QString defaultSim READ defaultSim NOTIFY defaultSimChanged)
  
  public:
      explicit ChannelHandler(QObject *parent = nullptr);
-@@ -22,17 +26,26 @@ public:
+@@ -22,17 +27,27 @@ public:
  
      bool isInterfaceAvailable();
  
@@ -149,6 +147,7 @@ Last-Update: 2026-11-25
      void channelOpen(const QString &phoneNumber);
      void messagesChanged(const PhoneNumberList &phoneNumberList);
 +    void simsChanged();
++    void defaultSimChanged();
  };
 --- a/src/contents/ui/MessagesPage.qml
 +++ b/src/contents/ui/MessagesPage.qml
@@ -241,21 +240,35 @@ Last-Update: 2026-11-25
                  Layout.alignment: Qt.AlignRight | Qt.AlignBottom
 --- a/src/contents/ui/settings/SettingsPage.qml
 +++ b/src/contents/ui/settings/SettingsPage.qml
-@@ -37,6 +37,23 @@ Kirigami.ScrollablePage {
+@@ -37,6 +37,37 @@ Kirigami.ScrollablePage {
          FormCard.FormCard {
              Layout.fillWidth: true
  
++            // shared with the cellular network settings and the dialer
 +            FormCard.FormComboBoxDelegate {
 +                id: defaultSim
 +
++                // the combo box resets its index when the model changes, so the index is set afterwards
++                function syncCurrentIndex() {
++                    currentIndex = ChannelHandler.sims.findIndex(sim => sim.simIdentifier === ChannelHandler.defaultSim);
++                }
++
 +                visible: ChannelHandler.sims.length > 1
 +                displayMode: FormCard.FormComboBoxDelegate.Dialog
-+                text: i18n("Default SIM")
++                text: i18n("SIM for calls and messages")
 +                description: i18n("Used for new conversations; replies go through the SIM the last message came in on.")
 +                model: ChannelHandler.sims
 +                textRole: "name"
-+                currentIndex: ChannelHandler.sims.findIndex(sim => sim.simIdentifier === ChannelHandler.defaultSim)
++                onModelChanged: Qt.callLater(() => defaultSim.syncCurrentIndex())
++                Component.onCompleted: syncCurrentIndex()
 +                onActivated: index => ChannelHandler.setDefaultSim(ChannelHandler.sims[index].simIdentifier)
++
++                Connections {
++                    target: ChannelHandler
++                    function onDefaultSimChanged() {
++                        Qt.callLater(() => defaultSim.syncCurrentIndex());
++                    }
++                }
 +            }
 +
 +            FormCard.FormDelegateSeparator {

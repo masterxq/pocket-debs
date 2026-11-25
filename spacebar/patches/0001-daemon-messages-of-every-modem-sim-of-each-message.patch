@@ -617,7 +617,7 @@ Last-Update: 2026-11-25
  };
 --- /dev/null
 +++ b/lib/telephonySupport/simidentities.cpp
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,130 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
 +
@@ -635,6 +635,8 @@ Last-Update: 2026-11-25
 +static const auto s_configName = u"simidentitiesrc"_s;
 +static const auto s_simsGroup = u"Sim"_s;
 +static const auto s_iconKey = u"Icon"_s;
++static const auto s_defaultsGroup = u"Defaults"_s;
++static const auto s_defaultSimKey = u"Sim"_s;
 +
 +SimIdentities *SimIdentities::instance()
 +{
@@ -703,8 +705,10 @@ Last-Update: 2026-11-25
 +        return icon;
 +    }
 +
++    // stored at once, so that the SIM keeps the icon; changed() is not emitted here, since
++    // this is called from property getters: the icons of other SIMs stay as they are
 +    icon = defaultIcon();
-+    setIcon(simIdentifier, icon);
++    writeEntry(simGroup(simIdentifier), s_iconKey, icon);
 +    return icon;
 +}
 +
@@ -714,17 +718,39 @@ Last-Update: 2026-11-25
 +        return;
 +    }
 +
-+    KConfigGroup group = simGroup(simIdentifier);
-+    if (group.readEntry(s_iconKey, QString()) == icon) {
++    if (writeEntry(simGroup(simIdentifier), s_iconKey, icon)) {
++        Q_EMIT changed();
++    }
++}
++
++QString SimIdentities::defaultSim() const
++{
++    return KConfigGroup(m_config, s_defaultsGroup).readEntry(s_defaultSimKey, QString());
++}
++
++void SimIdentities::setDefaultSim(const QString &simIdentifier)
++{
++    if (simIdentifier.isEmpty()) {
 +        return;
 +    }
-+    group.writeEntry(s_iconKey, icon, KConfig::Notify);
++
++    if (writeEntry(KConfigGroup(m_config, s_defaultsGroup), s_defaultSimKey, simIdentifier)) {
++        Q_EMIT changed();
++    }
++}
++
++bool SimIdentities::writeEntry(KConfigGroup group, const QString &key, const QString &value)
++{
++    if (group.readEntry(key, QString()) == value) {
++        return false;
++    }
++    group.writeEntry(key, value, KConfig::Notify);
 +    m_config->sync();
-+    Q_EMIT changed();
++    return true;
 +}
 --- /dev/null
 +++ b/lib/telephonySupport/simidentities.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,69 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
 +
@@ -749,9 +775,13 @@ Last-Update: 2026-11-25
 + * (when all are in use, the least used one, earlier ones first), and the
 + * choice is stored at once, so every application shows the same icon.
 + *
++ * The SIM used for calls and text messages by default is stored by its
++ * ICCID as well.
++ *
 + * Storage: simidentitiesrc in the configuration directory, one group per SIM
-+ * below the group "Sim", named after the ICCID, with the entry Icon. Writes
-+ * are notified, so that other processes follow at once.
++ * below the group "Sim", named after the ICCID, with the entry Icon; the
++ * default SIM for calls and text messages in the entry Sim of the group
++ * "Defaults". Writes are notified, so that other processes follow at once.
 + */
 +class SimIdentities : public QObject
 +{
@@ -769,7 +799,14 @@ Last-Update: 2026-11-25
 +    /** Stores the icon chosen for the SIM. */
 +    void setIcon(const QString &simIdentifier, const QString &icon);
 +
++    /** Identifier of the SIM chosen for calls and text messages, empty if none was chosen. */
++    QString defaultSim() const;
++
++    /** Stores the SIM chosen for calls and text messages. */
++    void setDefaultSim(const QString &simIdentifier);
++
 +Q_SIGNALS:
++    /** An icon or the default SIM changed, in this or another process. */
 +    void changed();
 +
 +private:
@@ -777,6 +814,8 @@ Last-Update: 2026-11-25
 +
 +    KConfigGroup simGroup(const QString &simIdentifier) const;
 +    QString defaultIcon() const;
++    // writes the entry if it differs, returns whether it was written
++    bool writeEntry(KConfigGroup group, const QString &key, const QString &value);
 +
 +    KSharedConfig::Ptr m_config;
 +    KConfigWatcher::Ptr m_watcher;
