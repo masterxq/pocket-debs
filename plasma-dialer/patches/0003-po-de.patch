@@ -1,0 +1,57 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] po/de: German translation of the strings for several SIMs
+Description:
+ German translation of the strings added by the patches for several SIMs:
+ the SIM choice of the dialer (call buttons, menu, call back, settings).
+Forwarded: not-needed
+License: as the patched files (the translations are under the license of the translated program)
+Last-Update: 2026-11-25
+---
+--- a/po/de/plasma-dialer.po
++++ b/po/de/plasma-dialer.po
+@@ -335,6 +335,44 @@ msgstr "Senden"
+ msgid "Cancel USSD session"
+ msgstr "USSD-Sitzung abbrechen"
+ 
++#, kde-format
++msgctxt "@action:button"
++msgid "Call through %1"
++msgstr "Über %1 anrufen"
++
++msgctxt "@action:button"
++msgid "Call through another SIM"
++msgstr "Über eine andere SIM anrufen"
++
++msgctxt "@title:menu"
++msgid "Call Through"
++msgstr "Anrufen über"
++
++#, kde-format
++msgctxt "@item:inmenu SIM, default"
++msgid "%1 (default)"
++msgstr "%1 (Standard)"
++
++msgctxt "@action:button"
++msgid "Call"
++msgstr "Anrufen"
++
++msgctxt "@action:button"
++msgid "Call back"
++msgstr "Zurückrufen"
++
++msgid "SIM for calls and messages"
++msgstr "SIM für Anrufe und Nachrichten"
++
++#, kde-format
++msgctxt "@label name of a SIM card after its slot"
++msgid "SIM %1"
++msgstr "SIM %1"
++
++msgctxt "@label name of a SIM card"
++msgid "SIM"
++msgstr "SIM"
++
+ #~ msgid "More Info:"
+ #~ msgstr "Weitere Informationen:"
+ 

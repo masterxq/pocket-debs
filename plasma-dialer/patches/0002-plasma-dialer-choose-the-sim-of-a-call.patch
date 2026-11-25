@@ -1,25 +1,104 @@
 From: pocket-debs <masterxq@users.noreply.github.com>
 Date: Tue, 25 Nov 2026 12:00:00 +0100
-Subject: [PATCH] plasma-dialer: choose the SIM of a call
+Subject: [PATCH] plasma-dialer: choose the SIM of a call, show the SIM of the active call
 Description:
  With more than one modem the dialer chose no modem ("TODO: select device
  uni"): dialling, USSD and the controls of the call screen did nothing.
  .
- SimUtils lists the active SIM of every modem with its slot (PrimarySimSlot,
- read over D-Bus), name ("SIM <slot>", else the operator name) and icon
- (shared with plasma-nm and spacebar in simidentitiesrc, class
- SimIdentities). The default SIM for calls is a setting (by ICCID), the
- first SIM without a choice. With several SIMs the call button calls
- through the default SIM and carries the icon of that SIM as a badge; the
- so far empty cell left of it holds a smaller, tinted call button for the
- other SIM, or with three and more SIMs one that opens a choice. One tap is
- one call, nothing is remembered. USSD goes through the default SIM. The
- call history offers a call back button through the SIM of the call (the
- SIM identifier stored with each call). With one SIM nothing changes.
+ SimUtils lists the active SIM of every modem with its slot
+ (PrimarySimSlot, read over D-Bus), name ("SIM <slot>", else the operator
+ name) and icon (shared with plasma-nm and spacebar in simidentitiesrc,
+ class SimIdentities). The default SIM for calls is the SIM chosen for
+ calls and text messages, kept by its ICCID in simidentitiesrc and shared
+ with the cellular network settings and the messaging application (the
+ settings page offers the same choice); without a choice it is the SIM in
+ the first slot. With several SIMs the call button calls through the
+ default SIM and carries the icon of that SIM as a badge; the so far empty
+ cell left of it holds a smaller, tinted call button for the other SIM, or
+ with three and more SIMs one that opens a choice. One tap is one call,
+ nothing is remembered. USSD goes through the default SIM. The call history
+ offers a call back button through the SIM of the call (the SIM identifier
+ stored with each call). The call screen shows the icon and name of the SIM
+ of the active call and controls the call through its modem
+ (ActiveCallModel.account, the SIM identifier of the active call). With one
+ SIM nothing changes.
 Forwarded: no
 License: as the patched files (LGPL-2.0-or-later, GPL-2.0-or-later, LicenseRef-KDE-Accepted-GPL); new files simutils.*, CallButton.qml LGPL-2.0-or-later, simidentities.* LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
 Last-Update: 2026-11-25
 ---
+--- a/kde-telephony-plugin-declarative/src/active-call-model.cpp
++++ b/kde-telephony-plugin-declarative/src/active-call-model.cpp
+@@ -206,6 +206,19 @@ void ActiveCallModel::setDuration(qulonglong duration)
+     Q_EMIT durationChanged();
+ }
+ 
++QString ActiveCallModel::account() const
++{
++    return m_account;
++}
++
++void ActiveCallModel::setAccount(const QString &account)
++{
++    if (m_account == account)
++        return;
++    m_account = account;
++    Q_EMIT accountChanged();
++}
++
+ void ActiveCallModel::setCallUtils(org::kde::telephony::CallUtils *callUtils)
+ {
+     if (!callUtils) {
+@@ -269,11 +282,13 @@ void ActiveCallModel::updateActiveCallProps()
+         setInCall(false);
+         setIncoming(false);
+         setDuration(0);
++        setAccount(QString());
+         return;
+     }
+ 
+     DialerTypes::CallData call = findActiveCall();
+     setCommunicationWith(call.communicationWith);
++    setAccount(call.account);
+     setActive(true);
+     setInCall(call.state == DialerTypes::CallState::Active);
+     setIncoming(call.direction == DialerTypes::CallDirection::Incoming);
+--- a/kde-telephony-plugin-declarative/src/active-call-model.h
++++ b/kde-telephony-plugin-declarative/src/active-call-model.h
+@@ -16,6 +16,8 @@ class ActiveCallModel : public CallModel
+     Q_PROPERTY(bool inCall READ inCall NOTIFY inCallChanged)
+     Q_PROPERTY(QString communicationWith READ communicationWith NOTIFY communicationWithChanged)
+     Q_PROPERTY(qulonglong duration READ duration NOTIFY durationChanged)
++    // account of the active call; for a call through a modem the identifier (ICCID) of its SIM
++    Q_PROPERTY(QString account READ account NOTIFY accountChanged)
+ 
+ public:
+     ActiveCallModel(QObject *parent = nullptr);
+@@ -37,6 +39,9 @@ public:
+     qulonglong duration() const;
+     void setDuration(qulonglong duration);
+ 
++    QString account() const;
++    void setAccount(const QString &account);
++
+     void setCallUtils(org::kde::telephony::CallUtils *callUtils);
+ 
+ public Q_SLOTS:
+@@ -53,6 +58,7 @@ Q_SIGNALS:
+     void incomingChanged();
+     void communicationWithChanged();
+     void durationChanged();
++    void accountChanged();
+ 
+ private Q_SLOTS:
+     void onUtilsCallAdded(const QString &deviceUni,
+@@ -77,6 +83,7 @@ private:
+     bool m_incoming = false;
+     QString m_communicationWith;
+     qulonglong m_duration;
++    QString m_account;
+ 
+     void updateTimers();
+ };
 --- a/plasma-dialer/src/CMakeLists.txt
 +++ b/plasma-dialer/src/CMakeLists.txt
 @@ -5,6 +5,8 @@
@@ -56,21 +135,6 @@ Last-Update: 2026-11-25
      KF6::Crash
      KF6::I18n
      KF6::I18nQml
---- a/plasma-dialer/src/config.kcfg
-+++ b/plasma-dialer/src/config.kcfg
-@@ -43,6 +43,12 @@
-             </choices>
-         </entry>
-     </group>
-+    <group name="Calls">
-+        <entry name="defaultSim" type="String">
-+            <label>Identifier (ICCID) of the SIM used for calls by default</label>
-+            <default></default>
-+        </entry>
-+    </group>
-     <group name="Sound">
-         <entry name="customRingtone" type="String">
-             <label>Custom ringtone file path</label>
 --- a/plasma-dialer/src/qml/Main.qml
 +++ b/plasma-dialer/src/qml/Main.qml
 @@ -90,6 +90,7 @@ Kirigami.ApplicationWindow {
@@ -91,6 +155,60 @@ Last-Update: 2026-11-25
      }
  
      function call(number) {
+--- a/plasma-dialer/src/qml/call/ActiveCallView.qml
++++ b/plasma-dialer/src/qml/call/ActiveCallView.qml
+@@ -10,6 +10,7 @@ import org.kde.kirigami as Kirigami
+ import org.kde.telephony
+ import org.kde.kirigamiaddons.components as Addons
+ import org.kde.people as KPeople
++import org.kde.plasma.dialer
+ 
+ import ".."
+ 
+@@ -64,6 +65,29 @@ Item {
+             visible: text != ""
+         }
+ 
++        // with several SIMs: the SIM of the call
++        RowLayout {
++            id: callSim
++
++            readonly property var sim: SimUtils.sims.find(sim => sim.simIdentifier !== "" && sim.simIdentifier === ActiveCallModel.account)
++
++            Layout.alignment: Qt.AlignHCenter
++            visible: SimUtils.sims.length > 1 && sim !== undefined
++            spacing: Kirigami.Units.smallSpacing
++
++            Kirigami.Icon {
++                Layout.preferredWidth: Kirigami.Units.iconSizes.small
++                Layout.preferredHeight: Kirigami.Units.iconSizes.small
++                source: callSim.sim ? callSim.sim.icon : ""
++                isMask: true
++                color: Kirigami.Theme.textColor
++            }
++
++            Controls.Label {
++                text: callSim.sim ? callSim.sim.name : ""
++            }
++        }
++
+         Item {
+             Layout.fillHeight: true
+             Layout.fillWidth: true
+--- a/plasma-dialer/src/qml/call/CallPage.qml
++++ b/plasma-dialer/src/qml/call/CallPage.qml
+@@ -23,8 +23,10 @@ Kirigami.Page {
+     property int callDuration: ActiveCallModel.duration
+     property string callCommunicationWith: ActiveCallModel.communicationWith
+ 
++    // the modem with the SIM of the active call, else the default one
+     function activeDeviceUni() {
+-        return applicationWindow().selectModem();
++        const deviceUni = SimUtils.deviceForSim(ActiveCallModel.account);
++        return deviceUni !== "" ? deviceUni : applicationWindow().selectModem();
+     }
+ 
+     function activeCallUni() {
 --- /dev/null
 +++ b/plasma-dialer/src/qml/dialpad/CallButton.qml
 @@ -0,0 +1,75 @@
@@ -333,20 +451,34 @@ Last-Update: 2026-11-25
  }
 --- a/plasma-dialer/src/qml/settings/SettingsPage.qml
 +++ b/plasma-dialer/src/qml/settings/SettingsPage.qml
-@@ -44,6 +44,24 @@ FormCard.FormCardPage {
+@@ -44,6 +44,38 @@ FormCard.FormCardPage {
      FormCard.FormCard {
          Layout.topMargin: Kirigami.Units.gridUnit
  
++        // shared with the cellular network settings and the messaging application
 +        FormCard.FormComboBoxDelegate {
 +            id: defaultSim
 +
++            // the combo box resets its index when the model changes, so the index is set afterwards
++            function syncCurrentIndex() {
++                currentIndex = SimUtils.sims.findIndex(sim => sim.simIdentifier === SimUtils.defaultSimIdentifier);
++            }
++
 +            visible: SimUtils.sims.length > 1
 +            displayMode: FormCard.FormComboBoxDelegate.Dialog
-+            text: i18n("Default SIM for calls")
++            text: i18n("SIM for calls and messages")
 +            model: SimUtils.sims
 +            textRole: "name"
-+            currentIndex: SimUtils.sims.findIndex(sim => sim.simIdentifier === SimUtils.defaultSimIdentifier)
++            onModelChanged: Qt.callLater(() => defaultSim.syncCurrentIndex())
++            Component.onCompleted: syncCurrentIndex()
 +            onActivated: index => SimUtils.defaultSimIdentifier = SimUtils.sims[index].simIdentifier
++
++            Connections {
++                target: SimUtils
++                function onDefaultSimChanged() {
++                    Qt.callLater(() => defaultSim.syncCurrentIndex());
++                }
++            }
 +        }
 +
 +        FormCard.FormDelegateSeparator {
@@ -360,7 +492,7 @@ Last-Update: 2026-11-25
  
 --- /dev/null
 +++ b/plasma-dialer/src/simidentities.cpp
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,130 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
 +
@@ -378,6 +510,8 @@ Last-Update: 2026-11-25
 +static const auto s_configName = u"simidentitiesrc"_s;
 +static const auto s_simsGroup = u"Sim"_s;
 +static const auto s_iconKey = u"Icon"_s;
++static const auto s_defaultsGroup = u"Defaults"_s;
++static const auto s_defaultSimKey = u"Sim"_s;
 +
 +SimIdentities *SimIdentities::instance()
 +{
@@ -446,8 +580,10 @@ Last-Update: 2026-11-25
 +        return icon;
 +    }
 +
++    // stored at once, so that the SIM keeps the icon; changed() is not emitted here, since
++    // this is called from property getters: the icons of other SIMs stay as they are
 +    icon = defaultIcon();
-+    setIcon(simIdentifier, icon);
++    writeEntry(simGroup(simIdentifier), s_iconKey, icon);
 +    return icon;
 +}
 +
@@ -457,17 +593,39 @@ Last-Update: 2026-11-25
 +        return;
 +    }
 +
-+    KConfigGroup group = simGroup(simIdentifier);
-+    if (group.readEntry(s_iconKey, QString()) == icon) {
++    if (writeEntry(simGroup(simIdentifier), s_iconKey, icon)) {
++        Q_EMIT changed();
++    }
++}
++
++QString SimIdentities::defaultSim() const
++{
++    return KConfigGroup(m_config, s_defaultsGroup).readEntry(s_defaultSimKey, QString());
++}
++
++void SimIdentities::setDefaultSim(const QString &simIdentifier)
++{
++    if (simIdentifier.isEmpty()) {
 +        return;
 +    }
-+    group.writeEntry(s_iconKey, icon, KConfig::Notify);
++
++    if (writeEntry(KConfigGroup(m_config, s_defaultsGroup), s_defaultSimKey, simIdentifier)) {
++        Q_EMIT changed();
++    }
++}
++
++bool SimIdentities::writeEntry(KConfigGroup group, const QString &key, const QString &value)
++{
++    if (group.readEntry(key, QString()) == value) {
++        return false;
++    }
++    group.writeEntry(key, value, KConfig::Notify);
 +    m_config->sync();
-+    Q_EMIT changed();
++    return true;
 +}
 --- /dev/null
 +++ b/plasma-dialer/src/simidentities.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,69 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
 +
@@ -492,9 +650,13 @@ Last-Update: 2026-11-25
 + * (when all are in use, the least used one, earlier ones first), and the
 + * choice is stored at once, so every application shows the same icon.
 + *
++ * The SIM used for calls and text messages by default is stored by its
++ * ICCID as well.
++ *
 + * Storage: simidentitiesrc in the configuration directory, one group per SIM
-+ * below the group "Sim", named after the ICCID, with the entry Icon. Writes
-+ * are notified, so that other processes follow at once.
++ * below the group "Sim", named after the ICCID, with the entry Icon; the
++ * default SIM for calls and text messages in the entry Sim of the group
++ * "Defaults". Writes are notified, so that other processes follow at once.
 + */
 +class SimIdentities : public QObject
 +{
@@ -512,7 +674,14 @@ Last-Update: 2026-11-25
 +    /** Stores the icon chosen for the SIM. */
 +    void setIcon(const QString &simIdentifier, const QString &icon);
 +
++    /** Identifier of the SIM chosen for calls and text messages, empty if none was chosen. */
++    QString defaultSim() const;
++
++    /** Stores the SIM chosen for calls and text messages. */
++    void setDefaultSim(const QString &simIdentifier);
++
 +Q_SIGNALS:
++    /** An icon or the default SIM changed, in this or another process. */
 +    void changed();
 +
 +private:
@@ -520,6 +689,8 @@ Last-Update: 2026-11-25
 +
 +    KConfigGroup simGroup(const QString &simIdentifier) const;
 +    QString defaultIcon() const;
++    // writes the entry if it differs, returns whether it was written
++    bool writeEntry(KConfigGroup group, const QString &key, const QString &value);
 +
 +    KSharedConfig::Ptr m_config;
 +    KConfigWatcher::Ptr m_watcher;
@@ -533,7 +704,6 @@ Last-Update: 2026-11-25
 +
 +#include "simutils.h"
 +
-+#include "config.h"
 +#include "simidentities.h"
 +
 +#include <KLocalizedString>
@@ -559,7 +729,11 @@ Last-Update: 2026-11-25
 +{
 +    connect(ModemManager::notifier(), &ModemManager::Notifier::modemAdded, this, &SimUtils::update);
 +    connect(ModemManager::notifier(), &ModemManager::Notifier::modemRemoved, this, &SimUtils::update);
-+    connect(SimIdentities::instance(), &SimIdentities::changed, this, &SimUtils::update);
++    // an icon or the default SIM changed
++    connect(SimIdentities::instance(), &SimIdentities::changed, this, [this]() {
++        update();
++        Q_EMIT defaultSimChanged();
++    });
 +    update();
 +}
 +
@@ -639,6 +813,7 @@ Last-Update: 2026-11-25
 +    if (sims != m_sims) {
 +        m_sims = sims;
 +        Q_EMIT simsChanged();
++        Q_EMIT defaultSimChanged();
 +    }
 +}
 +
@@ -649,7 +824,7 @@ Last-Update: 2026-11-25
 +
 +QString SimUtils::defaultSimIdentifier() const
 +{
-+    const QString chosen = Config::self()->defaultSim();
++    const QString chosen = SimIdentities::instance()->defaultSim();
 +    if (!chosen.isEmpty() && !deviceForSim(chosen).isEmpty()) {
 +        return chosen;
 +    }
@@ -658,12 +833,8 @@ Last-Update: 2026-11-25
 +
 +void SimUtils::setDefaultSimIdentifier(const QString &simIdentifier)
 +{
-+    if (Config::self()->defaultSim() == simIdentifier) {
-+        return;
-+    }
-+    Config::self()->setDefaultSim(simIdentifier);
-+    Config::self()->save();
-+    Q_EMIT simsChanged();
++    // shared with the other applications, SimIdentities::changed updates the SIMs
++    SimIdentities::instance()->setDefaultSim(simIdentifier);
 +}
 +
 +QString SimUtils::defaultDeviceUni() const
@@ -707,7 +878,7 @@ Last-Update: 2026-11-25
 +}
 --- /dev/null
 +++ b/plasma-dialer/src/simutils.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,59 @@
 +// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
 +//
 +// SPDX-License-Identifier: LGPL-2.0-or-later
@@ -727,7 +898,9 @@ Last-Update: 2026-11-25
 + * ModemManager modem), simIdentifier (ICCID), slot (from 1, 0 if not known),
 + * name ("SIM <slot>", else the operator name of the SIM) and icon (shared
 + * with the other applications that show the SIM). The default SIM for calls
-+ * is stored by its identifier; without a choice it is the first SIM.
++ * is the one chosen for calls and text messages (shared with the other
++ * applications, stored by its identifier); without a choice, or when the
++ * chosen SIM is not inserted, it is the SIM in the first slot.
 + */
 +class SimUtils : public QObject
 +{
@@ -736,8 +909,8 @@ Last-Update: 2026-11-25
 +    QML_SINGLETON
 +
 +    Q_PROPERTY(QVariantList sims READ sims NOTIFY simsChanged)
-+    Q_PROPERTY(QString defaultSimIdentifier READ defaultSimIdentifier WRITE setDefaultSimIdentifier NOTIFY simsChanged)
-+    Q_PROPERTY(QString defaultDeviceUni READ defaultDeviceUni NOTIFY simsChanged)
++    Q_PROPERTY(QString defaultSimIdentifier READ defaultSimIdentifier WRITE setDefaultSimIdentifier NOTIFY defaultSimChanged)
++    Q_PROPERTY(QString defaultDeviceUni READ defaultDeviceUni NOTIFY defaultSimChanged)
 +
 +public:
 +    explicit SimUtils(QObject *parent = nullptr);
@@ -756,6 +929,7 @@ Last-Update: 2026-11-25
 +
 +Q_SIGNALS:
 +    void simsChanged();
++    void defaultSimChanged();
 +
 +private:
 +    void update();
