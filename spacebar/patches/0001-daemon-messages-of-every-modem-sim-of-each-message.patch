@@ -11,7 +11,10 @@ Description:
  bearer stay on it). Each message stores the SIM (ICCID) it was received on
  or sent through (new column Messages.sim, migration
  2026-11-25-120000_message_sim). sendMessage takes the SIM to send an SMS
- through (empty: the default modem). The new method sims() lists the active
+ through; without one it goes through the SIM chosen for calls and text
+ messages (shared in simidentitiesrc), else through the SIM in the first
+ slot. A message for a SIM that no modem has fails instead of going
+ through another SIM. The new method sims() lists the active
  SIM of every modem with its slot (PrimarySimSlot, read over D-Bus), name
  ("SIM <slot>", else the operator name) and icon (shared with plasma-nm and
  plasma-dialer in simidentitiesrc, class SimIdentities); simsChanged is
@@ -351,7 +354,7 @@ Last-Update: 2026-11-25
  
  ModemController &ModemController::instance()
  {
-@@ -16,12 +28,32 @@ ModemController::ModemController()
+@@ -16,12 +28,44 @@ ModemController::ModemController()
      : QObject()
  {
      connect(ModemManager::notifier(), &ModemManager::Notifier::modemAdded, this, [this](const QString &udi) {
@@ -374,18 +377,30 @@ Last-Update: 2026-11-25
 -std::optional<QDBusPendingReply<QDBusObjectPath>> ModemController::createMessage(ModemManager::ModemMessaging::Message m)
 +std::optional<QDBusPendingReply<QDBusObjectPath>> ModemController::createMessage(ModemManager::ModemMessaging::Message m, const QString &simIdentifier)
  {
-+    if (!simIdentifier.isEmpty()) {
++    // the modem with the SIM; a message is never sent through another SIM than the one asked for
++    const QString sim = simIdentifier.isEmpty() ? defaultSimIdentifier() : simIdentifier;
++    if (!sim.isEmpty()) {
 +        for (const auto &device : ModemManager::modemDevices()) {
-+            if (device->sim() && device->sim()->simIdentifier() == simIdentifier && m_msgManagers.contains(device->uni())) {
-+                return m_msgManagers.value(device->uni())->createMessage(m);
++            if (!device->sim() || device->sim()->simIdentifier() != sim) {
++                continue;
 +            }
++            if (!device->hasInterface(ModemManager::ModemDevice::MessagingInterface)) {
++                qWarning() << "The modem" << device->uni() << "of the SIM cannot send messages yet";
++                return {};
++            }
++            qDebug() << "Sending the message through" << device->uni();
++            return device->messagingInterface()->createMessage(m);
++        }
++        if (!simIdentifier.isEmpty()) {
++            qWarning() << "No modem has the SIM to send the message through";
++            return {};
 +        }
 +    }
 +
      if (!m_msgManager) {
          return {};
      }
-@@ -29,6 +61,110 @@ std::optional<QDBusPendingReply<QDBusObjectPath>> ModemController::createMessage
+@@ -29,6 +73,121 @@ std::optional<QDBusPendingReply<QDBusObjectPath>> ModemController::createMessage
      return m_msgManager->createMessage(m);
  }
  
@@ -456,6 +471,17 @@ Last-Update: 2026-11-25
 +
 +QString ModemController::defaultSimIdentifier() const
 +{
++    // the SIM chosen for calls and text messages if it is inserted, else the SIM in the first slot
++    const QString chosen = SimIdentities::instance()->defaultSim();
++    const auto allSims = sims();
++    for (const auto &sim : allSims) {
++        if (!chosen.isEmpty() && sim.value(QStringLiteral("simIdentifier")) == chosen) {
++            return chosen;
++        }
++    }
++    if (!allSims.isEmpty()) {
++        return allSims.first().value(QStringLiteral("simIdentifier"));
++    }
 +    return (m_modem && m_modem->sim()) ? m_modem->sim()->simIdentifier() : QString();
 +}
 +
@@ -496,7 +522,7 @@ Last-Update: 2026-11-25
  void ModemController::init(std::optional<QString> modemPath)
  {
      if (modemPath) {
-@@ -109,6 +245,10 @@ void ModemController::init(std::optional<QString> modemPath)
+@@ -109,6 +268,10 @@ void ModemController::init(std::optional<QString> modemPath)
          initMessaging();
      }
  
@@ -507,7 +533,7 @@ Last-Update: 2026-11-25
      connect(m_interface.get(), &ModemManager::Modem::stateChanged, this, [this](MMModemState oldState, MMModemState newState, MMModemStateChangeReason reason) {
          Q_UNUSED(oldState);
          Q_UNUSED(reason);
-@@ -126,21 +266,14 @@ void ModemController::initMessaging()
+@@ -126,21 +289,14 @@ void ModemController::initMessaging()
  
      m_msgManager = m_modem->messagingInterface();
  
@@ -532,7 +558,7 @@ Last-Update: 2026-11-25
      if (msg->state() == MMSmsState::MM_SMS_STATE_RECEIVING) {
          connect(msg.get(), &ModemManager::Sms::dataChanged, this, [this, msg]() {
              if (msg->state() == MMSmsState::MM_SMS_STATE_RECEIVED) {
-@@ -163,6 +296,13 @@ void ModemController::slotMessageAdded(const QString &uni, bool received)
+@@ -163,6 +319,13 @@ void ModemController::slotMessageAdded(const QString &uni, bool received)
  
  void ModemController::deleteMessage(const QString &uni)
  {
@@ -546,7 +572,7 @@ Last-Update: 2026-11-25
      if (!m_msgManager) {
          return;
      }
-@@ -172,12 +312,11 @@ void ModemController::deleteMessage(const QString &uni)
+@@ -172,12 +335,11 @@ void ModemController::deleteMessage(const QString &uni)
  
  ModemManager::Sms::List ModemController::messages()
  {
@@ -565,12 +591,12 @@ Last-Update: 2026-11-25
  QString ModemController::ownNumber()
 --- a/lib/telephonySupport/modemcontroller.h
 +++ b/lib/telephonySupport/modemcontroller.h
-@@ -21,11 +21,20 @@ public:
+@@ -21,11 +21,21 @@ public:
  
      void init(std::optional<QString> modemPath);
  
 -    std::optional<QDBusPendingReply<QDBusObjectPath>> createMessage(ModemManager::ModemMessaging::Message m);
-+    // creates the message on the modem with the SIM (ICCID), on the default modem if empty or not found
++    // creates the message on the modem with the SIM (ICCID), with the default SIM if empty; nothing if no modem has the SIM
 +    std::optional<QDBusPendingReply<QDBusObjectPath>> createMessage(ModemManager::ModemMessaging::Message m, const QString &simIdentifier = QString());
      void deleteMessage(const QString &uni);
  
@@ -579,7 +605,8 @@ Last-Update: 2026-11-25
  
 +    // SIM (ICCID) of the modem that has the message, empty if not known
 +    QString simForMessage(const QString &uni) const;
-+    // SIM (ICCID) of the default modem
++    // SIM (ICCID) for messages without a chosen SIM: the one chosen for calls and text messages (shared with other
++    // applications) if inserted, else the SIM in the first slot
 +    QString defaultSimIdentifier() const;
 +    // active SIM of every modem: simIdentifier, deviceUni, slot ("0" if not known), name, icon
 +    QList<QMap<QString, QString>> sims() const;
@@ -587,7 +614,7 @@ Last-Update: 2026-11-25
      QString ownNumber();
  
      QString ifaceName;
-@@ -39,12 +48,14 @@ Q_SIGNALS:
+@@ -39,12 +49,14 @@ Q_SIGNALS:
      void modemConnected();
      void modemDataConnectedChanged(const bool isConnected);
      void countryCodeChanged(const QString &code);
@@ -605,7 +632,7 @@ Last-Update: 2026-11-25
      ModemController();
  
      ModemManager::ModemDevice::Ptr m_modem;
-@@ -52,6 +63,9 @@ private:
+@@ -52,6 +64,9 @@ private:
      ModemManager::Modem::Ptr m_interface;
      ModemManager::Bearer::Ptr m_bearer;
      ModemManager::Modem3gpp::Ptr m_modem3gpp;

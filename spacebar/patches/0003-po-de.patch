@@ -11,7 +11,7 @@ Last-Update: 2026-11-25
 ---
 --- a/po/de/spacebar.po
 +++ b/po/de/spacebar.po
-@@ -529,6 +529,30 @@ msgstr "Spacebar-SMS/MMS-Programm"
+@@ -529,6 +529,34 @@ msgstr "Spacebar-SMS/MMS-Programm"
  msgid "Open a chat with the given phone number"
  msgstr "Einen Chat mit der angegebenen Telefonnummern öffnen"
  
@@ -32,6 +32,10 @@ Last-Update: 2026-11-25
 +msgctxt "@title:menu"
 +msgid "Send Through"
 +msgstr "Senden über"
++
++msgctxt "@action:button"
++msgid "Send"
++msgstr "Senden"
 +
 +msgid "SIM for calls and messages"
 +msgstr "SIM für Anrufe und Nachrichten"

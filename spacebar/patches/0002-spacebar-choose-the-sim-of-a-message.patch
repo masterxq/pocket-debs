@@ -6,10 +6,16 @@ Description:
  message of the conversation came in on, else through the default SIM: the
  SIM chosen for calls and text messages, shared with the cellular network
  settings and the dialer (simidentitiesrc), the SIM in the first slot
- without a choice; the settings page offers the same choice. A button next
- to the send button shows the icon of that SIM and lets the user send the
- next message through another SIM; the choice is not remembered. With one
- SIM nothing changes.
+ without a choice; the settings page offers the same choice. The send
+ button carries the icon of that SIM as a badge; pressing and holding it
+ opens a choice of the SIM for this message above the button; the choice
+ is not remembered. The send button is a flat button with a larger icon,
+ greyed out while there is nothing to send; it sends on a click, keeps the
+ focus in the text area, and with one SIM shows no badge.
+ .
+ A message being sent gets the current time at once; its date section was
+ empty until the message had been stored ("Invalid argument passed to
+ formatDate()").
  .
  Needs the daemon of this version (sendMessage with the SIM, sims()).
 Forwarded: no
@@ -192,27 +198,75 @@ Last-Update: 2026-11-25
                      files.clear()
                      textarea.text = ""
                      listView.positionAtEnd()
-@@ -1140,6 +1156,45 @@ Kirigami.ScrollablePage {
+@@ -1140,16 +1156,31 @@ Kirigami.ScrollablePage {
                  onActivated: sendAction.trigger()
              }
  
-+            // with several SIMs: the SIM the message goes through, tap to send this message through another one
+-            Controls.Button {
++            // with several SIMs the button carries the SIM the message goes through; a long press chooses
++            // another SIM for this message
 +            Controls.ToolButton {
-+                id: simButton
+                 id: sendButton
 +
++                readonly property bool severalSims: ChannelHandler.sims.length > 1
 +                readonly property var sim: ChannelHandler.sims.find(entry => entry.simIdentifier === msgPage.sendSim) || ({})
 +
-+                visible: ChannelHandler.sims.length > 1
-+                Layout.alignment: Qt.AlignRight | Qt.AlignBottom
-+                Layout.margins: Kirigami.Units.smallSpacing
-+                icon.name: sim.icon || "auth-sim-symbolic"
-+                icon.width: Kirigami.Units.iconSizes.smallMedium
-+                icon.height: Kirigami.Units.iconSizes.smallMedium
-+                text: sim.name || ""
+                 Layout.alignment: Qt.AlignRight | Qt.AlignBottom
+                 Layout.margins: Kirigami.Units.smallSpacing
 +                display: Controls.AbstractButton.IconOnly
-+                hoverEnabled: false
-+                Accessible.name: i18nc("@action:button %1 is the name of a SIM", "Send through %1", text)
-+                onClicked: simMenu.popup(simButton)
+                 icon.name: "document-send"
+-                icon.width: Kirigami.Units.iconSizes.smallMedium
+-                icon.height: Kirigami.Units.iconSizes.smallMedium
++                icon.width: Kirigami.Units.iconSizes.medium
++                icon.height: Kirigami.Units.iconSizes.medium
++                text: severalSims && sim.name ? i18nc("@action:button %1 is the name of a SIM", "Send through %1", sim.name) : i18nc("@action:button", "Send")
+                 hoverEnabled: false
++                // the text area keeps the focus, so the on-screen keyboard stays open
++                focusPolicy: Qt.NoFocus
+                 enabled: people.length > 0 && (textarea.length > 0 || files.count > 0) && !maxAttachmentsError.visible
+-                onPressed: sendAction.trigger()
++                onClicked: sendAction.trigger()
++                onPressAndHold: {
++                    if (severalSims) {
++                        simMenu.popup(sendButton, sendButton.width - simMenu.implicitWidth, -simMenu.implicitHeight);
++                    }
++                }
+ 
+                 Controls.Label {
+                     text: textarea.length
+@@ -1160,6 +1191,61 @@ Kirigami.ScrollablePage {
+                     anchors.bottom: parent.top
+                     anchors.margins: Kirigami.Units.smallSpacing * 1.5
+                 }
++
++                // badge with the icon of the SIM: ring in the window colour, disc, SIM icon
++                Rectangle {
++                    visible: sendButton.severalSims && sendButton.sim.icon !== undefined
++                    width: Math.round(Kirigami.Units.iconSizes.medium * 0.6)
++                    height: width
++                    radius: width / 2
++                    x: sendButton.width - width - Math.round(sendButton.rightPadding / 2)
++                    y: sendButton.height - height - Math.round(sendButton.bottomPadding / 2)
++                    color: Kirigami.Theme.backgroundColor
++                    opacity: sendButton.enabled ? 1 : 0.6
++
++                    Rectangle {
++                        anchors.centerIn: parent
++                        width: parent.width - 2
++                        height: width
++                        radius: width / 2
++                        color: Kirigami.ColorUtils.linearInterpolation(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, 0.12)
++
++                        Kirigami.Icon {
++                            anchors.centerIn: parent
++                            width: Math.round(parent.width * 0.65)
++                            height: width
++                            source: sendButton.sim.icon || ""
++                            color: Kirigami.Theme.textColor
++                            isMask: true
++                        }
++                    }
++                }
 +
 +                Controls.Menu {
 +                    id: simMenu
@@ -223,21 +277,25 @@ Last-Update: 2026-11-25
 +                        model: ChannelHandler.sims
 +
 +                        Controls.MenuItem {
++                            id: simItem
++
 +                            required property var modelData
 +
 +                            text: modelData.name
 +                            icon.name: modelData.icon
 +                            checkable: true
 +                            checked: modelData.simIdentifier === msgPage.sendSim
-+                            onTriggered: msgPage.chosenSim = modelData.simIdentifier
++                            onTriggered: {
++                                msgPage.chosenSim = modelData.simIdentifier;
++                                // a click toggles the item; it shows the SIM in use again
++                                simItem.checked = Qt.binding(() => simItem.modelData.simIdentifier === msgPage.sendSim);
++                            }
 +                        }
 +                    }
 +                }
-+            }
-+
-             Controls.Button {
-                 id: sendButton
-                 Layout.alignment: Qt.AlignRight | Qt.AlignBottom
+             }
+         }
+ 
 --- a/src/contents/ui/settings/SettingsPage.qml
 +++ b/src/contents/ui/settings/SettingsPage.qml
 @@ -37,6 +37,37 @@ Kirigami.ScrollablePage {
@@ -310,7 +368,7 @@ Last-Update: 2026-11-25
      }
  
      return {};
-@@ -253,7 +260,20 @@ void MessageModel::sendTapback(const QString &id, const QString &tapback, const
+@@ -253,20 +260,35 @@ void MessageModel::sendTapback(const QString &id, const QString &tapback, const
      m_handler.interface()->sendTapback(m_phoneNumberList.toString(), id, tapback, isRemoved);
  }
  
@@ -332,8 +390,9 @@ Last-Update: 2026-11-25
  {
      Message message;
      message.id = Database::generateRandomId();
-@@ -261,12 +281,13 @@ void MessageModel::sendMessage(const QString &text, const QStringList &files, co
+     message.phoneNumberList = m_phoneNumberList;
      message.text = text;
++    message.datetime = QDateTime::currentDateTime();
      message.sentByMe = true;
      message.deliveryStatus = MessageState::Pending;
 +    message.sim = sim;
