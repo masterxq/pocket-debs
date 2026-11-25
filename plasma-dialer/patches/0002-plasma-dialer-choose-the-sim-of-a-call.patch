@@ -1,0 +1,766 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] plasma-dialer: choose the SIM of a call
+Description:
+ With more than one modem the dialer chose no modem ("TODO: select device
+ uni"): dialling, USSD and the controls of the call screen did nothing.
+ .
+ SimUtils lists the active SIM of every modem with its slot (PrimarySimSlot,
+ read over D-Bus), name ("SIM <slot>", else the operator name) and icon
+ (shared with plasma-nm and spacebar in simidentitiesrc, class
+ SimIdentities). The default SIM for calls is a setting (by ICCID), the
+ first SIM without a choice. With several SIMs the call button calls
+ through the default SIM and carries the icon of that SIM as a badge; the
+ so far empty cell left of it holds a smaller, tinted call button for the
+ other SIM, or with three and more SIMs one that opens a choice. One tap is
+ one call, nothing is remembered. USSD goes through the default SIM. The
+ call history offers a call back button through the SIM of the call (the
+ SIM identifier stored with each call). With one SIM nothing changes.
+Forwarded: no
+License: as the patched files (LGPL-2.0-or-later, GPL-2.0-or-later, LicenseRef-KDE-Accepted-GPL); new files simutils.*, CallButton.qml LGPL-2.0-or-later, simidentities.* LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
+Last-Update: 2026-11-25
+---
+--- a/plasma-dialer/src/CMakeLists.txt
++++ b/plasma-dialer/src/CMakeLists.txt
+@@ -5,6 +5,8 @@
+ set(dialer_SRCS
+     lockscreenutils.cpp
+     ringtoneutils.cpp
++    simidentities.cpp
++    simutils.cpp
+ )
+ 
+ kconfig_add_kcfg_files(dialer_SRCS GENERATE_MOC config.kcfgc)
+@@ -36,6 +38,7 @@ qt_target_qml_sources(plasma-dialer QML_FILES
+     qml/dialpad/Dialpad.qml
+     qml/dialpad/DialerButton.qml
+     qml/dialpad/DialerIconButton.qml
++    qml/dialpad/CallButton.qml
+     qml/USSDSheet.qml
+     qml/ImeiSheet.qml
+     qml/PhoneNumberDialog.qml
+@@ -43,7 +46,7 @@ qt_target_qml_sources(plasma-dialer QML_FILES
+ 
+ 
+ find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED Core Quick Qml QuickControls2 Multimedia)
+-find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS Config Crash CoreAddons I18n DBusAddons)
++find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS Config Crash CoreAddons I18n DBusAddons ModemManagerQt)
+ find_package(KF6KirigamiAddons 1.3 REQUIRED)
+ 
+ if (DIALER_BUILD_SHELL_OVERLAY)
+@@ -79,6 +82,7 @@ target_link_libraries(plasma-dialer PRIVATE
+     Qt::Multimedia
+     KF6::ConfigGui
+     KF6::CoreAddons
++    KF6::ModemManagerQt
+     KF6::Crash
+     KF6::I18n
+     KF6::I18nQml
+--- a/plasma-dialer/src/config.kcfg
++++ b/plasma-dialer/src/config.kcfg
+@@ -43,6 +43,12 @@
+             </choices>
+         </entry>
+     </group>
++    <group name="Calls">
++        <entry name="defaultSim" type="String">
++            <label>Identifier (ICCID) of the SIM used for calls by default</label>
++            <default></default>
++        </entry>
++    </group>
+     <group name="Sound">
+         <entry name="customRingtone" type="String">
+             <label>Custom ringtone file path</label>
+--- a/plasma-dialer/src/qml/Main.qml
++++ b/plasma-dialer/src/qml/Main.qml
+@@ -90,6 +90,7 @@ Kirigami.ApplicationWindow {
+         }
+     }
+ 
++    // the modem of the default SIM
+     function selectModem() {
+         const deviceUniList = DeviceUtils.deviceUniList;
+         if (deviceUniList.length === 0) {
+@@ -99,7 +100,8 @@ Kirigami.ApplicationWindow {
+         if (deviceUniList.length === 1)
+             return deviceUniList[0];
+ 
+-        console.log("TODO: select device uni");
++        const deviceUni = SimUtils.defaultDeviceUni;
++        return deviceUniList.includes(deviceUni) ? deviceUni : deviceUniList[0];
+     }
+ 
+     function call(number) {
+--- /dev/null
++++ b/plasma-dialer/src/qml/dialpad/CallButton.qml
+@@ -0,0 +1,75 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: LGPL-2.0-or-later
++
++import QtQuick
++import QtQuick.Controls as Controls
++import org.kde.kirigami as Kirigami
++
++// Round call button. With several SIMs it carries a badge with the icon of
++// the SIM the call goes through (or three dots for a choice of SIMs).
++Controls.AbstractButton {
++    id: button
++
++    // tinted look for a call through a SIM other than the default one
++    property bool secondary: false
++    // icon of the SIM in the badge, empty for no badge
++    property string simIcon: ""
++    // three dots in the badge instead of a SIM icon
++    property bool showChoice: false
++
++    readonly property real diameter: Math.min(width, height)
++    readonly property bool showBadge: simIcon !== "" || showChoice
++
++    Accessible.role: Accessible.Button
++
++    background: Item {
++        Rectangle {
++            id: circle
++
++            anchors.centerIn: parent
++            width: button.diameter
++            height: width
++            radius: width / 2
++            color: button.secondary ? Qt.alpha(Kirigami.Theme.highlightColor, 0.18) : Kirigami.Theme.highlightColor
++            opacity: button.pressed ? 0.7 : 1
++
++            Kirigami.Icon {
++                anchors.fill: parent
++                anchors.margins: parent.width * (button.secondary ? 0.27 : 0.28)
++                source: "call-start"
++                color: button.secondary ? Kirigami.Theme.highlightColor : "white"
++                isMask: true
++            }
++        }
++
++        // badge: ring in the window colour, disc in the view colour, SIM icon
++        Rectangle {
++            id: badge
++
++            visible: button.showBadge
++            width: Math.round(button.diameter * (button.secondary ? 28 / 52 : 32 / 68))
++            height: width
++            radius: width / 2
++            x: circle.x + circle.width - width + Math.round(button.diameter * 7 / 68)
++            y: circle.y + circle.height - height + Math.round(button.diameter * 7 / 68)
++            color: Kirigami.Theme.backgroundColor
++
++            Rectangle {
++                anchors.centerIn: parent
++                width: Math.round(button.diameter * (button.secondary ? 26 / 52 : 28 / 68))
++                height: width
++                radius: width / 2
++                color: Kirigami.ColorUtils.linearInterpolation(Kirigami.Theme.backgroundColor, Kirigami.Theme.textColor, 0.12)
++
++                Kirigami.Icon {
++                    anchors.centerIn: parent
++                    width: Math.round(button.diameter * (button.secondary ? 17 / 52 : 18 / 68))
++                    height: width
++                    source: button.showChoice ? "overflow-menu" : button.simIcon
++                    color: Kirigami.Theme.textColor
++                    isMask: true
++                }
++            }
++        }
++    }
++}
+--- a/plasma-dialer/src/qml/dialpad/Dialpad.qml
++++ b/plasma-dialer/src/qml/dialpad/Dialpad.qml
+@@ -10,6 +10,7 @@ import QtQuick.Layouts
+ import QtQuick.Controls as Controls
+ import org.kde.kirigami as Kirigami
+ import org.kde.telephony
++import org.kde.plasma.dialer
+ 
+ GridLayout {
+     id: pad
+@@ -19,6 +20,13 @@ GridLayout {
+     property bool voicemailFail: false
+     property bool callActive: ActiveCallModel.active
+ 
++    // SIMs to call through; with several SIMs the call buttons show the SIM
++    readonly property var sims: SimUtils.sims
++    readonly property bool severalSims: sims.length > 1
++    readonly property var defaultSim: SimUtils.simForDevice(SimUtils.defaultDeviceUni)
++    // with two SIMs: the one that is not the default SIM
++    readonly property var otherSim: sims.length === 2 ? sims.find(sim => sim.deviceUni !== SimUtils.defaultDeviceUni) : undefined
++
+     function sendDtmf(tones) {
+         const deviceUni = applicationWindow().selectModem();
+         const callUni = ActiveCallModel.activeCallUni();
+@@ -57,9 +65,14 @@ GridLayout {
+         return true;
+     }
+ 
+-    function onCallButtonPressed(number) {
+-        const deviceUni = applicationWindow().selectModem();
++    // deviceUni: the modem to call through, the default one if not given
++    function onCallButtonPressed(number, deviceUni) {
++        if (!deviceUni) {
++            deviceUni = applicationWindow().selectModem();
++        }
+         if (isSpecialCode(number)) {
++            // USSD always goes through the default SIM
++            deviceUni = applicationWindow().selectModem();
+             applicationWindow().ussdUserInitiated();
+             UssdUtils.initiate(deviceUni, number);
+         } else if (number === "*#06#") {
+@@ -206,14 +219,55 @@ GridLayout {
+         }
+     }
+ 
++    // call through another SIM: the other one with two SIMs, a choice with more
+     Item {
+         visible: pad.showBottomRow
+         Layout.fillWidth: true
+         Layout.fillHeight: true
++
++        CallButton {
++            id: otherSimButton
++
++            anchors.centerIn: parent
++            width: Math.round(callButton.diameter * 52 / 68)
++            height: width
++            visible: pad.severalSims
++            secondary: true
++            simIcon: pad.otherSim ? pad.otherSim.icon : ""
++            showChoice: pad.sims.length > 2
++            enabled: callButton.enabled
++            opacity: enabled ? 1 : 0.6
++            Accessible.name: pad.otherSim ? i18nc("@action:button", "Call through %1", pad.otherSim.name) : i18nc("@action:button", "Call through another SIM")
++            onClicked: {
++                if (pad.otherSim) {
++                    onCallButtonPressed(pad.number, pad.otherSim.deviceUni);
++                } else {
++                    simMenu.popup(otherSimButton);
++                }
++            }
++        }
++
++        Controls.Menu {
++            id: simMenu
++
++            title: i18nc("@title:menu", "Call Through")
++
++            Repeater {
++                model: pad.sims
++
++                Controls.MenuItem {
++                    required property var modelData
++
++                    text: modelData.deviceUni === SimUtils.defaultDeviceUni ? i18nc("@item:inmenu SIM, default", "%1 (default)", modelData.name) : modelData.name
++                    icon.name: modelData.icon
++                    onTriggered: onCallButtonPressed(pad.number, modelData.deviceUni)
++                }
++            }
++        }
+     }
+ 
+-    // call button
+-    Controls.AbstractButton {
++    // call button: through the default SIM
++    CallButton {
+         id: callButton
+ 
+         visible: pad.showBottomRow
+@@ -221,26 +275,9 @@ GridLayout {
+         Layout.fillHeight: true
+         enabled: pad.showBottomRow && statusLabel.text.length > 0
+         opacity: enabled ? 1 : 0.8
++        simIcon: pad.severalSims && pad.defaultSim.icon ? pad.defaultSim.icon : ""
++        Accessible.name: pad.severalSims && pad.defaultSim.name ? i18nc("@action:button", "Call through %1", pad.defaultSim.name) : i18nc("@action:button", "Call")
+         onClicked: onCallButtonPressed(pad.number)
+-
+-        background: Rectangle {
+-            anchors.centerIn: parent
+-            height: parent.height
+-            width: height
+-            radius: height / 2
+-            color: Kirigami.Theme.highlightColor
+-            opacity: callButton.pressed ? 0.7 : 1
+-
+-            Kirigami.Icon {
+-                source: "call-start"
+-                anchors.fill: parent
+-                anchors.margins: applicationWindow().smallMode ? Kirigami.Units.smallSpacing : Kirigami.Units.largeSpacing
+-                color: "white"
+-                isMask: true
+-            }
+-
+-        }
+-
+     }
+ 
+     DialerIconButton {
+--- a/plasma-dialer/src/qml/history/HistoryDelegate.qml
++++ b/plasma-dialer/src/qml/history/HistoryDelegate.qml
+@@ -6,6 +6,9 @@ import QtQuick.Layouts
+ import QtQuick.Controls as Controls
+ import org.kde.kirigami as Kirigami
+ import org.kde.telephony
++import org.kde.plasma.dialer
++
++import "../dialpad"
+ 
+ Controls.ItemDelegate {
+     id: root
+@@ -71,6 +74,21 @@ Controls.ItemDelegate {
+ 
+         }
+ 
++        // with several SIMs: call back through the SIM the call came in on or went out through
++        CallButton {
++            id: callBackButton
++
++            readonly property string simDevice: SimUtils.deviceForSim(model.account)
++
++            visible: SimUtils.sims.length > 1
++            Layout.preferredWidth: Kirigami.Units.gridUnit * 2.5
++            Layout.preferredHeight: Kirigami.Units.gridUnit * 2.5
++            secondary: true
++            simIcon: model.account ? SimUtils.iconForSim(model.account) : ""
++            Accessible.name: i18nc("@action:button", "Call back")
++            onClicked: CallUtils.dial(simDevice !== "" ? simDevice : applicationWindow().selectModem(), model.communicationWith)
++        }
++
+     }
+ 
+ }
+--- a/plasma-dialer/src/qml/settings/SettingsPage.qml
++++ b/plasma-dialer/src/qml/settings/SettingsPage.qml
+@@ -44,6 +44,24 @@ FormCard.FormCardPage {
+     FormCard.FormCard {
+         Layout.topMargin: Kirigami.Units.gridUnit
+ 
++        FormCard.FormComboBoxDelegate {
++            id: defaultSim
++
++            visible: SimUtils.sims.length > 1
++            displayMode: FormCard.FormComboBoxDelegate.Dialog
++            text: i18n("Default SIM for calls")
++            model: SimUtils.sims
++            textRole: "name"
++            currentIndex: SimUtils.sims.findIndex(sim => sim.simIdentifier === SimUtils.defaultSimIdentifier)
++            onActivated: index => SimUtils.defaultSimIdentifier = SimUtils.sims[index].simIdentifier
++        }
++
++        FormCard.FormDelegateSeparator {
++            visible: defaultSim.visible
++            above: defaultSim
++            below: ringtoneSettings
++        }
++
+         FormCard.FormButtonDelegate {
+             id: ringtoneSettings
+ 
+--- /dev/null
++++ b/plasma-dialer/src/simidentities.cpp
+@@ -0,0 +1,104 @@
++/*
++    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#include "simidentities.h"
++
++#include <KConfigGroup>
++
++#include <QHash>
++
++using namespace Qt::Literals::StringLiterals;
++
++static const auto s_configName = u"simidentitiesrc"_s;
++static const auto s_simsGroup = u"Sim"_s;
++static const auto s_iconKey = u"Icon"_s;
++
++SimIdentities *SimIdentities::instance()
++{
++    static SimIdentities *s_instance = new SimIdentities();
++    return s_instance;
++}
++
++SimIdentities::SimIdentities()
++    : QObject{nullptr}
++    , m_config{KSharedConfig::openConfig(s_configName, KConfig::NoGlobals)}
++    , m_watcher{KConfigWatcher::create(m_config)}
++{
++    connect(m_watcher.data(), &KConfigWatcher::configChanged, this, &SimIdentities::changed);
++}
++
++QStringList SimIdentities::icons()
++{
++    return {
++        u"draw-circle-symbolic"_s,
++        u"draw-rectangle-symbolic"_s,
++        u"applications-utilities-symbolic"_s,
++        u"go-home"_s,
++        u"globe"_s,
++        u"starred-symbolic"_s,
++    };
++}
++
++KConfigGroup SimIdentities::simGroup(const QString &simIdentifier) const
++{
++    return KConfigGroup(m_config, s_simsGroup).group(simIdentifier);
++}
++
++QString SimIdentities::defaultIcon() const
++{
++    const QStringList candidates = icons();
++    QHash<QString, int> uses;
++    const KConfigGroup sims(m_config, s_simsGroup);
++    for (const QString &sim : sims.groupList()) {
++        uses[sims.group(sim).readEntry(s_iconKey, QString())]++;
++    }
++
++    QString best = candidates.first();
++    for (const QString &candidate : candidates) {
++        if (uses.value(candidate) < uses.value(best)) {
++            best = candidate;
++        }
++    }
++    return best;
++}
++
++QString SimIdentities::icon(const QString &simIdentifier)
++{
++    if (simIdentifier.isEmpty()) {
++        return {};
++    }
++
++    QString icon = simGroup(simIdentifier).readEntry(s_iconKey, QString());
++    if (!icon.isEmpty()) {
++        return icon;
++    }
++
++    // another process may have given the SIM its icon since the file was read
++    m_config->reparseConfiguration();
++    icon = simGroup(simIdentifier).readEntry(s_iconKey, QString());
++    if (!icon.isEmpty()) {
++        return icon;
++    }
++
++    icon = defaultIcon();
++    setIcon(simIdentifier, icon);
++    return icon;
++}
++
++void SimIdentities::setIcon(const QString &simIdentifier, const QString &icon)
++{
++    if (simIdentifier.isEmpty() || icon.isEmpty()) {
++        return;
++    }
++
++    KConfigGroup group = simGroup(simIdentifier);
++    if (group.readEntry(s_iconKey, QString()) == icon) {
++        return;
++    }
++    group.writeEntry(s_iconKey, icon, KConfig::Notify);
++    m_config->sync();
++    Q_EMIT changed();
++}
+--- /dev/null
++++ b/plasma-dialer/src/simidentities.h
+@@ -0,0 +1,56 @@
++/*
++    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#pragma once
++
++#include <QObject>
++#include <QString>
++#include <QStringList>
++
++#include <KConfigWatcher>
++#include <KSharedConfig>
++
++/**
++ * Icons of the SIM cards, shared by all applications that show a SIM.
++ *
++ * Each SIM card is identified by its ICCID (the SIM identifier reported by
++ * ModemManager) and gets one icon out of a fixed set. A SIM that is seen for
++ * the first time is given the first icon of the set that no known SIM has
++ * (when all are in use, the least used one, earlier ones first), and the
++ * choice is stored at once, so every application shows the same icon.
++ *
++ * Storage: simidentitiesrc in the configuration directory, one group per SIM
++ * below the group "Sim", named after the ICCID, with the entry Icon. Writes
++ * are notified, so that other processes follow at once.
++ */
++class SimIdentities : public QObject
++{
++    Q_OBJECT
++
++public:
++    static SimIdentities *instance();
++
++    /** The icons a SIM can have, in the order they are given to new SIMs. */
++    static QStringList icons();
++
++    /** Icon of the SIM; a SIM not known yet is given and stored an icon. Empty for an empty identifier. */
++    QString icon(const QString &simIdentifier);
++
++    /** Stores the icon chosen for the SIM. */
++    void setIcon(const QString &simIdentifier, const QString &icon);
++
++Q_SIGNALS:
++    void changed();
++
++private:
++    SimIdentities();
++
++    KConfigGroup simGroup(const QString &simIdentifier) const;
++    QString defaultIcon() const;
++
++    KSharedConfig::Ptr m_config;
++    KConfigWatcher::Ptr m_watcher;
++};
+--- /dev/null
++++ b/plasma-dialer/src/simutils.cpp
+@@ -0,0 +1,178 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++//
++// SPDX-License-Identifier: LGPL-2.0-or-later
++
++#include "simutils.h"
++
++#include "config.h"
++#include "simidentities.h"
++
++#include <KLocalizedString>
++
++#include <ModemManagerQt/Manager>
++#include <ModemManagerQt/ModemDevice>
++#include <ModemManagerQt/Sim>
++
++#include <QDBusArgument>
++#include <QDBusConnection>
++#include <QDBusMessage>
++#include <QDBusObjectPath>
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
++#include <QPointer>
++
++#include <algorithm>
++
++using namespace Qt::Literals::StringLiterals;
++
++SimUtils::SimUtils(QObject *parent)
++    : QObject(parent)
++{
++    connect(ModemManager::notifier(), &ModemManager::Notifier::modemAdded, this, &SimUtils::update);
++    connect(ModemManager::notifier(), &ModemManager::Notifier::modemRemoved, this, &SimUtils::update);
++    connect(SimIdentities::instance(), &SimIdentities::changed, this, &SimUtils::update);
++    update();
++}
++
++void SimUtils::loadSimSlot(const QString &deviceUni)
++{
++    // ModemManagerQt does not expose the SIM slots of a modem yet
++    QDBusMessage message =
++        QDBusMessage::createMethodCall(u"org.freedesktop.ModemManager1"_s, deviceUni, u"org.freedesktop.DBus.Properties"_s, u"GetAll"_s);
++    message << u"org.freedesktop.ModemManager1.Modem"_s;
++
++    QPointer<SimUtils> self{this};
++    auto watcher = new QDBusPendingCallWatcher(QDBusConnection::systemBus().asyncCall(message), this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [self, deviceUni](QDBusPendingCallWatcher *watcher) {
++        watcher->deleteLater();
++        QDBusPendingReply<QVariantMap> reply = *watcher;
++        if (!self || reply.isError()) {
++            return;
++        }
++
++        QList<QDBusObjectPath> simSlots;
++        const QVariant simSlotsValue = reply.value().value(u"SimSlots"_s);
++        if (simSlotsValue.canConvert<QDBusArgument>()) {
++            simSlotsValue.value<QDBusArgument>() >> simSlots;
++        }
++        const uint primary = reply.value().value(u"PrimarySimSlot"_s).toUInt();
++        const int slot = (primary > 0 && primary <= uint(simSlots.size())) ? int(primary) : 0;
++        if (self->m_slots.value(deviceUni, -1) != slot) {
++            self->m_slots.insert(deviceUni, slot);
++            self->update();
++        }
++    });
++}
++
++void SimUtils::update()
++{
++    QVariantList sims;
++    for (const auto &device : ModemManager::modemDevices()) {
++        const auto sim = device->sim();
++        if (!sim || sim->uni() == u"/"_s) {
++            continue;
++        }
++        connect(sim.data(), &ModemManager::Sim::simIdentifierChanged, this, &SimUtils::update, Qt::UniqueConnection);
++        connect(sim.data(), &ModemManager::Sim::operatorNameChanged, this, &SimUtils::update, Qt::UniqueConnection);
++
++        if (!m_slots.contains(device->uni())) {
++            m_slots.insert(device->uni(), 0);
++            loadSimSlot(device->uni());
++        }
++        const int slot = m_slots.value(device->uni());
++
++        QString name;
++        if (slot > 0) {
++            name = i18nc("@label name of a SIM card after its slot", "SIM %1", slot);
++        } else if (!sim->operatorName().isEmpty()) {
++            name = sim->operatorName();
++        } else {
++            name = i18nc("@label name of a SIM card", "SIM");
++        }
++
++        QVariantMap entry;
++        entry[u"deviceUni"_s] = device->uni();
++        entry[u"simIdentifier"_s] = sim->simIdentifier();
++        entry[u"slot"_s] = slot;
++        entry[u"name"_s] = name;
++        entry[u"icon"_s] = SimIdentities::instance()->icon(sim->simIdentifier());
++        entry[u"operatorName"_s] = sim->operatorName();
++        sims.append(entry);
++    }
++
++    // in the order of the SIM slots, SIMs without a known slot last
++    std::stable_sort(sims.begin(), sims.end(), [](const QVariant &a, const QVariant &b) {
++        const int slotA = a.toMap().value(u"slot"_s).toInt();
++        const int slotB = b.toMap().value(u"slot"_s).toInt();
++        return (slotA > 0 ? slotA : INT_MAX) < (slotB > 0 ? slotB : INT_MAX);
++    });
++
++    if (sims != m_sims) {
++        m_sims = sims;
++        Q_EMIT simsChanged();
++    }
++}
++
++QVariantList SimUtils::sims() const
++{
++    return m_sims;
++}
++
++QString SimUtils::defaultSimIdentifier() const
++{
++    const QString chosen = Config::self()->defaultSim();
++    if (!chosen.isEmpty() && !deviceForSim(chosen).isEmpty()) {
++        return chosen;
++    }
++    return m_sims.isEmpty() ? QString() : m_sims.first().toMap().value(u"simIdentifier"_s).toString();
++}
++
++void SimUtils::setDefaultSimIdentifier(const QString &simIdentifier)
++{
++    if (Config::self()->defaultSim() == simIdentifier) {
++        return;
++    }
++    Config::self()->setDefaultSim(simIdentifier);
++    Config::self()->save();
++    Q_EMIT simsChanged();
++}
++
++QString SimUtils::defaultDeviceUni() const
++{
++    const QString device = deviceForSim(defaultSimIdentifier());
++    if (!device.isEmpty()) {
++        return device;
++    }
++    // a modem whose SIM has no identifier (yet)
++    return m_sims.isEmpty() ? QString() : m_sims.first().toMap().value(u"deviceUni"_s).toString();
++}
++
++QString SimUtils::deviceForSim(const QString &simIdentifier) const
++{
++    if (simIdentifier.isEmpty()) {
++        return {};
++    }
++    for (const auto &entry : m_sims) {
++        const QVariantMap sim = entry.toMap();
++        if (sim.value(u"simIdentifier"_s).toString() == simIdentifier) {
++            return sim.value(u"deviceUni"_s).toString();
++        }
++    }
++    return {};
++}
++
++QVariantMap SimUtils::simForDevice(const QString &deviceUni) const
++{
++    for (const auto &entry : m_sims) {
++        const QVariantMap sim = entry.toMap();
++        if (sim.value(u"deviceUni"_s).toString() == deviceUni) {
++            return sim;
++        }
++    }
++    return {};
++}
++
++QString SimUtils::iconForSim(const QString &simIdentifier) const
++{
++    return SimIdentities::instance()->icon(simIdentifier);
++}
+--- /dev/null
++++ b/plasma-dialer/src/simutils.h
+@@ -0,0 +1,56 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++//
++// SPDX-License-Identifier: LGPL-2.0-or-later
++
++#pragma once
++
++#include <QHash>
++#include <QObject>
++#include <QVariantList>
++#include <QVariantMap>
++#include <qqmlregistration.h>
++
++/**
++ * The SIM cards of the modems, for choosing the SIM of a call.
++ *
++ * Each entry of sims describes the active SIM of one modem: deviceUni (the
++ * ModemManager modem), simIdentifier (ICCID), slot (from 1, 0 if not known),
++ * name ("SIM <slot>", else the operator name of the SIM) and icon (shared
++ * with the other applications that show the SIM). The default SIM for calls
++ * is stored by its identifier; without a choice it is the first SIM.
++ */
++class SimUtils : public QObject
++{
++    Q_OBJECT
++    QML_ELEMENT
++    QML_SINGLETON
++
++    Q_PROPERTY(QVariantList sims READ sims NOTIFY simsChanged)
++    Q_PROPERTY(QString defaultSimIdentifier READ defaultSimIdentifier WRITE setDefaultSimIdentifier NOTIFY simsChanged)
++    Q_PROPERTY(QString defaultDeviceUni READ defaultDeviceUni NOTIFY simsChanged)
++
++public:
++    explicit SimUtils(QObject *parent = nullptr);
++
++    QVariantList sims() const;
++    QString defaultSimIdentifier() const;
++    void setDefaultSimIdentifier(const QString &simIdentifier);
++    QString defaultDeviceUni() const;
++
++    // modem with the SIM, empty if the SIM is not inserted
++    Q_INVOKABLE QString deviceForSim(const QString &simIdentifier) const;
++    // entry of sims for the modem, empty if the modem has no SIM
++    Q_INVOKABLE QVariantMap simForDevice(const QString &deviceUni) const;
++    // icon of a SIM, also of one that is not inserted
++    Q_INVOKABLE QString iconForSim(const QString &simIdentifier) const;
++
++Q_SIGNALS:
++    void simsChanged();
++
++private:
++    void update();
++    void loadSimSlot(const QString &deviceUni);
++
++    QVariantList m_sims;
++    QHash<QString, int> m_slots; // SIM slot of each modem
++};
