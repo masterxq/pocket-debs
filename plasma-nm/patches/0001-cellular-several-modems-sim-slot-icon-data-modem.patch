@@ -22,7 +22,9 @@ Description:
  setDataModem() enables mobile data on a modem. CellularModem: enabling
  mobile data with several modems disables it on the other modems, takes a
  connection of this modem even if none was used before and binds it to the
- SIM (gsm.sim-id). New connections are always bound to their SIM. There is
+ SIM (gsm.sim-id); connections bound to another SIM are never taken
+ (NetworkManager lists them as available on a modem until it has read the
+ SIM of the modem). New connections are always bound to their SIM. There is
  no automatic fallback to another modem.
  .
  CellularModemList: defaultModem, the modem with the SIM chosen for calls
@@ -44,9 +46,12 @@ Description:
  .
  CellularModem.operatorName: when the network sends no operator name,
  ModemManager reports the network code (MCC and MNC) as the name; the name
- of the provider of that network is then taken from the mobile broadband
- provider database (MobileProviders::getNetworkProviderName(): the
- provider marked as primary for the network, else the first one).
+ is then taken from the mobile broadband provider database: the provider
+ of the SIM (the MCC and MNC of its IMSI) while the SIM is served in its
+ home country, since virtual operators and national roaming share network
+ codes, else the provider of the network (MobileProviders::
+ getNetworkProviderName(): the provider marked as primary for the code,
+ else the first one).
 Forwarded: no
 License: as the patched files (libs/cellular: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL; libs/editor: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL)
 Last-Update: 2026-11-25
@@ -182,15 +187,38 @@ Last-Update: 2026-11-25
          return;
      }
  
-@@ -222,28 +275,94 @@ void CellularModem::setMobileDataEnabled(bool enabled)
+@@ -207,10 +260,21 @@ void CellularModem::setMobileDataEnabled(bool enabled)
+         // enable mobile data...
+         m_nmModem->setAutoconnect(true);
+ 
++        // connections bound to another SIM are left alone: NetworkManager lists them as available on a modem
++        // until it has read the SIM of the modem
++        const QString simId = simIdentifier();
++        NetworkManager::Connection::List usableConnections;
++        for (NetworkManager::Connection::Ptr con : m_nmModem->availableConnections()) {
++            const auto gsmSetting = con->settings()->setting(NetworkManager::Setting::Gsm).dynamicCast<NetworkManager::GsmSetting>();
++            if (!gsmSetting || simId.isEmpty() || gsmSetting->simId().isEmpty() || gsmSetting->simId() == simId) {
++                usableConnections.append(con);
++            }
++        }
++
+         // activate the connection that was last used
+         QDateTime latestTimestamp;
+         NetworkManager::Connection::Ptr latestCon;
+-        for (NetworkManager::Connection::Ptr con : m_nmModem->availableConnections()) {
++        for (NetworkManager::Connection::Ptr con : std::as_const(usableConnections)) {
+             QDateTime timestamp = con->settings()->timestamp();
+             // if con was not used yet, skip it, otherwise:
+             // if we have no latestTimestamp yet, con is the latest
+@@ -222,28 +286,94 @@ void CellularModem::setMobileDataEnabled(bool enabled)
              }
          }
  
 +        const QList<CellularModem *> others = otherModems();
 +
 +        // with several modems, mobile data must go through this modem: take any of its connections
-+        if (latestCon.isNull() && !others.isEmpty() && !m_nmModem->availableConnections().isEmpty()) {
-+            latestCon = m_nmModem->availableConnections().first();
++        if (latestCon.isNull() && !others.isEmpty() && !usableConnections.isEmpty()) {
++            latestCon = usableConnections.first();
 +        }
 +
 +        // with several modems, only one of them has mobile data: the connection is bound to the SIM
@@ -200,7 +228,7 @@ Last-Update: 2026-11-25
 +        }
 +
 +        // no connection can be used with this SIM: add one with the APN of the provider of the SIM
-+        if (latestCon.isNull() && m_nmModem->availableConnections().isEmpty()) {
++        if (latestCon.isNull() && usableConnections.isEmpty()) {
 +            if (!addDetectedProfileSettings()) {
 +                addError(i18n("An APN needs to be configured to have mobile data."));
 +            }
@@ -286,7 +314,7 @@ Last-Update: 2026-11-25
  bool CellularModem::hasSim() const
  {
      if (!m_mmModem) {
-@@ -267,9 +386,60 @@ int CellularModem::signalStrength() const
+@@ -267,9 +397,69 @@ int CellularModem::signalStrength() const
      return m_mmInterface ? m_mmInterface->signalQuality().signal : 0;
  }
  
@@ -327,7 +355,16 @@ Last-Update: 2026-11-25
 +    const QString code = m_mm3gppDevice->operatorCode();
 +    // without a name from the network, ModemManager reports the network code (MCC and MNC) as the name
 +    if (!code.isEmpty() && (name.isEmpty() || name == code)) {
-+        const QString providerName = networkProviderName(code);
++        // the provider of the SIM (MCC and MNC of its IMSI) while it is served in its home country: virtual operators
++        // and national roaming share network codes; abroad, or without a code of the SIM, the provider of the network
++        const QString simCode = m_mmModem && m_mmModem->sim() ? m_mmModem->sim()->operatorIdentifier() : QString();
++        QString providerName;
++        if (simCode.size() >= 5 && code.left(3) == simCode.left(3)) {
++            providerName = networkProviderName(simCode);
++        }
++        if (providerName.isEmpty()) {
++            providerName = networkProviderName(code);
++        }
 +        if (!providerName.isEmpty()) {
 +            return providerName;
 +        }
@@ -348,7 +385,13 @@ Last-Update: 2026-11-25
  }
  
  QStringList CellularModem::errors() const
-@@ -317,6 +487,7 @@ void CellularModem::refreshSims()
+@@ -313,10 +503,13 @@ void CellularModem::refreshSims()
+ 
+     if (m_mmModem->sim()) {
+         m_sims.append(new CellularSim{this, this, m_mmModem->sim(), m_mmInterface, m_mm3gppDevice});
++        // the operator name falls back to the provider of the SIM
++        connect(m_mmModem->sim().data(), &ModemManager::Sim::operatorIdentifierChanged, this, &CellularModem::operatorNameChanged, Qt::UniqueConnection);
+     }
  
      // Connect error signals from all SIMs
      for (auto sim : m_sims) {
@@ -356,7 +399,7 @@ Last-Update: 2026-11-25
          connect(sim, &CellularSim::errorOccurred, this, &CellularModem::addError);
      }
  
-@@ -389,6 +560,9 @@ QCoro::Task<void> CellularModem::addProfile(QString name, QString apn, QString u
+@@ -389,6 +582,9 @@ QCoro::Task<void> CellularModem::addProfile(QString name, QString apn, QString u
      gsmSetting->setPasswordFlags(password.isEmpty() ? NetworkManager::Setting::NotRequired : NetworkManager::Setting::AgentOwned);
      gsmSetting->setNetworkType(CellularConnectionProfile::networkTypeFlag(networkType));
      gsmSetting->setHomeOnly(true); // New profiles default to roaming disabled
@@ -366,7 +409,7 @@ Last-Update: 2026-11-25
  
      gsmSetting->setInitialized(true);
  
-@@ -459,21 +633,21 @@ QCoro::Task<void> CellularModem::updateProfile(QString connectionUni, QString na
+@@ -459,21 +655,21 @@ QCoro::Task<void> CellularModem::updateProfile(QString connectionUni, QString na
      }
  }
  
@@ -392,7 +435,7 @@ Last-Update: 2026-11-25
      }
  
      bool found = false;
-@@ -509,6 +683,7 @@ void CellularModem::addDetectedProfileSettings()
+@@ -509,6 +705,7 @@ void CellularModem::addDetectedProfileSettings()
          qCDebug(PLASMA_NM_CELLULAR_LOG) << "No profiles were found.";
          Q_EMIT couldNotAutodetectSettings();
      }
@@ -400,7 +443,7 @@ Last-Update: 2026-11-25
  }
  
  QList<CellularSim *> CellularModem::sims()
-@@ -516,6 +691,21 @@ QList<CellularSim *> CellularModem::sims()
+@@ -516,6 +713,21 @@ QList<CellularSim *> CellularModem::sims()
      return m_sims;
  }
  
