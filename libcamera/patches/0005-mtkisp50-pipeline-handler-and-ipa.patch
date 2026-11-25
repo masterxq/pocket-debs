@@ -1,5 +1,5 @@
 From: pocket-debs
-Date: Sat, 21 Nov 2026 07:00:00 +0100
+Date: Wed, 25 Nov 2026 09:00:00 +0100
 Subject: [PATCH] mtkisp50: pipeline handler and IPA for the MediaTek MT6785 ISP
 Description:
  A pipeline handler of its own for the MediaTek MT6785 camera subsystem
@@ -58,7 +58,7 @@ Description:
    still image jobs and the frames of a series without it; a new
    reference after jumps of exposure, white balance and scene brightness,
    while the lens moves and after a still image; only for a driver whose
-   parameter buffers have the size of the header, and with at least
+   parameter buffers have at least 6144 bytes, and with at least
    three buffers of a main stream or in a session with still images,
    whose preview jobs have no main buffer (the driver keeps the reference
    in frames of its own and runs the jobs without the module when the
@@ -68,6 +68,11 @@ Description:
    chooses the point is multiplied by the square of the ratio of the
    processed width to that width, for points of a preview that is scaled
    down before the ISP. Without the key as before.
+ - Radial weights of the DIP filter modules and the raw noise reduction
+   (keys radial and rnr of NoiseReduction beside the points, one block
+   each for all jobs): sent to DIP drivers with a parameter buffer of
+   6656 bytes, with the first buffer of a stream, never to older drivers;
+   without the keys the driver uses its neutral settings.
  - Multi-frame still images (tuning block MultiFrame and the image
    quality sets multiFrameInput/multiFrameBase/multiFrameOutput, off
    without them, and only with the multi-frame blending block (MFB) and
@@ -223,6 +228,7 @@ Description:
    and for a new light, the temporal noise reduction (restarts, settings
    between the sensitivities, parameter buffers, fallback), the image
    quality points per sensitivity and set and with a reference width, the
+   radial weights and the raw noise reduction blocks, the
    frames of
    a series per sensitivity and the plan of its blends, the calibration
    of the camera module over the tuning (keys replaced, missing, broken
@@ -234,7 +240,7 @@ Forwarded: no
 License: LGPL-2.1-or-later (as the files it derives from; the alignment
  module src/libcamera/pipeline/mtkisp50/align/ is LGPL-2.1-or-later as
  well); GPL-2.0-or-later for the tests
-Last-Update: 2026-11-23
+Last-Update: 2026-11-25
 ---
 diff --git a/include/libcamera/internal/mtkisp50/stats.h b/include/libcamera/internal/mtkisp50/stats.h
 new file mode 100644
@@ -599,7 +605,7 @@ index 0000000..25fc5d7
 +	metadataReady(uint32 frame, libcamera.ControlList metadata);
 +};
 diff --git a/include/linux/media/mediatek/mtk-dip-mt6785.h b/include/linux/media/mediatek/mtk-dip-mt6785.h
-index fd901cc..a65e13b 100644
+index fd901cc..e6df167 100644
 --- a/include/linux/media/mediatek/mtk-dip-mt6785.h
 +++ b/include/linux/media/mediatek/mtk-dip-mt6785.h
 @@ -1,7 +1,8 @@
@@ -612,7 +618,7 @@ index fd901cc..a65e13b 100644
   *
   * Device model (media controller, driver and model "mtk-dip", one processing
   * entity "mtk-dip", no subdev controls):
-@@ -10,22 +11,28 @@
+@@ -10,22 +11,27 @@
   *   mtk-dip-raw           to the ISP     VIDEO_OUTPUT_MPLANE     raw Bayer (below)
   *   mtk-dip-params        to the ISP     META_OUTPUT             V4L2_META_FMT_MTK_DIP_PARAMS
   *   mtk-dip-main          from the ISP   VIDEO_CAPTURE_MPLANE    NV12
@@ -622,8 +628,7 @@ index fd901cc..a65e13b 100644
   *
 - * A scaled output and a statistics node are planned; they are not part of
 - * version 1 and their nodes do not exist yet.
-+ * A statistics node is planned; it does not exist yet.
-  *
+- *
 - * The links of mtk-dip-raw and mtk-dip-main are enabled and immutable, the
 - * link of mtk-dip-params is enabled by default and can be disabled. A job
 - * runs when mtk-dip-raw and mtk-dip-main both stream and each holds a queued
@@ -642,18 +647,24 @@ index fd901cc..a65e13b 100644
   * first job the driver uses neutral values (unity gains, identity matrix,
 - * gamma bypass, no lens shading, no edge enhancement, no colour module) and
 - * its default settings of the noise reduction and demosaicing modules. Sequence numbers
-+ * gamma bypass, no lens shading, no edge enhancement) and its default
-+ * settings of the noise reduction and demosaicing modules. Sequence numbers
++ * gamma bypass, no lens shading, no edge enhancement, flat radial weights)
++ * and the least filtering the noise reduction and demosaicing modules allow
++ * (see their blocks). Sequence numbers
   * and timestamps of the capture buffers are copied from the raw buffer. A
 - * job that fails returns its raw, params and main buffers with
 + * job that fails returns its raw, params and output buffers with
   * V4L2_BUF_FLAG_ERROR, in queue order. STREAMOFF on any
   * node waits for the running job and returns the buffers of that node.
   *
-@@ -45,6 +52,21 @@
+@@ -45,11 +51,30 @@
   * bytesperline of mtk-dip-main is a multiple of 16, at least the width and
   * at most 9248.
   *
+- * Raw formats on mtk-dip-raw, Bayer order BGGR only in version 1:
+- *  - V4L2_PIX_FMT_SBGGR8: one byte per pixel.
+- *  - V4L2_PIX_FMT_MTISP_SBGGR10: 10 bits per pixel as one bit stream per
+- *    line, least significant bit first (4 pixels in 5 bytes), the layout of
+- *    the MediaTek CAMSV and pass 1 raw outputs.
 + * mtk-dip-scaled scales the same area, from 1/2 down to 1/16 of its width
 + * and of its height (each axis on its own, so the aspect ratio may change),
 + * at least 32x16, width and height even. The scaler makes each output pixel
@@ -669,10 +680,19 @@ index fd901cc..a65e13b 100644
 + * width and at most 9248. Zoom is a crop on mtk-dip-raw with a scaled output
 + * of a fixed size, set between streamoff and streamon of mtk-dip-raw.
 + *
-  * Raw formats on mtk-dip-raw, Bayer order BGGR only in version 1:
-  *  - V4L2_PIX_FMT_SBGGR8: one byte per pixel.
-  *  - V4L2_PIX_FMT_MTISP_SBGGR10: 10 bits per pixel as one bit stream per
-@@ -63,6 +85,26 @@
++ * Raw formats on mtk-dip-raw, each in the four Bayer orders:
++ *  - V4L2_PIX_FMT_SBGGR8, _SGBRG8, _SGRBG8, _SRGGB8: one byte per pixel.
++ *  - V4L2_PIX_FMT_MTISP_SBGGR10, _SGBRG10, _SGRBG10, _SRGGB10: 10 bits per
++ *    pixel as one bit stream per line, least significant bit first (4 pixels
++ *    in 5 bytes), the layout of the MediaTek CAMSV and pass 1 raw outputs.
++ * The order is that of the top left 2x2 cell of the frame; the crop keeps it
++ * (even left and top). The per-position arrays of the params blocks follow
++ * the order of the format (see MTK_DIP_BAYER_CHANNELS); the driver places
++ * them in the colour registers of the hardware.
+  * bytesperline is at least DIV_ROUND_UP(width * bpp, 8), at most 9248 and a
+  * multiple of 2; a longer line of the caller is kept (the CAMSV writes 5780
+  * bytes for 4624 pixels, pass 1 5784). The frame starts at the start of the
+@@ -63,6 +88,26 @@
   * the board; REQBUFS returns fewer buffers than asked for, or fails with
   * -ENOMEM, once the region is full.
   *
@@ -699,7 +719,27 @@ index fd901cc..a65e13b 100644
   * Nothing in this interface carries register values, tile data or physical
   * addresses. The driver validates every block and translates it.
   */
-@@ -90,11 +132,11 @@
+@@ -74,13 +119,16 @@
+ #include <linux/media/v4l2-isp.h>
+ 
+ /*
+- * The packed raw format is defined in videodev2.h, the definition here
+- * serves user space built against older headers. The params format exists
++ * The packed raw formats are defined in videodev2.h, the definitions here
++ * serve user space built against older headers. The params format exists
+  * only here.
+  */
+ #ifndef V4L2_PIX_FMT_MTISP_SBGGR10
+-/* MediaTek packed 10-bit Bayer, BGGR, LSB first */
++/* MediaTek packed 10-bit Bayer, LSB first */
+ #define V4L2_PIX_FMT_MTISP_SBGGR10	v4l2_fourcc('M', 'B', 'B', 'A')
++#define V4L2_PIX_FMT_MTISP_SGBRG10	v4l2_fourcc('M', 'B', 'G', 'A')
++#define V4L2_PIX_FMT_MTISP_SGRBG10	v4l2_fourcc('M', 'B', 'g', 'A')
++#define V4L2_PIX_FMT_MTISP_SRGGB10	v4l2_fourcc('M', 'B', 'R', 'A')
+ #endif
+ #ifndef V4L2_META_FMT_MTK_DIP_PARAMS
+ /* Parameters of mtk-dip-params */
+@@ -90,13 +138,14 @@
  #define MTK_DIP_PARAMS_VERSION_V1	1
  
  /*
@@ -708,35 +748,53 @@ index fd901cc..a65e13b 100644
 - * MTK_DIP_PARAMS_BLOCK_DEMOSAIC the limit was 4096; a buffer that met it
 - * still does, and the version did not change: new block types do not change
 - * the meaning of the old ones.
-+ * Size of a params buffer: the header and one block of each type fit (4192
-+ * bytes with the blocks up to MTK_DIP_PARAMS_BLOCK_MIX). Up to
-+ * MTK_DIP_PARAMS_BLOCK_NBC2 the limit was 4096; a buffer that met it still
-+ * does. New block types do not change the meaning of the old ones; the
-+ * version stays.
++ * Size of a params buffer: the header and one block of each type fit (4296
++ * bytes with the blocks up to MTK_DIP_PARAMS_BLOCK_RNR). New block types do
++ * not change the meaning of the old ones; the version stays. The size grows
++ * with them: 6144 with the blocks up to MTK_DIP_PARAMS_BLOCK_MIX, 6656 with
++ * MTK_DIP_PARAMS_BLOCK_RADIAL and MTK_DIP_PARAMS_BLOCK_RNR, so that user space
++ * can tell from the buffer size which types a driver takes.
   */
- #define MTK_DIP_PARAMS_MAX_SIZE		6144
+-#define MTK_DIP_PARAMS_MAX_SIZE		6144
++#define MTK_DIP_PARAMS_MAX_SIZE		6656
  
-@@ -109,7 +151,8 @@
+ /**
+  * enum mtk_dip_params_block_type - type of a block in the params buffer
+@@ -109,7 +158,10 @@
   * @MTK_DIP_PARAMS_BLOCK_YCNR: luma/chroma noise reduction, first stage
   * @MTK_DIP_PARAMS_BLOCK_DEMOSAIC: demosaicing
   * @MTK_DIP_PARAMS_BLOCK_NBC2: luma/chroma noise reduction, second stage
 - * @MTK_DIP_PARAMS_BLOCK_COLOR: colour module (hue, saturation, contrast)
 + * @MTK_DIP_PARAMS_BLOCK_NR3D: temporal noise reduction (type 9 is not used)
 + * @MTK_DIP_PARAMS_BLOCK_MIX: blend with the base image (YUV input only)
++ * @MTK_DIP_PARAMS_BLOCK_RADIAL: radial weights of the filter modules
++ * @MTK_DIP_PARAMS_BLOCK_RNR: raw noise reduction
   *
   * The buffer is a struct v4l2_isp_params_buffer (version
   * MTK_DIP_PARAMS_VERSION_V1) followed by blocks, each starting with a
-@@ -127,7 +170,8 @@ enum mtk_dip_params_block_type {
+@@ -127,7 +179,10 @@ enum mtk_dip_params_block_type {
  	MTK_DIP_PARAMS_BLOCK_YCNR = 6,
  	MTK_DIP_PARAMS_BLOCK_DEMOSAIC = 7,
  	MTK_DIP_PARAMS_BLOCK_NBC2 = 8,
 -	MTK_DIP_PARAMS_BLOCK_COLOR = 9,
 +	MTK_DIP_PARAMS_BLOCK_NR3D = 10,
 +	MTK_DIP_PARAMS_BLOCK_MIX = 11,
++	MTK_DIP_PARAMS_BLOCK_RADIAL = 12,
++	MTK_DIP_PARAMS_BLOCK_RNR = 13,
  };
  
  /*
-@@ -270,7 +314,7 @@ struct mtk_dip_params_lsc {
+@@ -142,7 +197,8 @@ enum mtk_dip_params_block_type {
+ /*
+  * Channel order of all per-channel arrays: the four positions of the Bayer
+  * cell in raster order (top left, top right, bottom left, bottom right) of
+- * the format set on mtk-dip-raw. For BGGR that is B, Gb, Gr, R.
++ * the format set on mtk-dip-raw. For BGGR that is B, Gb, Gr, R; for GRBG
++ * Gr, R, B, Gb; for GBRG Gb, B, R, Gr; for RGGB R, Gr, Gb, B.
+  */
+ #define MTK_DIP_BAYER_CHANNELS	4
+ 
+@@ -270,7 +326,7 @@ struct mtk_dip_params_lsc {
  } __attribute__((aligned(8)));
  
  /*
@@ -745,20 +803,81 @@ index fd901cc..a65e13b 100644
   *
   * Their fields are the parameters of the hardware modules, one struct member
   * per parameter (arrays for the points of a curve or the elements of a
-@@ -755,8 +799,10 @@ struct mtk_dip_params_demosaic {
-  * driver. It stays in the pipeline with its tile margins in any case; the
+@@ -307,8 +363,8 @@ struct mtk_dip_params_lsc {
+  * @radial_gain: gains of the radial weight link, 0 to 255
+  * @radial_response_ratio: share of the radial weight in the response, 0 to 31
+  * @gain_curve_radial: the gain curve follows the radial weights (0 or 1)
+- * @gain_curve_x: inner points of the response gain curve, input; 0 < x[0] <
+- *	x[1] < x[2] < x[3] < 255
++ * @gain_curve_x: inner points of the response gain curve, input; 0 <= x[0] <
++ *	x[1] < x[2] < x[3] < 255 (x[0] 0: the curve starts at the first point)
+  * @gain_curve_y: output at the inner points, 0 to 1023
+  * @gain_curve_y_end: output at input 255, -2048 to 3071; the driver derives the
+  *	five segment slopes from the points
+@@ -376,8 +432,8 @@ struct mtk_dip_params_lsc {
+  * with @master_gain_neg. The response gain curve runs through (0, 0), the
+  * four inner points and (255, @gain_curve_y_end); the driver programs its
+  * five segment slopes as 16 * dy / dx, rounded half away from zero and
+- * limited to -128 to 127. The radial weights the module links to are fixed
+- * by the driver.
++ * limited to -128 to 127. The radial weights the module links to are those
++ * of MTK_DIP_PARAMS_BLOCK_RADIAL.
+  *
+  * The block selects the module set of the jobs: while edge enhancement is
+  * enabled (from a job whose params buffer carries an enabled EE block up to
+@@ -528,13 +584,15 @@ struct mtk_dip_params_ee {
+  * @reserved: must be 0
+  *
+  * The module filters luma and chroma within ranges per luma level and step,
+- * with strength curves over the luma level and the local activity and a
+- * radial weight fixed by the driver. It works without a local tone map:
++ * with strength curves over the luma level and the local activity and the
++ * radial weights of MTK_DIP_PARAMS_BLOCK_RADIAL. It works without a local
++ * tone map:
+  * the stage does not take a gain map from the statistics, and its lookup
+  * table is off. At least one of @luma_enable and @chroma_enable has to be
+  * set; the module stays in the pipeline with its tile margins in any case.
+- * With MTK_DIP_PARAMS_BLOCK_FL_DISABLE the driver returns to its default
+- * settings of the module.
++ * With MTK_DIP_PARAMS_BLOCK_FL_DISABLE, and before the first YCNR block, the
++ * driver uses its neutral settings: the chroma part on (for the tile
++ * margins), all other fields 0.
+  */
+ struct mtk_dip_params_ycnr {
+ 	struct v4l2_isp_params_block_header header;
+@@ -655,9 +713,9 @@ struct mtk_dip_params_ycnr {
+  * @reserved: must be 0
+  *
+  * The module interpolates the missing colours along the detected direction,
+- * with crosstalk and noise handling and a detail gain per band. With
+- * MTK_DIP_PARAMS_BLOCK_FL_DISABLE the driver returns to its default settings
+- * of the module (it cannot be bypassed).
++ * with crosstalk and noise handling and a detail gain per band. It cannot be
++ * bypassed: with MTK_DIP_PARAMS_BLOCK_FL_DISABLE, and before the first
++ * DEMOSAIC block, the driver sets all fields to 0.
+  */
+ struct mtk_dip_params_demosaic {
+ 	struct v4l2_isp_params_block_header header;
+@@ -751,12 +809,14 @@ struct mtk_dip_params_demosaic {
+  * @chroma_dither: dither of U and V, 0 to 31
+  *
+  * The second stage filters mainly the chroma (colour noise in flat areas),
+- * with a strength curve over the luma level and a radial weight fixed by the
+- * driver. It stays in the pipeline with its tile margins in any case; the
++ * with a strength curve over the luma level and the radial weights of
++ * MTK_DIP_PARAMS_BLOCK_RADIAL. It stays in the pipeline with its tile margins
++ * in any case; the
   * margins the driver uses are those of the chroma part with scale 2 or 3,
   * which is why the chroma part cannot be switched off and smaller scales are
 - * refused. With MTK_DIP_PARAMS_BLOCK_FL_DISABLE the driver returns to its
 - * default settings of the module.
 + * refused. With MTK_DIP_PARAMS_BLOCK_FL_DISABLE, and before the first NBC2
-+ * block, the driver uses its default settings of the module: the strongest
-+ * chroma filtering of the device's tuning (single frames before multi-frame
-+ * blending at the highest sensitivities).
++ * block, the driver uses its neutral settings: scale_mode 3, all other
++ * fields 0.
   */
  struct mtk_dip_params_nbc2 {
  	struct v4l2_isp_params_block_header header;
-@@ -795,54 +841,189 @@ struct mtk_dip_params_nbc2 {
+@@ -795,55 +855,294 @@ struct mtk_dip_params_nbc2 {
  } __attribute__((aligned(8)));
  
  /*
@@ -853,8 +972,8 @@ index fd901cc..a65e13b 100644
 + * @strength_max: upper bound of the blend strength, 0 to 63
 + * @blend_ratio: ratios of four measures in the blend decision (block luma,
 + *	detail, texture, motion), 0 to 31; roles not documented beyond this
-+ * @noise_level: expected noise level, 0 to 63; the device tuning raises it
-+ *	with the sensitivity
++ * @noise_level: expected noise level, 0 to 63; usually raised with the
++ *	sensitivity
 + * @noise_slope: a second noise setting, 0 to 63; role not documented
 + * @small_diff_th: threshold of small frame differences, 0 to 63
 + * @motion_penalty_th: threshold of the motion penalty, 0 to 63
@@ -927,23 +1046,22 @@ index fd901cc..a65e13b 100644
 + * map at the chroma sample. With weight_to_base 0 the roles of input and base
 + * swap (w is the weight of the input). A slope of 0 gives weight_min
 + * everywhere at or above map_start.
++ *
++ * With luma_enable and chroma_enable 0 nothing is blended and the output
++ * takes the input, or the base image where luma_pass_base and
++ * chroma_pass_base are set.
   *
 - * Global and per hue sector adjustments of saturation, hue and luma. The
 - * module costs no columns at the tile edges. Its colour space mapping stage
 - * stays off. With MTK_DIP_PARAMS_BLOCK_FL_DISABLE the module is off (the
 - * default); an enabled block switches it on from that job on, like the other
 - * blocks with a module of their own.
-+ * With luma_enable and chroma_enable 0 nothing is blended and the output
-+ * takes the input, or the base image where luma_pass_base and
-+ * chroma_pass_base are set.
-+ *
 + * A params buffer without this block leaves the last values; before the
 + * first block the driver uses weight_to_base 1, weight 0 to 255, slope 1,
 + * map_start 0, map_end 255: the map value is the weight of the input
 + * (0 base image, 255 input). MTK_DIP_PARAMS_BLOCK_FL_DISABLE switches the
 + * blend off: the job filters the input alone; it still takes and returns a
 + * buffer of mtk-dip-base and of mtk-dip-weight, unread.
-+ * See the driver documentation for the measurements behind this model.
   */
 -struct mtk_dip_params_color {
 +
@@ -989,6 +1107,112 @@ index fd901cc..a65e13b 100644
  	__u8 reserved[6];
  } __attribute__((aligned(8)));
  
++/**
++ * struct mtk_dip_params_radial - radial weights of the filter modules
++ * @header: block header, type MTK_DIP_PARAMS_BLOCK_RADIAL
++ * @center_x: horizontal position of the centre, in pixels of the raw frame,
++ *	0 to 16383
++ * @center_y: vertical position of the centre, 0 to 16383
++ * @radius: distances from the centre of the inner points of the weight
++ *	curve, in pixels, 0 to 16383
++ * @weight: weights at the centre, at the three radii and at the farthest
++ *	corner, 0 to 255
++ * @reserved: must be 0
++ * @slope: slopes of the four segments of the weight curve, weight steps per
++ *	pixel in units of 1/65536, 0 to 16777215
++ *
++ * The edge enhancement, both luma/chroma noise reduction stages, the
++ * demosaicing, the raw noise reduction and the temporal noise reduction can
++ * scale their strength with the distance of a pixel from a centre: each of
++ * them has a radial link switch and a curve of its own over the weight that
++ * this block defines. The weight runs from @weight[0] at the centre along
++ * straight segments through @weight[1] to @weight[3] at @radius[0] to
++ * @radius[2], to @weight[4] at the farthest corner of the frame. The module
++ * does not compute the slopes from the points: @slope[0] to @slope[3] are
++ * those of the four segments ((w[i + 1] - w[i]) * 65536 / (r[i + 1] - r[i])
++ * with r = 0, @radius and the distance of the farthest corner), and the
++ * distance of the corner follows the octagon approximation of the hardware;
++ * the caller provides them. The same weights serve all modules and all jobs
++ * until the next block.
++ *
++ * With MTK_DIP_PARAMS_BLOCK_FL_DISABLE, and before the first RADIAL block,
++ * all fields are 0: the weight is 0 everywhere, as at the centre.
++ */
++struct mtk_dip_params_radial {
++	struct v4l2_isp_params_block_header header;
++	__u16 center_x;
++	__u16 center_y;
++	__u16 radius[3];
++	__u8 weight[5];
++	__u8 reserved;
++	__u32 slope[4];
++} __attribute__((aligned(8)));
++
++/**
++ * struct mtk_dip_params_rnr - raw noise reduction
++ * @header: block header, type MTK_DIP_PARAMS_BLOCK_RNR
++ * @ratio: filter ratio, 0 to 511
++ * @noise_offset: constant part of the noise model per colour (red, green,
++ *	blue), 0 to 511
++ * @noise_slope: part of the noise model that rises with the level, per
++ *	colour (red, green, blue), 0 to 511
++ * @radial_gain: gains of the radial link, 0 to 1023
++ * @norm_gain: colour gains the module normalises the raw values with, for
++ *	blue, green and red of the colour order of the hardware (a BGGR frame;
++ *	the driver does not move them with the Bayer order), unsigned 13 bit,
++ *	512 = 1.0
++ * @norm_offset: offsets of the normalisation, same order, -2048 to 2047
++ * @black_gain: gain of the black level stage the normalisation assumes, 0 to
++ *	8191, 512 = 1.0
++ * @eps: small constant of the filter weights, 0 to 255
++ * @range: range limits of the four filter steps, 0 to 63
++ * @median_ratio: share of the median filter, 0 to 127
++ * @profile_ratio: share of the profile filter, 0 to 127
++ * @radius: filter radius, 0 to 7
++ * @th_right: a threshold, 0 to 63; role not documented
++ * @th_left: the counterpart of @th_right, 0 to 63
++ * @flat_mode: mode for flat areas (0 or 1)
++ * @gradient_ratio: share of the gradient term, 0 to 63
++ * @lowpass_ratio: share of the low-pass term, 0 to 255
++ * @intensity_offset: offset of the intensity term, 0 to 255
++ * @radial_enable: strength follows the radial weights (0 or 1)
++ * @level_th: thresholds of two level stages, 0 to 255; role not documented
++ * @level_slope: slopes of the two level stages, 0 to 255
++ * @reserved: must be 0
++ *
++ * The module filters the raw Bayer values before the demosaicing, with a
++ * noise model per colour. It stays in the pipeline in any case. With
++ * MTK_DIP_PARAMS_BLOCK_FL_DISABLE, and before the first RNR block, the driver
++ * sets the normalisation gains and @black_gain to 512 and all other fields
++ * to 0.
++ */
++struct mtk_dip_params_rnr {
++	struct v4l2_isp_params_block_header header;
++	__u16 ratio;
++	__u16 noise_offset[3];
++	__u16 noise_slope[3];
++	__u16 radial_gain[2];
++	__u16 norm_gain[3];
++	__s16 norm_offset[3];
++	__u16 black_gain;
++	__u8 eps;
++	__u8 range[4];
++	__u8 median_ratio;
++	__u8 profile_ratio;
++	__u8 radius;
++	__u8 th_right;
++	__u8 th_left;
++	__u8 flat_mode;
++	__u8 gradient_ratio;
++	__u8 lowpass_ratio;
++	__u8 intensity_offset;
++	__u8 radial_enable;
++	__u8 level_th[2];
++	__u8 level_slope[2];
++	__u8 reserved[5];
++} __attribute__((aligned(8)));
++
+ #endif /* _UAPI_MTK_DIP_MT6785_H */
 diff --git a/include/linux/media/mediatek/mtk-mfb-mt6785.h b/include/linux/media/mediatek/mtk-mfb-mt6785.h
 new file mode 100644
 index 0000000..2b05ed2
@@ -7698,10 +7922,10 @@ index 0000000..3b6f580
 +...
 diff --git a/src/ipa/mtkisp50/dip_params.cpp b/src/ipa/mtkisp50/dip_params.cpp
 new file mode 100644
-index 0000000..fc5123a
+index 0000000..e8c54a2
 --- /dev/null
 +++ b/src/ipa/mtkisp50/dip_params.cpp
-@@ -0,0 +1,1529 @@
+@@ -0,0 +1,1621 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Translation of the frame parameters of the mtkisp50 IPA into MT6785 DIP
@@ -8321,6 +8545,38 @@ index 0000000..fc5123a
 +	QUALITY_FIELD(mtk_dip_params_nr3d, pattern_texture_offset),
 +};
 +
++const QualityField kRadialFields[] = {
++	QUALITY_FIELD(mtk_dip_params_radial, center_x),
++	QUALITY_FIELD(mtk_dip_params_radial, center_y),
++	QUALITY_FIELD(mtk_dip_params_radial, radius),
++	QUALITY_FIELD(mtk_dip_params_radial, weight),
++	QUALITY_FIELD(mtk_dip_params_radial, slope),
++};
++
++const QualityField kRnrFields[] = {
++	QUALITY_FIELD(mtk_dip_params_rnr, ratio),
++	QUALITY_FIELD(mtk_dip_params_rnr, noise_offset),
++	QUALITY_FIELD(mtk_dip_params_rnr, noise_slope),
++	QUALITY_FIELD(mtk_dip_params_rnr, radial_gain),
++	QUALITY_FIELD(mtk_dip_params_rnr, norm_gain),
++	QUALITY_FIELD(mtk_dip_params_rnr, norm_offset),
++	QUALITY_FIELD(mtk_dip_params_rnr, black_gain),
++	QUALITY_FIELD(mtk_dip_params_rnr, eps),
++	QUALITY_FIELD(mtk_dip_params_rnr, range),
++	QUALITY_FIELD(mtk_dip_params_rnr, median_ratio),
++	QUALITY_FIELD(mtk_dip_params_rnr, profile_ratio),
++	QUALITY_FIELD(mtk_dip_params_rnr, radius),
++	QUALITY_FIELD(mtk_dip_params_rnr, th_right),
++	QUALITY_FIELD(mtk_dip_params_rnr, th_left),
++	QUALITY_FIELD(mtk_dip_params_rnr, flat_mode),
++	QUALITY_FIELD(mtk_dip_params_rnr, gradient_ratio),
++	QUALITY_FIELD(mtk_dip_params_rnr, lowpass_ratio),
++	QUALITY_FIELD(mtk_dip_params_rnr, intensity_offset),
++	QUALITY_FIELD(mtk_dip_params_rnr, radial_enable),
++	QUALITY_FIELD(mtk_dip_params_rnr, level_th),
++	QUALITY_FIELD(mtk_dip_params_rnr, level_slope),
++};
++
 +/* Switches and modes: not interpolated */
 +constexpr std::size_t kNr3dStepped[] = {
 +	offsetof(mtk_dip_params_nr3d, luma_enable),
@@ -8394,9 +8650,12 @@ index 0000000..fc5123a
 +			if (f.elementSize == 1) {
 +				const uint8_t v = static_cast<uint8_t>(values[i]);
 +				memcpy(dst, &v, 1);
-+			} else {
++			} else if (f.elementSize == 2) {
 +				const uint16_t v = static_cast<uint16_t>(values[i]);
 +				memcpy(dst, &v, 2);
++			} else {
++				const uint32_t v = static_cast<uint32_t>(values[i]);
++				memcpy(dst, &v, 4);
 +			}
 +		}
 +	}
@@ -8448,6 +8707,12 @@ index 0000000..fc5123a
 + * "points". A module used in any set is sent for every job;
 + * a point without it disables it.
 + *
++ * "radial" and "rnr" (beside "points") hold one block each for all jobs, the
++ * fields of struct mtk_dip_params_radial (the radial weights the filter
++ * modules link to) and of struct mtk_dip_params_rnr (raw noise reduction).
++ * They are sent to drivers that know them (see setRawBlocks()); without the
++ * key the driver uses its neutral settings.
++ *
 + * "referenceWidth" (beside "points", and in each optional section) is the
 + * width of the processed area that the points of the set are made for, for
 + * example the width of a preview that is scaled down in the raw domain
@@ -8476,6 +8741,20 @@ index 0000000..fc5123a
 +	if (!parsePoints(node["points"], table.sets_[0], table) ||
 +	    !parseReferenceWidth(node, table.referenceWidth_[0]))
 +		return std::nullopt;
++
++	/* Radial weights and raw noise reduction: one block for all points */
++	if (node.contains("radial")) {
++		table.radial_ = parseBlock<struct mtk_dip_params_radial>(
++			node["radial"], MTK_DIP_PARAMS_BLOCK_RADIAL, kRadialFields, "radial");
++		if (!table.radial_)
++			return std::nullopt;
++	}
++	if (node.contains("rnr")) {
++		table.rnr_ = parseBlock<struct mtk_dip_params_rnr>(node["rnr"], MTK_DIP_PARAMS_BLOCK_RNR,
++								    kRnrFields, "rnr");
++		if (!table.rnr_)
++			return std::nullopt;
++	}
 +
 +	/* Optional sets of video, still image and multi-frame jobs */
 +	static constexpr const char *names[] = { nullptr, "video", "still", "multiFrameInput",
@@ -8899,6 +9178,8 @@ index 0000000..fc5123a
 +				   MTK_DIP_PARAMS_BLOCK_NBC2 })
 +		unknown_[type] = true;
 +	unknown_[MTK_DIP_PARAMS_BLOCK_NR3D] = temporalNr_;
++	unknown_[MTK_DIP_PARAMS_BLOCK_RADIAL] = rawBlocks_;
++	unknown_[MTK_DIP_PARAMS_BLOCK_RNR] = rawBlocks_;
 +}
 +
 +/**
@@ -8915,6 +9196,26 @@ index 0000000..fc5123a
 +		sent_[MTK_DIP_PARAMS_BLOCK_NR3D].clear();
 +		pending_[MTK_DIP_PARAMS_BLOCK_NR3D].clear();
 +		unknown_[MTK_DIP_PARAMS_BLOCK_NR3D] = false;
++	}
++}
++
++/**
++ * \brief Tell whether the driver knows the radial weight and raw noise
++ * reduction blocks
++ * \param[in] supported True if it does
++ *
++ * Without them these blocks are never sent, also not disabled: such a driver
++ * keeps settings of its own for the modules. Call reset() after.
++ */
++void ParamsEncoder::setRawBlocks(bool supported)
++{
++	rawBlocks_ = supported;
++	if (!supported) {
++		for (unsigned int type : { MTK_DIP_PARAMS_BLOCK_RADIAL, MTK_DIP_PARAMS_BLOCK_RNR }) {
++			sent_[type].clear();
++			pending_[type].clear();
++			unknown_[type] = false;
++		}
 +	}
 +}
 +
@@ -9077,6 +9378,21 @@ index 0000000..fc5123a
 +	}
 +
 +	/*
++	 * Radial weights and raw noise reduction of the whole table, for
++	 * drivers that know the blocks
++	 */
++	if (rawBlocks_) {
++		if (quality_ && quality_->radial())
++			pending_[MTK_DIP_PARAMS_BLOCK_RADIAL] = blockBytes(*quality_->radial());
++		else
++			neutral(MTK_DIP_PARAMS_BLOCK_RADIAL);
++		if (quality_ && quality_->rnr())
++			pending_[MTK_DIP_PARAMS_BLOCK_RNR] = blockBytes(*quality_->rnr());
++		else
++			neutral(MTK_DIP_PARAMS_BLOCK_RNR);
++	}
++
++	/*
 +	 * Temporal noise reduction: the block of the frame, or the module off
 +	 * once (a still image, no tuning). A block with a flag acts on its job
 +	 * only: it goes into the buffer also when the same block went before.
@@ -9233,10 +9549,10 @@ index 0000000..fc5123a
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/dip_params.h b/src/ipa/mtkisp50/dip_params.h
 new file mode 100644
-index 0000000..33920ee
+index 0000000..64fd964
 --- /dev/null
 +++ b/src/ipa/mtkisp50/dip_params.h
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,352 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Translation of the frame parameters of the mtkisp50 IPA into MT6785 DIP
@@ -9443,6 +9759,10 @@ index 0000000..33920ee
 +	bool usesNbc2() const { return usesNbc2_; }
 +	void dropNbc2();
 +
++	/* Blocks of the whole table, not per point */
++	const std::optional<struct mtk_dip_params_radial> &radial() const { return radial_; }
++	const std::optional<struct mtk_dip_params_rnr> &rnr() const { return rnr_; }
++
 +private:
 +	QualityTable() = default;
 +
@@ -9465,6 +9785,8 @@ index 0000000..33920ee
 +	bool usesYcnr_ = false;
 +	bool usesDemosaic_ = false;
 +	bool usesNbc2_ = false;
++	std::optional<struct mtk_dip_params_radial> radial_;
++	std::optional<struct mtk_dip_params_rnr> rnr_;
 +};
 +
 +/*
@@ -9514,13 +9836,18 @@ index 0000000..33920ee
 +};
 +
 +/*
-+ * The driver knows all block types of this UAPI header when its parameter
-+ * buffers have the size of this header: the size grew with the temporal noise
-+ * reduction, the last type
++ * The block types a driver knows, from the size of its parameter buffers: the
++ * size grew with the temporal noise reduction and the blend (6144), then with
++ * the radial weights and the raw noise reduction (6656)
 + */
 +inline bool driverHasTemporalNr(uint32_t paramsBufferSize)
 +{
-+	return paramsBufferSize >= MTK_DIP_PARAMS_MAX_SIZE;
++	return paramsBufferSize >= 6144;
++}
++
++inline bool driverHasRawBlocks(uint32_t paramsBufferSize)
++{
++	return paramsBufferSize >= 6656;
 +}
 +
 +class ParamsEncoder
@@ -9544,10 +9871,11 @@ index 0000000..33920ee
 +
 +	void setTemporalNr(bool supported);
 +	bool temporalNr() const { return temporalNr_; }
++	void setRawBlocks(bool supported);
 +
 +private:
 +	/* Type 9 is not used (see the UAPI header) */
-+	static constexpr unsigned int kBlockTypes = MTK_DIP_PARAMS_BLOCK_MIX + 1;
++	static constexpr unsigned int kBlockTypes = MTK_DIP_PARAMS_BLOCK_RNR + 1;
 +
 +	/*
 +	 * Blocks the DIP has received, those of the last encode(), and which
@@ -9571,6 +9899,7 @@ index 0000000..33920ee
 +	std::optional<QualityTable> quality_;
 +	/* The driver knows the temporal noise reduction block */
 +	bool temporalNr_ = false;
++	bool rawBlocks_ = false;
 +};
 +
 +} /* namespace ipa::mtkisp50 */
@@ -10284,10 +10613,10 @@ index 0000000..e38120a
 +} /* namespace libcamera */
 diff --git a/src/ipa/mtkisp50/mtkisp50.cpp b/src/ipa/mtkisp50/mtkisp50.cpp
 new file mode 100644
-index 0000000..96d54c6
+index 0000000..f534e29
 --- /dev/null
 +++ b/src/ipa/mtkisp50/mtkisp50.cpp
-@@ -0,0 +1,857 @@
+@@ -0,0 +1,858 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2023, Linaro Ltd
@@ -10712,6 +11041,7 @@ index 0000000..96d54c6
 +
 +	/* All blocks again with the first parameters of the stream */
 +	encoder_.setTemporalNr(driverHasTemporalNr(configInfo.paramsBufferSize));
++	encoder_.setRawBlocks(driverHasRawBlocks(configInfo.paramsBufferSize));
 +	encoder_.setProcessedWidth(configInfo.ispCrop.width);
 +	encoder_.reset();
 +	if (encoder_.isoScale(QualityTable::Preview) != 1.0 ||
@@ -27587,10 +27917,10 @@ index 0000000..1892b41
 +TEST_REGISTER(MtkIsp50ProgramTest)
 diff --git a/test/mtkisp50/quality.cpp b/test/mtkisp50/quality.cpp
 new file mode 100644
-index 0000000..4efe0ee
+index 0000000..96adead
 --- /dev/null
 +++ b/test/mtkisp50/quality.cpp
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,235 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * Image quality points of the mtkisp50 IPA: the choice of the point per
@@ -27680,6 +28010,37 @@ index 0000000..4efe0ee
 +	return -1;
 +}
 +
++/* Flags of the block of a type in a buffer, -1 without it */
++int flagsOf(const std::vector<uint8_t> &buf, size_t used, uint16_t type)
++{
++	const auto *head = reinterpret_cast<const v4l2_isp_params_buffer *>(buf.data());
++	if (!used)
++		return -1;
++	size_t off = 0;
++	while (off + sizeof(v4l2_isp_params_block_header) <= head->data_size) {
++		const auto *h = reinterpret_cast<const v4l2_isp_params_block_header *>(head->data + off);
++		if (h->type == type)
++			return h->flags;
++		off += h->size;
++	}
++	return -1;
++}
++
++const char *const kRadial =
++	"  radial:\n"
++	"    center_x: 2312\n    center_y: 1736\n    radius: [800, 1600, 2400]\n"
++	"    weight: [0, 32, 64, 128, 255]\n    slope: [2621, 2621, 5243, 36864]\n";
++
++const char *const kRnr =
++	"  rnr:\n"
++	"    ratio: 256\n    noise_offset: [0, 0, 0]\n    noise_slope: [0, 0, 0]\n"
++	"    radial_gain: [128, 128]\n    norm_gain: [512, 512, 512]\n"
++	"    norm_offset: [0, -1, 0]\n    black_gain: 512\n    eps: 1\n"
++	"    range: [4, 8, 16, 32]\n    median_ratio: 0\n    profile_ratio: 0\n"
++	"    radius: 3\n    th_right: 10\n    th_left: 20\n    flat_mode: 0\n"
++	"    gradient_ratio: 0\n    lowpass_ratio: 0\n    intensity_offset: 0\n"
++	"    radial_enable: 0\n    level_th: [0, 0]\n    level_slope: [0, 0]\n";
++
 +} /* namespace */
 +
 +class MtkIsp50QualityTest : public Test
@@ -27744,6 +28105,44 @@ index 0000000..4efe0ee
 +			if (!bad || QualityTable::fromTuning((*bad)["NoiseReduction"]))
 +				return fail(std::string("width ") + w + " taken");
 +		}
++
++		/*
++		 * Radial weights and raw noise reduction of the table: sent to
++		 * a driver that knows them (with the first buffer after
++		 * reset()), never to one that does not
++		 */
++		std::unique_ptr<ValueNode> raw = parse("NoiseReduction:\n" + set("", "  ") + kRadial + kRnr);
++		std::optional<QualityTable> rawTable = raw ? QualityTable::fromTuning((*raw)["NoiseReduction"])
++							   : std::nullopt;
++		if (!rawTable || !rawTable->radial() || !rawTable->rnr())
++			return fail("radial weights and raw noise reduction not read");
++		if (rawTable->radial()->slope[3] != 36864 || rawTable->rnr()->norm_offset[1] != -1)
++			return fail("radial weights or raw noise reduction values");
++		for (bool driver : { false, true }) {
++			ParamsEncoder e;
++			e.setRawBlocks(driver);
++			e.setQuality(rawTable);
++			e.reset();
++			std::vector<uint8_t> buf(MTK_DIP_PARAMS_MAX_SIZE);
++			DipFrameParams p;
++			const size_t used = e.encode(p, BayerFormat::BGGR, buf);
++			const int want = driver ? MTK_DIP_PARAMS_BLOCK_FL_ENABLE : -1;
++			if (flagsOf(buf, used, MTK_DIP_PARAMS_BLOCK_RADIAL) != want ||
++			    flagsOf(buf, used, MTK_DIP_PARAMS_BLOCK_RNR) != want)
++				return fail(driver ? "blocks not sent" : "blocks sent to an older driver");
++		}
++
++		/* Without the keys: disabled once after reset() */
++		ParamsEncoder e;
++		e.setRawBlocks(true);
++		e.setQuality(table);
++		e.reset();
++		std::vector<uint8_t> buf(MTK_DIP_PARAMS_MAX_SIZE);
++		DipFrameParams p;
++		const size_t used = e.encode(p, BayerFormat::BGGR, buf);
++		if (flagsOf(buf, used, MTK_DIP_PARAMS_BLOCK_RADIAL) != MTK_DIP_PARAMS_BLOCK_FL_DISABLE ||
++		    flagsOf(buf, used, MTK_DIP_PARAMS_BLOCK_RNR) != MTK_DIP_PARAMS_BLOCK_FL_DISABLE)
++			return fail("blocks not disabled without the keys");
 +
 +		return TestPass;
 +	}
