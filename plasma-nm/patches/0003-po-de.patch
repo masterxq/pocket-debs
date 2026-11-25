@@ -1,0 +1,71 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] po/de: German translation of the strings for several SIMs
+Description:
+ German translation of the strings added by the patches for several SIMs:
+ the SIM names of the cellular library and the strings of the cellular
+ network settings page.
+Forwarded: not-needed
+License: as the patched files (the translations are under the license of the translated program)
+Last-Update: 2026-11-25
+---
+--- a/po/de/kcm_cellular_network.po
++++ b/po/de/kcm_cellular_network.po
+@@ -561,6 +561,39 @@ msgstr "SIM ID"
+ msgid "Emergency Numbers"
+ msgstr "Notfallnummern"
+ 
++#, kde-format
++msgctxt "@title modem of a SIM"
++msgid "Modem of %1"
++msgstr "Modem von %1"
++
++msgid "Modem"
++msgstr "Modem"
++
++msgid "Icon"
++msgstr "Symbol"
++
++msgid "Shown with this SIM wherever a SIM is chosen."
++msgstr "Wird überall dort mit dieser SIM angezeigt, wo eine SIM gewählt wird."
++
++msgid "Use this icon for the SIM"
++msgstr "Dieses Symbol für die SIM verwenden"
++
++msgid "SIM for mobile data"
++msgstr "SIM für mobile Daten"
++
++msgid "Mobile data only uses this SIM."
++msgstr "Mobile Daten laufen nur über diese SIM."
++
++msgid "SIM for calls and messages"
++msgstr "SIM für Anrufe und Nachrichten"
++
++msgid "Calls and text messages use this SIM unless another one is chosen for them."
++msgstr "Anrufe und SMS laufen über diese SIM, sofern für sie keine andere gewählt wird."
++
++#, kde-format
++msgid "View %1 details."
++msgstr "Details zu %1 anzeigen."
++
+ #~ msgid "Error resetting the modem: %1"
+ #~ msgstr "Fehler beim Zurücksetzen des Modems: %1"
+ 
+--- a/po/de/plasmanetworkmanagement-libs.po
++++ b/po/de/plasmanetworkmanagement-libs.po
+@@ -4258,6 +4258,15 @@ msgctxt "global connection state"
+ msgid "Unknown"
+ msgstr "Unbekannt"
+ 
++#, kde-format
++msgctxt "@label name of a SIM card after its slot"
++msgid "SIM %1"
++msgstr "SIM %1"
++
++msgctxt "@label name of a SIM card"
++msgid "SIM"
++msgstr "SIM"
++
+ #~ msgid "Wi-Fi Security"
+ #~ msgstr "WLAN-Sicherheit"
+ 

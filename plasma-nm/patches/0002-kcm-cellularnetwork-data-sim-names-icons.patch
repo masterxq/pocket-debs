@@ -1,13 +1,16 @@
 From: pocket-debs <masterxq@users.noreply.github.com>
 Date: Tue, 25 Nov 2026 12:00:00 +0100
-Subject: [PATCH] kcm_cellularnetwork: SIM for mobile data, SIM names and icons
+Subject: [PATCH] kcm_cellularnetwork: SIM for mobile data, SIM for calls and messages, SIM names and icons
 Description:
  The main page follows the modem for mobile data instead of the first modem
  and, with more than one modem, offers the choice "SIM for mobile data";
  choosing a SIM enables mobile data on it and disables it on the others.
- SIMs are listed with their name ("SIM <slot>") and icon, the SIM page
- lets the user choose the icon of the SIM out of the shared set. The page
- of a modem is named after its SIM instead of the object number.
+ The choice "SIM for calls and messages" sets the SIM the dialer and the
+ messaging application use unless another one is chosen for a call or a
+ message. Both choices list the SIMs in the order of their slots. SIMs are
+ listed with their name ("SIM <slot>") and icon, the SIM page lets the user
+ choose the icon of the SIM out of the shared set. The page of a modem is
+ named after its SIM instead of the object number.
  .
  While a modem goes away and comes back (e.g. a modem object restarted by
  ModemManager) the pages show no modem instead of failing on a missing one.
@@ -107,16 +110,52 @@ Last-Update: 2026-11-25
  
 --- a/kcms/kcm_cellularnetwork/ui/main.qml
 +++ b/kcms/kcm_cellularnetwork/ui/main.qml
-@@ -30,7 +30,7 @@ KCM.SimpleKCM {
+@@ -30,7 +30,43 @@ KCM.SimpleKCM {
          id: modemList
      }
  
 -    property Cellular.CellularModem selectedModem: modemList.primaryModem
 +    property Cellular.CellularModem selectedModem: modemList.dataModem
++
++    // every modem with a SIM, in the order of the SIM slots (SIMs without a known slot last)
++    readonly property var simModems: modemList.modems
++        .filter(modem => modem.sim !== null)
++        .sort((a, b) => (a.simSlot > 0 ? a.simSlot : Number.MAX_SAFE_INTEGER) - (b.simSlot > 0 ? b.simSlot : Number.MAX_SAFE_INTEGER))
++
++    // choice of a SIM, shown with several SIMs
++    component SimComboBox: FormCard.FormComboBoxDelegate {
++        id: simComboBox
++
++        // modems with a SIM to choose from
++        property var simModems: []
++        // the modem whose SIM is shown as chosen
++        property var chosenModem: null
++        signal modemActivated(var modem)
++
++        // the combo box resets its index when the model changes, so the index is set afterwards
++        function syncCurrentIndex() {
++            currentIndex = model.findIndex(entry => entry.modem === chosenModem);
++        }
++
++        visible: simModems.length > 1
++        model: simModems.map(modem => ({ "text": modem.sim.name, "modem": modem }))
++        textRole: "text"
++
++        onModelChanged: Qt.callLater(() => simComboBox.syncCurrentIndex())
++        onChosenModemChanged: Qt.callLater(() => simComboBox.syncCurrentIndex())
++        Component.onCompleted: syncCurrentIndex()
++
++        onActivated: index => {
++            const modem = model[index] ? model[index].modem : null;
++            if (modem && modem !== chosenModem) {
++                modemActivated(modem);
++            }
++        }
++    }
  
      PlasmaNM.Handler {
          id: nmHandler
-@@ -86,7 +86,7 @@ KCM.SimpleKCM {
+@@ -86,7 +122,7 @@ KCM.SimpleKCM {
                  id: mobileDataSwitch
                  text: i18n("Mobile data")
                  description: {
@@ -125,7 +164,7 @@ Last-Update: 2026-11-25
                          return "";
                      } else if (!selectedModem.hasSim) {
                          return i18n("No SIM is inserted.")
-@@ -115,14 +115,40 @@ KCM.SimpleKCM {
+@@ -115,14 +151,45 @@ KCM.SimpleKCM {
                          return;
                      }
  
@@ -144,31 +183,36 @@ Last-Update: 2026-11-25
 +                below: dataSimCombo
 +            }
 +
-+            FormCard.FormComboBoxDelegate {
++            SimComboBox {
 +                id: dataSimCombo
 +                text: i18n("SIM for mobile data")
 +                description: i18n("Mobile data only uses this SIM.")
-+                visible: modemList.modems.length > 1
 +                enabled: enabledConnections.wwanEnabled
-+
-+                // one entry per modem with a SIM
-+                model: modemList.modems.filter(modem => modem.sim !== null).map(modem => ({ "text": modem.sim.name, "modem": modem }))
-+                textRole: "text"
-+                currentIndex: model.findIndex(entry => entry.modem === root.selectedModem)
-+
-+                onActivated: index => {
-+                    const modem = model[index] ? model[index].modem : null;
-+                    if (modem && modem !== root.selectedModem) {
-+                        modemList.setDataModem(modem);
-+                    }
-+                }
++                simModems: root.simModems
++                chosenModem: root.selectedModem
++                onModemActivated: modem => modemList.setDataModem(modem)
 +            }
 +
-+            FormCard.FormDelegateSeparator { above: dataSimCombo.visible ? dataSimCombo : mobileDataSwitch; below: dataUsageButton }
++            FormCard.FormDelegateSeparator {
++                visible: defaultSimCombo.visible
++                above: dataSimCombo
++                below: defaultSimCombo
++            }
++
++            SimComboBox {
++                id: defaultSimCombo
++                text: i18n("SIM for calls and messages")
++                description: i18n("Calls and text messages use this SIM unless another one is chosen for them.")
++                simModems: root.simModems
++                chosenModem: modemList.defaultModem
++                onModemActivated: modem => modemList.setDefaultModem(modem)
++            }
++
++            FormCard.FormDelegateSeparator { above: defaultSimCombo.visible ? defaultSimCombo : mobileDataSwitch; below: dataUsageButton }
  
              FormCard.FormButtonDelegate {
                  id: dataUsageButton
-@@ -156,9 +182,9 @@ KCM.SimpleKCM {
+@@ -156,9 +223,9 @@ KCM.SimpleKCM {
  
                      FormCard.FormButtonDelegate {
                          id: simDelegate
