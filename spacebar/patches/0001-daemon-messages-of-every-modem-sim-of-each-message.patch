@@ -1,0 +1,783 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] daemon: messages of every modem, SIM of each message, send through a chosen SIM
+Description:
+ The daemon used the first modem only: SMS that arrived on the SIM of
+ another modem (dual SIM phones with one ModemManager modem per SIM) were
+ never stored, and every message was sent through the first modem.
+ .
+ ModemController handles the messages of every modem (also of modems that
+ come later) and keeps the first modem as the default one (MMS and the data
+ bearer stay on it). Each message stores the SIM (ICCID) it was received on
+ or sent through (new column Messages.sim, migration
+ 2026-11-25-120000_message_sim). sendMessage takes the SIM to send an SMS
+ through (empty: the default modem). The new method sims() lists the active
+ SIM of every modem with its slot (PrimarySimSlot, read over D-Bus), name
+ ("SIM <slot>", else the operator name) and icon (shared with plasma-nm and
+ plasma-dialer in simidentitiesrc, class SimIdentities); simsChanged is
+ signalled when the SIMs change.
+Forwarded: no
+License: as the patched files (GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL); new files simidentities.* LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
+Last-Update: 2026-11-25
+---
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -40,7 +40,7 @@ ecm_setup_version(${PROJECT_VERSION}
+ )
+ 
+ ################# Find dependencies #################
+-find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Concurrent Gui Qml Quick QuickControls2 Widgets Sql)
++find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Concurrent DBus Gui Qml Quick QuickControls2 Widgets Sql)
+ find_package(KF6 ${KF6_MIN_VERSION} REQUIRED COMPONENTS Kirigami I18n Contacts People Notifications Config CoreAddons DBusAddons ModemManagerQt KIO WindowSystem Crash)
+ find_package(KF6KirigamiAddons 1.4 REQUIRED)
+ find_package(PhoneNumber COMPONENTS PhoneNumber REQUIRED)
+--- a/daemon/channellogger.cpp
++++ b/daemon/channellogger.cpp
+@@ -53,6 +53,7 @@ ChannelLogger::ChannelLogger(std::optional<QString> &modemPath, QObject *parent)
+     });
+ 
+     connect(&ModemController::instance(), &ModemController::modemConnected, this, &ChannelLogger::checkMessages);
++    connect(&ModemController::instance(), &ModemController::simsChanged, this, &ChannelLogger::simsChanged);
+ 
+     connect(&ModemController::instance(), &ModemController::modemDataConnectedChanged, this, [this](const bool isConnected) {
+         m_dataConnected = isConnected;
+@@ -175,6 +176,7 @@ QCoro::Task<void> ChannelLogger::handleIncomingMessage(ModemManager::Sms::Ptr ms
+     const QString text = msg->text();
+     const QDateTime datetime = msg->timestamp();
+     const QByteArray data = msg->data();
++    const QString sim = ModemController::instance().simForMessage(msg->uni());
+ 
+     // Delete message from modem
+     ModemController::instance().deleteMessage(msg->uni());
+@@ -186,7 +188,7 @@ QCoro::Task<void> ChannelLogger::handleIncomingMessage(ModemManager::Sms::Ptr ms
+ 
+     // text and data are not valid at the same time
+     if (!text.isEmpty()) {
+-        co_await saveMessage(phoneNumberList, datetime, text);
++        co_await saveMessage(phoneNumberList, datetime, text, {}, {}, {}, {}, false, {}, {}, 0, sim);
+     } else if (!data.isEmpty()) {
+         MmsMessage mmsMessage;
+         m_mms.decodeNotification(mmsMessage, data);
+@@ -326,9 +328,11 @@ QCoro::Task<void> ChannelLogger::saveMessage(const PhoneNumberList &phoneNumberL
+                                              const bool pendingDownload,
+                                              const QString &contentLocation,
+                                              const QDateTime &expires,
+-                                             const int size)
++                                             const int size,
++                                             const QString &sim)
+ {
+     Message message;
++    message.sim = sim;
+     message.text = text;
+     message.sentByMe = false; // SMS doesn't have any kind of synchronization, so received messages are always from the chat partner.
+     message.datetime = datetime;
+@@ -377,11 +381,21 @@ QCoro::Task<void> ChannelLogger::saveMessage(const PhoneNumberList &phoneNumberL
+     createNotification(message);
+ }
+ 
+-void ChannelLogger::sendMessage(const QString &numbers, const QString &id, const QString &text, const QStringList &files, const qint64 &totalSize)
++QList<QMap<QString, QString>> ChannelLogger::sims()
++{
++    return ModemController::instance().sims();
++}
++
++void ChannelLogger::sendMessage(const QString &numbers,
++                                const QString &id,
++                                const QString &text,
++                                const QStringList &files,
++                                const qint64 &totalSize,
++                                const QString &sim)
+ {
+     PhoneNumberList phoneNumberList = PhoneNumberList(numbers);
+ 
+-    [this, phoneNumberList, id, text, files, totalSize]() -> QCoro::Task<void> {
++    [this, phoneNumberList, id, text, files, totalSize, sim]() -> QCoro::Task<void> {
+         QString result;
+         // check if it is a MMS message
+         if (phoneNumberList.size() > 1 || files.length() > 0) {
+@@ -393,7 +407,7 @@ void ChannelLogger::sendMessage(const QString &numbers, const QString &id, const
+                     if (files.length() > 0) {
+                         sendMessageMMS(PhoneNumberList(phoneNumber.toInternational()), Database::generateRandomId(), text, files, totalSize);
+                     } else {
+-                        result = co_await sendMessageSMS(phoneNumber, Database::generateRandomId(), text);
++                        result = co_await sendMessageSMS(phoneNumber, Database::generateRandomId(), text, sim);
+                     }
+                 }
+ 
+@@ -406,7 +420,7 @@ void ChannelLogger::sendMessage(const QString &numbers, const QString &id, const
+                 updateMessage(message);
+             }
+         } else {
+-            result = co_await sendMessageSMS(phoneNumberList.first(), id, text);
++            result = co_await sendMessageSMS(phoneNumberList.first(), id, text, sim);
+         }
+ 
+         if (result.isEmpty()) {
+@@ -422,7 +436,7 @@ void ChannelLogger::sendTapback(const QString &numbers, const QString &id, const
+     sendTapbackHandler(numbers, id, tapback, isRemoved);
+ }
+ 
+-QCoro::Task<QString> ChannelLogger::sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text)
++QCoro::Task<QString> ChannelLogger::sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text, const QString &sim)
+ {
+     ModemManager::ModemMessaging::Message m;
+     m.number = phoneNumber.toE164();
+@@ -436,11 +450,12 @@ QCoro::Task<QString> ChannelLogger::sendMessageSMS(const PhoneNumber &phoneNumbe
+     message.read = true;
+     message.sentByMe = true;
+     message.deliveryStatus = MessageState::Pending;
++    message.sim = sim.isEmpty() ? ModemController::instance().defaultSimIdentifier() : sim;
+ 
+     // add message to database
+     co_await addMessage(message);
+ 
+-    auto maybeReply = ModemController::instance().createMessage(m);
++    auto maybeReply = ModemController::instance().createMessage(m, sim);
+ 
+     if (!maybeReply) {
+         m_database.updateMessageDeliveryState(message.id, MessageState::Failed);
+--- a/daemon/channellogger.h
++++ b/daemon/channellogger.h
+@@ -36,11 +36,15 @@ public:
+     // QString argument since this needs to be called from DBus
+     Q_SCRIPTABLE void disableNotificationsForNumber(const QString &numbers);
+     Q_SCRIPTABLE void manualDownload(const QString &id, const QString &url, const QDateTime &expires);
+-    Q_SCRIPTABLE void sendMessage(const QString &numbers, const QString &id, const QString &text, const QStringList &files, const qint64 &totalSize);
++    // sim: ICCID of the SIM to send an SMS through, the default modem if empty
++    Q_SCRIPTABLE void
++    sendMessage(const QString &numbers, const QString &id, const QString &text, const QStringList &files, const qint64 &totalSize, const QString &sim);
+     Q_SCRIPTABLE void sendTapback(const QString &numbers, const QString &id, const QString &tapback, const bool &isRemoved);
+     Q_SCRIPTABLE void syncSettings();
+     Q_SCRIPTABLE QString ownNumber();
+     Q_SCRIPTABLE QString countryCode();
++    // active SIM of every modem: simIdentifier, deviceUni, slot, name, icon
++    Q_SCRIPTABLE StringMapList sims();
+ 
+     /*
+      * For the given phone numbers, return the list of chats associated with them.
+@@ -77,8 +81,9 @@ private:
+                                   const bool pendingDownload = false,
+                                   const QString &contentLocation = QString(),
+                                   const QDateTime &expires = QDateTime(),
+-                                  const int size = 0);
+-    QCoro::Task<QString> sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text);
++                                  const int size = 0,
++                                  const QString &sim = QString());
++    QCoro::Task<QString> sendMessageSMS(const PhoneNumber &phoneNumber, const QString &id, const QString &text, const QString &sim = QString());
+     QCoro::Task<QString>
+     sendMessageMMS(const PhoneNumberList &phoneNumberList, const QString &id, const QString &text, const QStringList &files, const qint64 totalSize);
+     QCoro::Task<void> sendCancelResponse(const QString &transactionId);
+@@ -116,4 +121,5 @@ Q_SIGNALS:
+     Q_SCRIPTABLE void messageAdded(const QString &phoneNumber, const QString &id);
+     Q_SCRIPTABLE void messageUpdated(const QString &phoneNumber, const QString &id);
+     Q_SCRIPTABLE void manualDownloadFinished(const QString &id, const bool isEmpty);
++    Q_SCRIPTABLE void simsChanged();
+ };
+--- a/daemon/org.kde.spacebar.Daemon.xml
++++ b/daemon/org.kde.spacebar.Daemon.xml
+@@ -9,6 +9,8 @@
+       <arg name="phoneNumber" type="s" direction="out"/>
+       <arg name="id" type="s" direction="out"/>
+     </signal>
++    <signal name="simsChanged">
++    </signal>
+     <signal name="manualDownloadFinished">
+       <arg name="id" type="s" direction="out"/>
+       <arg name="isEmpty" type="b" direction="out"/>
+@@ -28,6 +30,7 @@
+       <arg name="text" type="s" direction="in"/>
+       <arg name="files" type="as" direction="in"/>
+       <arg name="totalSize" type="x" direction="in"/>
++      <arg name="sim" type="s" direction="in"/>
+     </method>
+     <method name="sendTapback">
+       <arg name="numbers" type="s" direction="in"/>
+@@ -43,6 +46,10 @@
+     <method name="countryCode">
+       <arg type="s" direction="out"/>
+     </method>
++    <method name="sims">
++      <arg type="aa{ss}" direction="out"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.Out0" value="StringMapList"/>
++    </method>
+     <method name="chats">
+       <arg type="aa{ss}" direction="out"/>
+       <annotation name="org.qtproject.QtDBus.QtTypeName.Out0" value="StringMapList"/>
+--- a/lib/database/database.cpp
++++ b/lib/database/database.cpp
+@@ -74,7 +74,8 @@ QCoro::Task<std::vector<Message>> Database::messagesForNumber(const PhoneNumberL
+             contentLocation,
+             expires,
+             size,
+-            tapbacks
++            tapbacks,
++            sim
+         FROM Messages
+     )");
+ 
+@@ -232,8 +233,9 @@ QCoro::Task<> Database::addMessage(const Message &message)
+             pendingDownload,
+             contentLocation,
+             expires,
+-            size)
+-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++            size,
++            sim)
++        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         )"),
+                                  message.id,
+                                  message.phoneNumberList.toString(),
+@@ -251,7 +253,8 @@ QCoro::Task<> Database::addMessage(const Message &message)
+                                  message.pendingDownload,
+                                  message.contentLocation,
+                                  message.expires.isNull() ? QVariant() : message.expires.toMSecsSinceEpoch(),
+-                                 message.size);
++                                 message.size,
++                                 message.sim);
+ }
+ 
+ QCoro::Task<> Database::deleteMessage(const QString &id)
+@@ -522,7 +525,8 @@ Message Message::fromSql(ColumnTypes &&tuple)
+           contentLocation,
+           expires,
+           size,
+-          tapbacks] = tuple;
++          tapbacks,
++          sim] = tuple;
+ 
+     Message message;
+     message.id = id, message.phoneNumberList = PhoneNumberList(phoneNumberList);
+@@ -542,5 +546,6 @@ Message Message::fromSql(ColumnTypes &&tuple)
+     message.expires = QDateTime::fromMSecsSinceEpoch(expires);
+     message.size = size;
+     message.tapbacks = tapbacks;
++    message.sim = sim;
+     return message;
+ }
+--- a/lib/database/database.h
++++ b/lib/database/database.h
+@@ -46,7 +46,7 @@ Q_DECLARE_METATYPE(StringMapList)
+ 
+ struct Message {
+     using ColumnTypes =
+-        std::tuple<QString, QString, QString, qint64, bool, int, bool, QString, QString, QString, QString, int, QString, bool, QString, qint64, int, QString>;
++        std::tuple<QString, QString, QString, qint64, bool, int, bool, QString, QString, QString, QString, int, QString, bool, QString, qint64, int, QString, QString>;
+ 
+     static Message fromSql(ColumnTypes &&tuple);
+ 
+@@ -68,6 +68,7 @@ struct Message {
+     QDateTime expires;
+     int size = 0;
+     QString tapbacks;
++    QString sim; // SIM (ICCID) the message was received on or sent through, empty if not known
+ 
+     Message() = default;
+ 
+@@ -91,6 +92,7 @@ struct Message {
+         expires = QDateTime::fromString(map[SL("expires")]);
+         size = map[SL("size")].toInt();
+         tapbacks = map[SL("tapbacks")];
++        sim = map[SL("sim")];
+     }
+ 
+     StringMap toMap() const
+@@ -114,6 +116,7 @@ struct Message {
+             {SL("expires"), expires.toString()},
+             {SL("size"), QString::number(size)},
+             {SL("tapbacks"), tapbacks},
++            {SL("sim"), sim},
+         };
+     }
+ };
+--- a/lib/database/migrations.qrc
++++ b/lib/database/migrations.qrc
+@@ -2,5 +2,7 @@
+     <qresource prefix="/">
+         <file>migrations/2023-05-07-102621_init/down.sql</file>
+         <file>migrations/2023-05-07-102621_init/up.sql</file>
++        <file>migrations/2026-11-25-120000_message_sim/down.sql</file>
++        <file>migrations/2026-11-25-120000_message_sim/up.sql</file>
+     </qresource>
+ </RCC>
+--- /dev/null
++++ b/lib/database/migrations/2026-11-25-120000_message_sim/down.sql
+@@ -0,0 +1 @@
++ALTER TABLE Messages DROP COLUMN sim;
+--- /dev/null
++++ b/lib/database/migrations/2026-11-25-120000_message_sim/up.sql
+@@ -0,0 +1 @@
++ALTER TABLE Messages ADD COLUMN sim TEXT;
+--- a/lib/telephonySupport/CMakeLists.txt
++++ b/lib/telephonySupport/CMakeLists.txt
+@@ -3,7 +3,8 @@ add_library(kTelephonySupport STATIC
+     contactphonenumbermapper.cpp
+     modemcontroller.cpp
+     phonenumber.cpp
+-    phonenumberlist.cpp)
++    phonenumberlist.cpp
++    simidentities.cpp)
+ target_compile_definitions(kTelephonySupport PRIVATE -DQT_NO_CAST_FROM_ASCII)
+ target_link_libraries(kTelephonySupport PUBLIC
+     Qt6::Core
+@@ -11,6 +12,9 @@ target_link_libraries(kTelephonySupport PUBLIC
+     KF6::People
+     KF6::PeopleBackend
+     KF6::ModemManagerQt
++    KF6::ConfigCore
++    KF6::I18n
++    Qt6::DBus
+     PhoneNumber::PhoneNumber
+     macros)
+ target_include_directories(kTelephonySupport PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+--- a/lib/telephonySupport/modemcontroller.cpp
++++ b/lib/telephonySupport/modemcontroller.cpp
+@@ -4,7 +4,19 @@
+ 
+ #include "modemcontroller.h"
+ 
++#include "simidentities.h"
++
++#include <KLocalizedString>
++
+ #include <ModemManagerQt/Manager>
++#include <ModemManagerQt/Sim>
++
++#include <QDBusArgument>
++#include <QDBusConnection>
++#include <QDBusMessage>
++#include <QDBusObjectPath>
++#include <QDBusPendingCallWatcher>
++#include <QPointer>
+ 
+ ModemController &ModemController::instance()
+ {
+@@ -16,12 +28,32 @@ ModemController::ModemController()
+     : QObject()
+ {
+     connect(ModemManager::notifier(), &ModemManager::Notifier::modemAdded, this, [this](const QString &udi) {
++        // with several modems keep the default modem, messages of the others are handled as well
++        if (m_modem && ModemManager::findModemDevice(m_modem->uni())) {
++            initAllMessaging();
++            Q_EMIT simsChanged();
++            return;
++        }
+         init(udi);
+     });
++    connect(ModemManager::notifier(), &ModemManager::Notifier::modemRemoved, this, [this](const QString &udi) {
++        m_msgManagers.remove(udi);
++        m_slots.remove(udi);
++        Q_EMIT simsChanged();
++    });
++    connect(SimIdentities::instance(), &SimIdentities::changed, this, &ModemController::simsChanged);
+ }
+ 
+-std::optional<QDBusPendingReply<QDBusObjectPath>> ModemController::createMessage(ModemManager::ModemMessaging::Message m)
++std::optional<QDBusPendingReply<QDBusObjectPath>> ModemController::createMessage(ModemManager::ModemMessaging::Message m, const QString &simIdentifier)
+ {
++    if (!simIdentifier.isEmpty()) {
++        for (const auto &device : ModemManager::modemDevices()) {
++            if (device->sim() && device->sim()->simIdentifier() == simIdentifier && m_msgManagers.contains(device->uni())) {
++                return m_msgManagers.value(device->uni())->createMessage(m);
++            }
++        }
++    }
++
+     if (!m_msgManager) {
+         return {};
+     }
+@@ -29,6 +61,110 @@ std::optional<QDBusPendingReply<QDBusObjectPath>> ModemController::createMessage
+     return m_msgManager->createMessage(m);
+ }
+ 
++void ModemController::initAllMessaging()
++{
++    for (const auto &device : ModemManager::modemDevices()) {
++        if (!m_slots.contains(device->uni())) {
++            m_slots.insert(device->uni(), 0);
++            loadSimSlot(device->uni());
++        }
++        // the messaging interface of a modem may come later
++        connect(device.get(), &ModemManager::ModemDevice::interfaceAdded, this, &ModemController::initAllMessaging, Qt::UniqueConnection);
++        if (m_msgManagers.contains(device->uni()) || !device->hasInterface(ModemManager::ModemDevice::MessagingInterface)) {
++            continue;
++        }
++        const auto msgManager = device->messagingInterface();
++        m_msgManagers.insert(device->uni(), msgManager);
++        connect(msgManager.get(), &ModemManager::ModemMessaging::messageAdded, this, [this, msgManager](const QString &uni, bool received) {
++            if (!received) {
++                return;
++            }
++            ModemManager::Sms::Ptr msg = msgManager->findMessage(uni);
++            if (msg) {
++                handleNewMessage(msg);
++            }
++        });
++    }
++}
++
++void ModemController::loadSimSlot(const QString &deviceUni)
++{
++    // ModemManagerQt does not expose the SIM slots of a modem yet
++    QDBusMessage message = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.ModemManager1"),
++                                                          deviceUni,
++                                                          QStringLiteral("org.freedesktop.DBus.Properties"),
++                                                          QStringLiteral("GetAll"));
++    message << QStringLiteral("org.freedesktop.ModemManager1.Modem");
++
++    QPointer<ModemController> self{this};
++    auto watcher = new QDBusPendingCallWatcher(QDBusConnection::systemBus().asyncCall(message), this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [self, deviceUni](QDBusPendingCallWatcher *watcher) {
++        watcher->deleteLater();
++        QDBusPendingReply<QVariantMap> reply = *watcher;
++        if (!self || reply.isError()) {
++            return;
++        }
++        QList<QDBusObjectPath> simSlots;
++        const QVariant simSlotsValue = reply.value().value(QStringLiteral("SimSlots"));
++        if (simSlotsValue.canConvert<QDBusArgument>()) {
++            simSlotsValue.value<QDBusArgument>() >> simSlots;
++        }
++        const uint primary = reply.value().value(QStringLiteral("PrimarySimSlot")).toUInt();
++        self->m_slots.insert(deviceUni, (primary > 0 && primary <= uint(simSlots.size())) ? int(primary) : 0);
++        Q_EMIT self->simsChanged();
++    });
++}
++
++QString ModemController::simForMessage(const QString &uni) const
++{
++    for (auto it = m_msgManagers.cbegin(); it != m_msgManagers.cend(); ++it) {
++        if (it.value()->findMessage(uni)) {
++            const auto device = ModemManager::findModemDevice(it.key());
++            return (device && device->sim()) ? device->sim()->simIdentifier() : QString();
++        }
++    }
++    return {};
++}
++
++QString ModemController::defaultSimIdentifier() const
++{
++    return (m_modem && m_modem->sim()) ? m_modem->sim()->simIdentifier() : QString();
++}
++
++QList<QMap<QString, QString>> ModemController::sims() const
++{
++    QList<QMap<QString, QString>> sims;
++    for (const auto &device : ModemManager::modemDevices()) {
++        const auto sim = device->sim();
++        if (!sim || sim->uni() == QStringLiteral("/")) {
++            continue;
++        }
++        const int slot = m_slots.value(device->uni());
++        QString name;
++        if (slot > 0) {
++            name = i18nc("@label name of a SIM card after its slot", "SIM %1", slot);
++        } else if (!sim->operatorName().isEmpty()) {
++            name = sim->operatorName();
++        } else {
++            name = i18nc("@label name of a SIM card", "SIM");
++        }
++        sims.append({
++            {QStringLiteral("simIdentifier"), sim->simIdentifier()},
++            {QStringLiteral("deviceUni"), device->uni()},
++            {QStringLiteral("slot"), QString::number(slot)},
++            {QStringLiteral("name"), name},
++            {QStringLiteral("icon"), SimIdentities::instance()->icon(sim->simIdentifier())},
++        });
++    }
++    // in the order of the SIM slots, SIMs without a known slot last
++    std::stable_sort(sims.begin(), sims.end(), [](const auto &a, const auto &b) {
++        const int slotA = a.value(QStringLiteral("slot")).toInt();
++        const int slotB = b.value(QStringLiteral("slot")).toInt();
++        return (slotA > 0 ? slotA : INT_MAX) < (slotB > 0 ? slotB : INT_MAX);
++    });
++    return sims;
++}
++
+ void ModemController::init(std::optional<QString> modemPath)
+ {
+     if (modemPath) {
+@@ -109,6 +245,10 @@ void ModemController::init(std::optional<QString> modemPath)
+         initMessaging();
+     }
+ 
++    // messages of the other modems
++    initAllMessaging();
++    Q_EMIT simsChanged();
++
+     connect(m_interface.get(), &ModemManager::Modem::stateChanged, this, [this](MMModemState oldState, MMModemState newState, MMModemStateChangeReason reason) {
+         Q_UNUSED(oldState);
+         Q_UNUSED(reason);
+@@ -126,21 +266,14 @@ void ModemController::initMessaging()
+ 
+     m_msgManager = m_modem->messagingInterface();
+ 
+-    connect(m_msgManager.get(), &ModemManager::ModemMessaging::messageAdded, this, &ModemController::slotMessageAdded, Qt::UniqueConnection);
++    // messages of every modem are handled through initAllMessaging()
++    initAllMessaging();
+ 
+     Q_EMIT modemConnected();
+ }
+ 
+-void ModemController::slotMessageAdded(const QString &uni, bool received)
++void ModemController::handleNewMessage(ModemManager::Sms::Ptr msg)
+ {
+-    // true if the message was received from the network, as opposed to being added locally
+-    if (!received) {
+-        return;
+-    }
+-
+-    ModemManager::Sms::Ptr msg = m_msgManager->findMessage(uni);
+-    Q_ASSERT(msg);
+-
+     if (msg->state() == MMSmsState::MM_SMS_STATE_RECEIVING) {
+         connect(msg.get(), &ModemManager::Sms::dataChanged, this, [this, msg]() {
+             if (msg->state() == MMSmsState::MM_SMS_STATE_RECEIVED) {
+@@ -163,6 +296,13 @@ void ModemController::slotMessageAdded(const QString &uni, bool received)
+ 
+ void ModemController::deleteMessage(const QString &uni)
+ {
++    for (const auto &msgManager : std::as_const(m_msgManagers)) {
++        if (msgManager->findMessage(uni)) {
++            msgManager->deleteMessage(uni);
++            return;
++        }
++    }
++
+     if (!m_msgManager) {
+         return;
+     }
+@@ -172,12 +312,11 @@ void ModemController::deleteMessage(const QString &uni)
+ 
+ ModemManager::Sms::List ModemController::messages()
+ {
+-    if (!m_msgManager) {
+-        ModemManager::Sms::List list;
+-        return list;
++    ModemManager::Sms::List list;
++    for (const auto &msgManager : std::as_const(m_msgManagers)) {
++        list.append(msgManager->messages());
+     }
+-
+-    return m_msgManager->messages();
++    return list;
+ }
+ 
+ QString ModemController::ownNumber()
+--- a/lib/telephonySupport/modemcontroller.h
++++ b/lib/telephonySupport/modemcontroller.h
+@@ -21,11 +21,20 @@ public:
+ 
+     void init(std::optional<QString> modemPath);
+ 
+-    std::optional<QDBusPendingReply<QDBusObjectPath>> createMessage(ModemManager::ModemMessaging::Message m);
++    // creates the message on the modem with the SIM (ICCID), on the default modem if empty or not found
++    std::optional<QDBusPendingReply<QDBusObjectPath>> createMessage(ModemManager::ModemMessaging::Message m, const QString &simIdentifier = QString());
+     void deleteMessage(const QString &uni);
+ 
++    // messages of all modems
+     ModemManager::Sms::List messages();
+ 
++    // SIM (ICCID) of the modem that has the message, empty if not known
++    QString simForMessage(const QString &uni) const;
++    // SIM (ICCID) of the default modem
++    QString defaultSimIdentifier() const;
++    // active SIM of every modem: simIdentifier, deviceUni, slot ("0" if not known), name, icon
++    QList<QMap<QString, QString>> sims() const;
++
+     QString ownNumber();
+ 
+     QString ifaceName;
+@@ -39,12 +48,14 @@ Q_SIGNALS:
+     void modemConnected();
+     void modemDataConnectedChanged(const bool isConnected);
+     void countryCodeChanged(const QString &code);
+-
+-private Q_SLOTS:
+-    void slotMessageAdded(const QString &uni, bool received);
++    void simsChanged();
+ 
+ private:
++    void handleNewMessage(ModemManager::Sms::Ptr msg);
++
+     void initMessaging();
++    void initAllMessaging();
++    void loadSimSlot(const QString &deviceUni);
+     ModemController();
+ 
+     ModemManager::ModemDevice::Ptr m_modem;
+@@ -52,6 +63,9 @@ private:
+     ModemManager::Modem::Ptr m_interface;
+     ModemManager::Bearer::Ptr m_bearer;
+     ModemManager::Modem3gpp::Ptr m_modem3gpp;
++    // messaging interfaces of all modems, by modem
++    QMap<QString, ModemManager::ModemMessaging::Ptr> m_msgManagers;
++    QMap<QString, int> m_slots;
+ 
+     QString getDNS(QSharedPointer<ModemManager::Bearer> bearer);
+ };
+--- /dev/null
++++ b/lib/telephonySupport/simidentities.cpp
+@@ -0,0 +1,104 @@
++/*
++    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#include "simidentities.h"
++
++#include <KConfigGroup>
++
++#include <QHash>
++
++using namespace Qt::Literals::StringLiterals;
++
++static const auto s_configName = u"simidentitiesrc"_s;
++static const auto s_simsGroup = u"Sim"_s;
++static const auto s_iconKey = u"Icon"_s;
++
++SimIdentities *SimIdentities::instance()
++{
++    static SimIdentities *s_instance = new SimIdentities();
++    return s_instance;
++}
++
++SimIdentities::SimIdentities()
++    : QObject{nullptr}
++    , m_config{KSharedConfig::openConfig(s_configName, KConfig::NoGlobals)}
++    , m_watcher{KConfigWatcher::create(m_config)}
++{
++    connect(m_watcher.data(), &KConfigWatcher::configChanged, this, &SimIdentities::changed);
++}
++
++QStringList SimIdentities::icons()
++{
++    return {
++        u"draw-circle-symbolic"_s,
++        u"draw-rectangle-symbolic"_s,
++        u"applications-utilities-symbolic"_s,
++        u"go-home"_s,
++        u"globe"_s,
++        u"starred-symbolic"_s,
++    };
++}
++
++KConfigGroup SimIdentities::simGroup(const QString &simIdentifier) const
++{
++    return KConfigGroup(m_config, s_simsGroup).group(simIdentifier);
++}
++
++QString SimIdentities::defaultIcon() const
++{
++    const QStringList candidates = icons();
++    QHash<QString, int> uses;
++    const KConfigGroup sims(m_config, s_simsGroup);
++    for (const QString &sim : sims.groupList()) {
++        uses[sims.group(sim).readEntry(s_iconKey, QString())]++;
++    }
++
++    QString best = candidates.first();
++    for (const QString &candidate : candidates) {
++        if (uses.value(candidate) < uses.value(best)) {
++            best = candidate;
++        }
++    }
++    return best;
++}
++
++QString SimIdentities::icon(const QString &simIdentifier)
++{
++    if (simIdentifier.isEmpty()) {
++        return {};
++    }
++
++    QString icon = simGroup(simIdentifier).readEntry(s_iconKey, QString());
++    if (!icon.isEmpty()) {
++        return icon;
++    }
++
++    // another process may have given the SIM its icon since the file was read
++    m_config->reparseConfiguration();
++    icon = simGroup(simIdentifier).readEntry(s_iconKey, QString());
++    if (!icon.isEmpty()) {
++        return icon;
++    }
++
++    icon = defaultIcon();
++    setIcon(simIdentifier, icon);
++    return icon;
++}
++
++void SimIdentities::setIcon(const QString &simIdentifier, const QString &icon)
++{
++    if (simIdentifier.isEmpty() || icon.isEmpty()) {
++        return;
++    }
++
++    KConfigGroup group = simGroup(simIdentifier);
++    if (group.readEntry(s_iconKey, QString()) == icon) {
++        return;
++    }
++    group.writeEntry(s_iconKey, icon, KConfig::Notify);
++    m_config->sync();
++    Q_EMIT changed();
++}
+--- /dev/null
++++ b/lib/telephonySupport/simidentities.h
+@@ -0,0 +1,56 @@
++/*
++    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#pragma once
++
++#include <QObject>
++#include <QString>
++#include <QStringList>
++
++#include <KConfigWatcher>
++#include <KSharedConfig>
++
++/**
++ * Icons of the SIM cards, shared by all applications that show a SIM.
++ *
++ * Each SIM card is identified by its ICCID (the SIM identifier reported by
++ * ModemManager) and gets one icon out of a fixed set. A SIM that is seen for
++ * the first time is given the first icon of the set that no known SIM has
++ * (when all are in use, the least used one, earlier ones first), and the
++ * choice is stored at once, so every application shows the same icon.
++ *
++ * Storage: simidentitiesrc in the configuration directory, one group per SIM
++ * below the group "Sim", named after the ICCID, with the entry Icon. Writes
++ * are notified, so that other processes follow at once.
++ */
++class SimIdentities : public QObject
++{
++    Q_OBJECT
++
++public:
++    static SimIdentities *instance();
++
++    /** The icons a SIM can have, in the order they are given to new SIMs. */
++    static QStringList icons();
++
++    /** Icon of the SIM; a SIM not known yet is given and stored an icon. Empty for an empty identifier. */
++    QString icon(const QString &simIdentifier);
++
++    /** Stores the icon chosen for the SIM. */
++    void setIcon(const QString &simIdentifier, const QString &icon);
++
++Q_SIGNALS:
++    void changed();
++
++private:
++    SimIdentities();
++
++    KConfigGroup simGroup(const QString &simIdentifier) const;
++    QString defaultIcon() const;
++
++    KSharedConfig::Ptr m_config;
++    KConfigWatcher::Ptr m_watcher;
++};
