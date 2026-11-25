@@ -6,23 +6,26 @@ Description:
  signal of the first modem only and the mobile data quick setting and the
  cellular page of the initial setup always worked on the first modem.
  .
- The status bar shows the signal of every SIM, each with the icon of the
- SIM (from the shared SIM icons of plasma-nm's cellular library), in the
- order of the SIM slots; with one modem it is unchanged. The mobile data
- quick setting and the initial setup follow the modem chosen for mobile
- data (CellularModemList.dataModem) and name its SIM. While modems go away
- and come back (a modem object restarted by ModemManager) the quick setting
+ With several SIMs the status bar shows the signal of every SIM in the
+ order of the SIM slots; the signal of the SIM with a mobile data
+ connection carries the network type (network-mobile-<strength>-<type>),
+ and the internet indicator no longer shows the mobile data connection a
+ second time (it still shows Wi-Fi, a hotspot and a connection being set
+ up). With one modem the status bar is unchanged. The mobile data quick
+ setting and the initial setup follow the modem chosen for mobile data
+ (CellularModemList.dataModem) and name its SIM. While modems go away and
+ come back (a modem object restarted by ModemManager) the quick setting
  shows "Not Available" instead of failing on a missing modem.
  .
  Needs the cellular library of plasma-nm with CellularModemList.dataModem,
- CellularModem.sim/simSlot and CellularSim.name/icon.
+ CellularModem.sim/simSlot/networkType and CellularSim.name.
 Forwarded: no
 License: GPL-2.0-or-later, LGPL-2.0-or-later (as the patched files)
 Last-Update: 2026-11-25
 ---
 --- a/components/mobileshell/qml/dataproviders/SignalStrengthInfo.qml
 +++ b/components/mobileshell/qml/dataproviders/SignalStrengthInfo.qml
-@@ -14,13 +14,30 @@ import org.kde.plasma.networkmanagement.cellular as Cellular
+@@ -14,13 +14,29 @@ import org.kde.plasma.networkmanagement.cellular as Cellular
  QtObject {
      property Cellular.CellularModemList _modemList: Cellular.CellularModemList {}
  
@@ -43,17 +46,16 @@ Last-Update: 2026-11-25
  
 +    // the modem used for mobile data
 +    readonly property string icon: _strengthIcon(_modemList.dataModem)
-+    readonly property string label: _modemList.modems.length > 1 ? modems.map(modem => modem.label).filter(text => text !== "").join(" · ") : _label(_modemList.dataModem)
++    readonly property string label: modems.length > 1 ? modems.map(modem => modem.label).filter(text => text !== "").join(" · ") : _label(_modemList.dataModem)
 +
-+    // every modem with a SIM, in the order of the SIM slots
++    // every modem with a SIM, in the order of the SIM slots (SIMs without a known slot last); the
++    // icon of a modem with a mobile data connection names the network type (network-mobile-<strength>-<type>)
 +    readonly property var modems: _modemList.modems
 +        .filter(modem => modem.sim !== null)
-+        .sort((a, b) => a.simSlot - b.simSlot)
++        .sort((a, b) => (a.simSlot > 0 ? a.simSlot : Number.MAX_SAFE_INTEGER) - (b.simSlot > 0 ? b.simSlot : Number.MAX_SAFE_INTEGER))
 +        .map(modem => ({
-+            "icon": _strengthIcon(modem),
-+            "label": _label(modem),
-+            "simIcon": modem.sim.icon,
-+            "simName": modem.sim.name
++            "icon": (modem.activeConnectionUni !== "" && modem.networkType !== "") ? _strengthIcon(modem) + "-" + modem.networkType : _strengthIcon(modem),
++            "label": _label(modem)
 +        }))
 +
      readonly property bool showIndicator: _modemList.modemAvailable
@@ -69,9 +71,18 @@ Last-Update: 2026-11-25
                      }
                      MobileShell.BluetoothIndicator {
                          implicitHeight: mainRow.rowHeight
+@@ -142,6 +142,8 @@ Item {
+                         id: internetIndicatorItem
+                         implicitHeight: mainRow.rowHeight
+                         Layout.preferredWidth: height
++                        // with several SIMs the signal indicator shows mobile data on the signal of its SIM
++                        visible: indicatorRunning || !icon.startsWith("network-mobile-") || MobileShell.SignalStrengthInfo.modems.length <= 1
+                     }
+                     MobileShell.VolumeIndicator {
+                         implicitHeight: mainRow.rowHeight
 --- a/components/mobileshell/qml/statusbar/indicators/SignalStrengthIndicator.qml
 +++ b/components/mobileshell/qml/statusbar/indicators/SignalStrengthIndicator.qml
-@@ -14,40 +14,75 @@ import org.kde.kirigami as Kirigami
+@@ -14,40 +14,63 @@ import org.kde.kirigami as Kirigami
  import org.kde.plasma.private.mobileshell as MobileShell
  
  Item {
@@ -82,7 +93,7 @@ Last-Update: 2026-11-25
      // check if the internet indicator icon is a mobile data related one
      readonly property bool isInternetIndicatorMobileData: internetIndicator && internetIndicator.icon && internetIndicator.icon.startsWith('network-mobile-')
  
-+    // with several SIMs, the signal of each SIM is shown with the icon of the SIM
++    // with several SIMs, the signal of each SIM is shown
 +    readonly property bool severalSims: MobileShell.SignalStrengthInfo.modems.length > 1
 +
      property bool showLabel: true
@@ -121,28 +132,16 @@ Last-Update: 2026-11-25
 +            visible: !root.severalSims && (!isInternetIndicatorMobileData || wirelessStatus.hotspotSSID.length !== 0) && MobileShell.SignalStrengthInfo.showIndicator
 +        }
 +
++        // with several SIMs: the signal of each SIM, mobile data shown with the network type on its SIM
 +        Repeater {
 +            model: root.severalSims ? MobileShell.SignalStrengthInfo.modems : []
 +
-+            delegate: Row {
++            delegate: Kirigami.Icon {
 +                required property var modelData
 +
++                width: height
 +                height: row.height
-+                spacing: 0
-+
-+                Kirigami.Icon {
-+                    anchors.verticalCenter: parent.verticalCenter
-+                    width: Math.round(row.height * 0.6)
-+                    height: width
-+                    source: modelData.simIcon
-+                    visible: modelData.simIcon !== ""
-+                }
-+
-+                Kirigami.Icon {
-+                    width: height
-+                    height: row.height
-+                    source: modelData.icon
-+                }
++                source: modelData.icon
 +            }
 +        }
 +

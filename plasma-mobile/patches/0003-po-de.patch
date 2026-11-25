@@ -1,0 +1,21 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] po/de: German translation of the strings for several SIMs
+Description:
+ German translation of the strings added by the patches for several SIMs:
+ the title of the mobile data quick setting with the name of its SIM.
+Forwarded: not-needed
+License: as the patched files (the translations are under the license of the translated program)
+Last-Update: 2026-11-25
+---
+--- a/po/de/plasma_org.kde.plasma.quicksetting.mobiledata.po
++++ b/po/de/plasma_org.kde.plasma.quicksetting.mobiledata.po
+@@ -46,3 +46,8 @@ msgstr "Aus"
+ #, kde-format
+ msgid "No SIM inserted"
+ msgstr "SIM-Karte fehlt"
++
++#, kde-format
++msgctxt "@label mobile data on a SIM"
++msgid "Mobile Data (%1)"
++msgstr "Mobile Daten (%1)"
