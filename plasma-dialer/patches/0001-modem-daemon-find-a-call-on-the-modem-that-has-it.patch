@@ -1,0 +1,138 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] modem-daemon: find a call on the modem that has it
+Description:
+ Accepting, hanging up and sending DTMF tones looked the call up only on
+ the modem the client named. With several modems the client does not know
+ the modem of an incoming call or passes none, and the request was dropped
+ ("deviceUni not found"). Call paths are unique among all modems: look the
+ call up on the named modem first, then on every modem.
+Forwarded: no
+License: LicenseRef-KDE-Accepted-GPL (as the patched files)
+Last-Update: 2026-11-25
+---
+--- a/modem-daemon/src/mm-modem-controller.cpp
++++ b/modem-daemon/src/mm-modem-controller.cpp
+@@ -100,17 +100,7 @@ void ModemManagerController::ussdCancel(const QString &deviceUni)
+ QString ModemManagerController::callNumber(const QString &deviceUni, const QString &callUni)
+ {
+     QString callNumber;
+-    const auto modem = ModemManager::findModemDevice(deviceUni);
+-    if (modem.isNull()) {
+-        qDebug() << Q_FUNC_INFO << "deviceUni not found:" << deviceUni;
+-        return callNumber;
+-    }
+-    const auto voiceInterface = this->voiceInterface(modem);
+-    if (voiceInterface.isNull()) {
+-        qDebug() << Q_FUNC_INFO << "voiceInterface not found";
+-        return callNumber;
+-    }
+-    const auto call = voiceInterface->findCall(callUni);
++    const auto call = findVoiceCall(deviceUni, callUni);
+     if (call.isNull()) {
+         qDebug() << Q_FUNC_INFO << "call not found" << callUni;
+         return callNumber;
+@@ -141,17 +131,7 @@ void ModemManagerController::createCall(const QString &deviceUni, const QString
+ 
+ void ModemManagerController::acceptCall(const QString &deviceUni, const QString &callUni)
+ {
+-    const auto modem = ModemManager::findModemDevice(deviceUni);
+-    if (modem.isNull()) {
+-        qDebug() << Q_FUNC_INFO << "deviceUni not found:" << deviceUni;
+-        return;
+-    }
+-    const auto voiceInterface = this->voiceInterface(modem);
+-    if (voiceInterface.isNull()) {
+-        qDebug() << Q_FUNC_INFO << "voiceInterface not found";
+-        return;
+-    }
+-    const auto call = voiceInterface->findCall(callUni);
++    const auto call = findVoiceCall(deviceUni, callUni);
+     if (call.isNull()) {
+         qDebug() << Q_FUNC_INFO << "call not found" << callUni;
+         return;
+@@ -161,17 +141,7 @@ void ModemManagerController::acceptCall(const QString &deviceUni, const QString
+ 
+ void ModemManagerController::hangUp(const QString &deviceUni, const QString &callUni)
+ {
+-    const auto modem = ModemManager::findModemDevice(deviceUni);
+-    if (modem.isNull()) {
+-        qDebug() << Q_FUNC_INFO << "deviceUni not found:" << deviceUni;
+-        return;
+-    }
+-    const auto voiceInterface = this->voiceInterface(modem);
+-    if (voiceInterface.isNull()) {
+-        qDebug() << Q_FUNC_INFO << "voiceInterface not found";
+-        return;
+-    }
+-    const auto call = voiceInterface->findCall(callUni);
++    const auto call = findVoiceCall(deviceUni, callUni);
+     if (call.isNull()) {
+         qDebug() << Q_FUNC_INFO << "call not found" << callUni;
+         return;
+@@ -181,20 +151,10 @@ void ModemManagerController::hangUp(const QString &deviceUni, const QString &cal
+ 
+ void ModemManagerController::sendDtmf(const QString &deviceUni, const QString &callUni, const QString &tones)
+ {
+-    const auto modem = ModemManager::findModemDevice(deviceUni);
+-    if (modem.isNull()) {
+-        qDebug() << Q_FUNC_INFO << "deviceUni not found:" << deviceUni;
+-        return;
+-    }
+-    const auto voiceInterface = this->voiceInterface(modem);
+-    if (voiceInterface.isNull()) {
+-        qDebug() << Q_FUNC_INFO << "voiceInterface not found";
+-        return;
+-    }
+     // never try to send + as a DTMF tone
+     QString safeTones = tones;
+     safeTones.replace(QStringLiteral("+"), QStringLiteral("0"));
+-    const auto call = voiceInterface->findCall(callUni);
++    const auto call = findVoiceCall(deviceUni, callUni);
+     if (call.isNull()) {
+         qDebug() << Q_FUNC_INFO << "call not found" << callUni;
+         return;
+@@ -425,6 +385,33 @@ void ModemManagerController::fetchModemCalls()
+     };
+ }
+ 
++QSharedPointer<ModemManager::Call> ModemManagerController::findVoiceCall(const QString &deviceUni, const QString &callUni)
++{
++    // call paths are unique among all modems: a call is found also when the
++    // client does not know the modem of the call (several modems)
++    const auto modem = ModemManager::findModemDevice(deviceUni);
++    if (!modem.isNull()) {
++        const auto voiceInterface = this->voiceInterface(modem);
++        if (!voiceInterface.isNull()) {
++            const auto call = voiceInterface->findCall(callUni);
++            if (!call.isNull()) {
++                return call;
++            }
++        }
++    }
++    for (const auto &device : ModemManager::modemDevices()) {
++        const auto voiceInterface = this->voiceInterface(device);
++        if (voiceInterface.isNull()) {
++            continue;
++        }
++        const auto call = voiceInterface->findCall(callUni);
++        if (!call.isNull()) {
++            return call;
++        }
++    }
++    return {};
++}
++
+ CallObject *ModemManagerController::getVoiceCallObject(const QString &deviceUni, const QString &callUni)
+ {
+     Q_UNUSED(deviceUni);
+--- a/modem-daemon/src/mm-modem-controller.h
++++ b/modem-daemon/src/mm-modem-controller.h
+@@ -67,5 +67,7 @@ private:
+ 
+     void fetchModemCalls();
+     CallObject *getVoiceCallObject(const QString &deviceUni, const QString &callUni);
++    // the call on the given modem, else on the modem that has it
++    QSharedPointer<ModemManager::Call> findVoiceCall(const QString &deviceUni, const QString &callUni);
+     void initAddedCall(const QSharedPointer<ModemManager::ModemDevice> &device, const QSharedPointer<ModemManager::Call> &call);
+ };
