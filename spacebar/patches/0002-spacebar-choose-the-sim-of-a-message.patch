@@ -1,0 +1,377 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Tue, 25 Nov 2026 12:00:00 +0100
+Subject: [PATCH] spacebar: choose the SIM of a message
+Description:
+ With several SIMs a message goes through the SIM the latest received
+ message of the conversation came in on, else through the default SIM (a
+ new setting, the first SIM without a choice). A button next to the send
+ button shows the icon of that SIM and lets the user send the next message
+ through another SIM; the choice is not remembered. With one SIM nothing
+ changes.
+ .
+ Needs the daemon of this version (sendMessage with the SIM, sims()).
+Forwarded: no
+License: as the patched files (GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL)
+Last-Update: 2026-11-25
+---
+--- a/lib/config/settingsmanager.kcfg
++++ b/lib/config/settingsmanager.kcfg
+@@ -94,4 +94,10 @@
+             <default>true</default>
+         </entry>
+     </group>
++    <group name="Messages">
++        <entry name="defaultSim" type="String">
++            <label>Identifier (ICCID) of the SIM used for new conversations by default</label>
++            <default></default>
++        </entry>
++    </group>
+ </kcfg>
+--- a/src/channelhandler.cpp
++++ b/src/channelhandler.cpp
+@@ -4,9 +4,14 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+ 
+ #include "channelhandler.h"
++#include "settingsmanager.h"
+ 
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
+ #include <QLocale>
+ 
++#include <database.h>
++
+ #include <global.h>
+ 
+ const QString DAEMON_DBUS_SERVICE = QStringLiteral("org.kde.spacebar.Daemon");
+@@ -72,6 +77,65 @@ void ChannelHandler::connectInterfaceSignals()
+         Q_UNUSED(id);
+         Q_EMIT messagesChanged(PhoneNumberList(phoneNumber));
+     });
++
++    connect(m_interface, &OrgKdeSpacebarDaemonInterface::simsChanged, this, &ChannelHandler::loadSims);
++    loadSims();
++}
++
++void ChannelHandler::loadSims()
++{
++    auto watcher = new QDBusPendingCallWatcher(m_interface->sims(), this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *watcher) {
++        watcher->deleteLater();
++        QDBusPendingReply<StringMapList> reply = *watcher;
++        if (reply.isError()) {
++            return;
++        }
++        QVariantList sims;
++        for (const StringMap &sim : reply.value()) {
++            QVariantMap entry;
++            for (auto it = sim.cbegin(); it != sim.cend(); ++it) {
++                entry.insert(it.key(), it.value());
++            }
++            sims.append(entry);
++        }
++        if (sims != m_sims) {
++            m_sims = sims;
++            Q_EMIT simsChanged();
++        }
++    });
++}
++
++QVariantList ChannelHandler::sims() const
++{
++    return m_sims;
++}
++
++QVariantMap ChannelHandler::sim(const QString &simIdentifier) const
++{
++    for (const QVariant &entry : m_sims) {
++        const QVariantMap sim = entry.toMap();
++        if (!simIdentifier.isEmpty() && sim.value(QStringLiteral("simIdentifier")).toString() == simIdentifier) {
++            return sim;
++        }
++    }
++    return {};
++}
++
++void ChannelHandler::setDefaultSim(const QString &simIdentifier)
++{
++    SettingsManager::self()->setDefaultSim(simIdentifier);
++    SettingsManager::self()->save();
++    Q_EMIT simsChanged();
++}
++
++QString ChannelHandler::defaultSim() const
++{
++    const QString chosen = SettingsManager::self()->defaultSim();
++    if (!sim(chosen).isEmpty()) {
++        return chosen;
++    }
++    return m_sims.isEmpty() ? QString() : m_sims.first().toMap().value(QStringLiteral("simIdentifier")).toString();
+ }
+ 
+ org::kde::spacebar::Daemon *ChannelHandler::interface()
+--- a/src/channelhandler.h
++++ b/src/channelhandler.h
+@@ -14,6 +14,10 @@ class ChannelHandler : public QObject
+ {
+     Q_OBJECT
+     Q_PROPERTY(bool isDaemonAvailable READ isInterfaceAvailable NOTIFY isInterfaceAvailableChanged)
++    // active SIM of every modem: simIdentifier, deviceUni, slot, name, icon
++    Q_PROPERTY(QVariantList sims READ sims NOTIFY simsChanged)
++    // SIM for messages without a reply SIM: the chosen default SIM if inserted, else the first SIM
++    Q_PROPERTY(QString defaultSim READ defaultSim NOTIFY simsChanged)
+ 
+ public:
+     explicit ChannelHandler(QObject *parent = nullptr);
+@@ -22,17 +26,26 @@ public:
+ 
+     bool isInterfaceAvailable();
+ 
++    QVariantList sims() const;
++    QString defaultSim() const;
++    // entry of sims for the SIM, empty if it is not inserted
++    Q_INVOKABLE QVariantMap sim(const QString &simIdentifier) const;
++    Q_INVOKABLE void setDefaultSim(const QString &simIdentifier);
++
+ private:
+     void connectInterface();
+     void connectInterfaceSignals();
++    void loadSims();
+ 
+     org::kde::spacebar::Daemon *m_interface{nullptr};
+     bool m_isInterfaceAvailable{false};
+     QDBusServiceWatcher *m_watcher{nullptr};
++    QVariantList m_sims;
+ 
+ Q_SIGNALS:
+     void isInterfaceAvailableChanged();
+     void handlerReady();
+     void channelOpen(const QString &phoneNumber);
+     void messagesChanged(const PhoneNumberList &phoneNumberList);
++    void simsChanged();
+ };
+--- a/src/contents/ui/MessagesPage.qml
++++ b/src/contents/ui/MessagesPage.qml
+@@ -26,6 +26,21 @@ Kirigami.ScrollablePage {
+     property var people: messageModel ? messageModel.people : []
+     property string sendingNumber: messageModel ? messageModel.sendingNumber : ""
+     property string attachmentsFolder: messageModel ? messageModel.attachmentsFolder : "";
++    // SIM chosen for the next message only, empty: replies go through the SIM of the latest received
++    // message if it is inserted, else through the default SIM
++    property string chosenSim: ""
++    readonly property string replySim: messageModel ? messageModel.replySim : ""
++    readonly property string sendSim: {
++        // re-evaluated when the SIMs change
++        const sims = ChannelHandler.sims;
++        if (chosenSim !== "" && ChannelHandler.sim(chosenSim).simIdentifier) {
++            return chosenSim;
++        }
++        if (replySim !== "" && ChannelHandler.sim(replySim).simIdentifier) {
++            return replySim;
++        }
++        return ChannelHandler.defaultSim;
++    }
+     property ListModel files: ListModel {}
+     property var tapbackKeys: ["♥️", "👍" , "👎", "😂", "‼️", "❓"]
+     property real lastHeight: applicationWindow().height
+@@ -880,7 +895,7 @@ Kirigami.ScrollablePage {
+                 text: i18nc("Retry sending message", "Resend")
+                 icon.name: "edit-redo"
+                 onClicked: {
+-                    messageModel.sendMessage(menu.text, menu.attachments.map(o => "file://" + attachmentsFolder + "/" + o.fileName), menu.attachments.reduce((a,c) => a += (c.size || 0), 0))
++                    messageModel.sendMessage(menu.text, menu.attachments.map(o => "file://" + attachmentsFolder + "/" + o.fileName), menu.attachments.reduce((a,c) => a += (c.size || 0), 0), msgPage.sendSim)
+                     listView.currentIndex = menu.index
+                     messageModel.deleteMessage(menu.id, menu.index, menu.attachments.map(o => o.fileName))
+                     menu.close()
+@@ -1128,7 +1143,8 @@ Kirigami.ScrollablePage {
+             Controls.Action {
+                 id: sendAction
+                 onTriggered: {
+-                    messageModel.sendMessage(textarea.text, filesToList(), filesTotalSize())
++                    messageModel.sendMessage(textarea.text, filesToList(), filesTotalSize(), msgPage.sendSim)
++                    msgPage.chosenSim = ""
+                     files.clear()
+                     textarea.text = ""
+                     listView.positionAtEnd()
+@@ -1140,6 +1156,45 @@ Kirigami.ScrollablePage {
+                 onActivated: sendAction.trigger()
+             }
+ 
++            // with several SIMs: the SIM the message goes through, tap to send this message through another one
++            Controls.ToolButton {
++                id: simButton
++
++                readonly property var sim: ChannelHandler.sims.find(entry => entry.simIdentifier === msgPage.sendSim) || ({})
++
++                visible: ChannelHandler.sims.length > 1
++                Layout.alignment: Qt.AlignRight | Qt.AlignBottom
++                Layout.margins: Kirigami.Units.smallSpacing
++                icon.name: sim.icon || "auth-sim-symbolic"
++                icon.width: Kirigami.Units.iconSizes.smallMedium
++                icon.height: Kirigami.Units.iconSizes.smallMedium
++                text: sim.name || ""
++                display: Controls.AbstractButton.IconOnly
++                hoverEnabled: false
++                Accessible.name: i18nc("@action:button %1 is the name of a SIM", "Send through %1", text)
++                onClicked: simMenu.popup(simButton)
++
++                Controls.Menu {
++                    id: simMenu
++
++                    title: i18nc("@title:menu", "Send Through")
++
++                    Repeater {
++                        model: ChannelHandler.sims
++
++                        Controls.MenuItem {
++                            required property var modelData
++
++                            text: modelData.name
++                            icon.name: modelData.icon
++                            checkable: true
++                            checked: modelData.simIdentifier === msgPage.sendSim
++                            onTriggered: msgPage.chosenSim = modelData.simIdentifier
++                        }
++                    }
++                }
++            }
++
+             Controls.Button {
+                 id: sendButton
+                 Layout.alignment: Qt.AlignRight | Qt.AlignBottom
+--- a/src/contents/ui/settings/SettingsPage.qml
++++ b/src/contents/ui/settings/SettingsPage.qml
+@@ -37,6 +37,23 @@ Kirigami.ScrollablePage {
+         FormCard.FormCard {
+             Layout.fillWidth: true
+ 
++            FormCard.FormComboBoxDelegate {
++                id: defaultSim
++
++                visible: ChannelHandler.sims.length > 1
++                displayMode: FormCard.FormComboBoxDelegate.Dialog
++                text: i18n("Default SIM")
++                description: i18n("Used for new conversations; replies go through the SIM the last message came in on.")
++                model: ChannelHandler.sims
++                textRole: "name"
++                currentIndex: ChannelHandler.sims.findIndex(sim => sim.simIdentifier === ChannelHandler.defaultSim)
++                onActivated: index => ChannelHandler.setDefaultSim(ChannelHandler.sims[index].simIdentifier)
++            }
++
++            FormCard.FormDelegateSeparator {
++                visible: defaultSim.visible
++            }
++
+             FormCard.FormButtonDelegate {
+                 id: aboutButton
+                 text: i18n("About")
+--- a/src/messagemodel.cpp
++++ b/src/messagemodel.cpp
+@@ -25,6 +25,10 @@ MessageModel::MessageModel(ChannelHandler &handler, const PhoneNumberList &phone
+ {
+     disableNotifications(m_phoneNumberList);
+ 
++    connect(this, &QAbstractItemModel::modelReset, this, &MessageModel::replySimChanged);
++    connect(this, &QAbstractItemModel::rowsInserted, this, &MessageModel::replySimChanged);
++    connect(this, &QAbstractItemModel::dataChanged, this, &MessageModel::replySimChanged);
++
+     for (const auto &number : phoneNumberList) {
+         Person person;
+         person.m_name = KPeople::PersonData(ContactPhoneNumberMapper::instance().uriForNumber(number)).name();
+@@ -125,7 +129,8 @@ QHash<int, QByteArray> MessageModel::roleNames() const
+             {Role::ExpiresRole, BL("expires")},
+             {Role::ExpiresDateTimeRole, BL("expiresDateTime")},
+             {Role::SizeRole, BL("size")},
+-            {Role::TapbacksRole, BL("tapbacks")}};
++            {Role::TapbacksRole, BL("tapbacks")},
++            {Role::SimRole, BL("sim")}};
+ }
+ 
+ QVariant MessageModel::data(const QModelIndex &index, int role) const
+@@ -175,6 +180,8 @@ QVariant MessageModel::data(const QModelIndex &index, int role) const
+         return message.size;
+     case Role::TapbacksRole:
+         return message.tapbacks;
++    case Role::SimRole:
++        return message.sim;
+     }
+ 
+     return {};
+@@ -253,7 +260,20 @@ void MessageModel::sendTapback(const QString &id, const QString &tapback, const
+     m_handler.interface()->sendTapback(m_phoneNumberList.toString(), id, tapback, isRemoved);
+ }
+ 
+-void MessageModel::sendMessage(const QString &text, const QStringList &files, const qint64 &totalSize)
++QString MessageModel::replySim() const
++{
++    QString sim;
++    QDateTime latest;
++    for (const Message &message : m_messages) {
++        if (!message.sentByMe && !message.sim.isEmpty() && (latest.isNull() || message.datetime > latest)) {
++            latest = message.datetime;
++            sim = message.sim;
++        }
++    }
++    return sim;
++}
++
++void MessageModel::sendMessage(const QString &text, const QStringList &files, const qint64 &totalSize, const QString &sim)
+ {
+     Message message;
+     message.id = Database::generateRandomId();
+@@ -261,12 +281,13 @@ void MessageModel::sendMessage(const QString &text, const QStringList &files, co
+     message.text = text;
+     message.sentByMe = true;
+     message.deliveryStatus = MessageState::Pending;
++    message.sim = sim;
+ 
+     beginInsertRows({}, m_messages.size(), m_messages.size());
+     m_messages.insert(m_messages.begin(), message);
+     endInsertRows();
+ 
+-    m_handler.interface()->sendMessage(m_phoneNumberList.toString(), message.id, text, files, totalSize);
++    m_handler.interface()->sendMessage(m_phoneNumberList.toString(), message.id, text, files, totalSize, sim);
+ 
+     // update chat list
+     Q_EMIT m_handler.messagesChanged(m_phoneNumberList);
+--- a/src/messagemodel.h
++++ b/src/messagemodel.h
+@@ -34,6 +34,8 @@ class MessageModel : public QAbstractListModel
+     Q_PROPERTY(QString sendingNumber READ sendingNumber CONSTANT)
+     Q_PROPERTY(QVector<Person> people READ people NOTIFY peopleChanged)
+     Q_PROPERTY(QString attachmentsFolder READ attachmentsFolder CONSTANT)
++    // SIM (ICCID) of the latest received message, empty if none: replies go through it
++    Q_PROPERTY(QString replySim READ replySim NOTIFY replySimChanged)
+ 
+ public:
+     enum Role {
+@@ -55,7 +57,8 @@ public:
+         ExpiresRole,
+         ExpiresDateTimeRole,
+         SizeRole,
+-        TapbacksRole
++        TapbacksRole,
++        SimRole
+     };
+     Q_ENUM(Role)
+ 
+@@ -100,7 +103,10 @@ public:
+      * and adds it to the model and database by calling addMessage(const QString&)
+      * @param text
+      */
+-    Q_INVOKABLE void sendMessage(const QString &text, const QStringList &files, const qint64 &totalSize);
++    // sim: ICCID of the SIM to send through, the default modem if empty
++    Q_INVOKABLE void sendMessage(const QString &text, const QStringList &files, const qint64 &totalSize, const QString &sim = QString());
++
++    QString replySim() const;
+ 
+     /**
+      * @brief marks a message as read by calling the respective database function
+@@ -147,6 +153,7 @@ private Q_SLOTS:
+     void messageUpdated(const QString &numbers, const QString &id);
+ 
+ Q_SIGNALS:
++    void replySimChanged();
+     void phoneNumberListChanged();
+     void peopleChanged();
+     void messagesFetched();
