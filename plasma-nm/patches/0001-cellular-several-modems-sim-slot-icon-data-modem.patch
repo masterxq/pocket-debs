@@ -1,20 +1,20 @@
 From: pocket-debs <masterxq@users.noreply.github.com>
 Date: Tue, 25 Nov 2026 12:00:00 +0100
-Subject: [PATCH] cellular: several modems: SIM slot, SIM icon, modem for mobile data
+Subject: [PATCH] cellular: several modems: SIM slot, SIM icon, modems for mobile data and for calls
 Description:
  The cellular library took the first modem for everything and named a SIM
  after the last part of its ModemManager object path, which changes with
  every start of ModemManager. With several modems (one per SIM, as on dual
- SIM phones whose modem has a modem object per SIM) mobile data, the
- quick setting and the status bar always followed the first modem.
+ SIM phones whose modem has a modem object per SIM) mobile data, the quick
+ setting and the status bar always followed the first modem.
  .
  CellularSim: slot (PrimarySimSlot of the modem when it reports SIM slots;
  read over D-Bus, ModemManagerQt has no API for it), name ("SIM <slot>",
  else the operator name of the SIM) and icon. The icon of a SIM is kept per
  ICCID in the shared file simidentitiesrc (class SimIdentities): a SIM seen
  for the first time gets the first icon of a fixed set that no known SIM
- has, and the choice is stored at once, so every application shows the
- same icon.
+ has, and the choice is stored at once, so every application shows the same
+ icon. The same file holds the SIM chosen for calls and text messages.
  .
  CellularModemList: dataModem, the modem whose NetworkManager device is
  connected or connecting, else the one with an autoconnect connection (one
@@ -24,6 +24,12 @@ Description:
  connection of this modem even if none was used before and binds it to the
  SIM (gsm.sim-id). New connections are always bound to their SIM. There is
  no automatic fallback to another modem.
+ .
+ CellularModemList: defaultModem, the modem with the SIM chosen for calls
+ and text messages (shared with the dialer and messaging applications),
+ else the SIM in the first slot; setDefaultModem() chooses it.
+ CellularModem: networkType, the radio access technology as named in the
+ network-mobile-<strength>-<type> icons.
 Forwarded: no
 License: as the patched files (libs/cellular: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL)
 Last-Update: 2026-11-25
@@ -80,7 +86,15 @@ Last-Update: 2026-11-25
  
  using namespace Qt::Literals::StringLiterals;
  
-@@ -68,6 +74,9 @@ CellularModem::CellularModem(QObject *parent, ModemManager::ModemDevice::Ptr mmM
+@@ -58,6 +64,7 @@ CellularModem::CellularModem(QObject *parent, ModemManager::ModemDevice::Ptr mmM
+ 
+     // Signal strength from modem interface
+     connect(m_mmInterface.data(), &ModemManager::Modem::signalQualityChanged, this, &CellularModem::signalStrengthChanged);
++    connect(m_mmInterface.data(), &ModemManager::Modem::accessTechnologiesChanged, this, &CellularModem::networkTypeChanged);
+ 
+     // SIM lock status
+     connect(m_mmInterface.data(), &ModemManager::Modem::unlockRequiredChanged, this, &CellularModem::simLockedChanged);
+@@ -68,6 +75,9 @@ CellularModem::CellularModem(QObject *parent, ModemManager::ModemDevice::Ptr mmM
      // find networkmanager modem, if it exists
      findNetworkManagerDevice();
  
@@ -90,7 +104,7 @@ Last-Update: 2026-11-25
      // we need to initialize it after m_mm3gppDevice has been set
      m_details = new CellularModemDetails(this, this);
  
-@@ -108,6 +117,44 @@ void CellularModem::findNetworkManagerDevice()
+@@ -108,6 +118,44 @@ void CellularModem::findNetworkManagerDevice()
      Q_EMIT mobileDataSupportedChanged();
  }
  
@@ -135,7 +149,7 @@ Last-Update: 2026-11-25
  CellularModemDetails *CellularModem::modemDetails() const
  {
      return m_details;
-@@ -222,28 +269,87 @@ void CellularModem::setMobileDataEnabled(bool enabled)
+@@ -222,28 +270,87 @@ void CellularModem::setMobileDataEnabled(bool enabled)
              }
          }
  
@@ -232,7 +246,41 @@ Last-Update: 2026-11-25
  bool CellularModem::hasSim() const
  {
      if (!m_mmModem) {
-@@ -317,6 +423,7 @@ void CellularModem::refreshSims()
+@@ -267,6 +374,33 @@ int CellularModem::signalStrength() const
+     return m_mmInterface ? m_mmInterface->signalQuality().signal : 0;
+ }
+ 
++QString CellularModem::networkType() const
++{
++    if (!m_mmInterface) {
++        return {};
++    }
++    // the newest technology in use, e.g. LTE and 5G NR together with 5G NSA
++    const auto technologies = m_mmInterface->accessTechnologies();
++    if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_5GNR) {
++        return u"5g"_s;
++    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_LTE) {
++        return u"lte"_s;
++    } else if (technologies & (MM_MODEM_ACCESS_TECHNOLOGY_HSPA | MM_MODEM_ACCESS_TECHNOLOGY_HSPA_PLUS)) {
++        return u"hspa"_s;
++    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_HSUPA) {
++        return u"hsupa"_s;
++    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_HSDPA) {
++        return u"hsdpa"_s;
++    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_UMTS) {
++        return u"umts"_s;
++    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_EDGE) {
++        return u"edge"_s;
++    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_GPRS) {
++        return u"gprs"_s;
++    }
++    return {};
++}
++
+ QString CellularModem::operatorName() const
+ {
+     return m_mm3gppDevice ? m_mm3gppDevice->operatorName() : QString{};
+@@ -317,6 +451,7 @@ void CellularModem::refreshSims()
  
      // Connect error signals from all SIMs
      for (auto sim : m_sims) {
@@ -240,7 +288,7 @@ Last-Update: 2026-11-25
          connect(sim, &CellularSim::errorOccurred, this, &CellularModem::addError);
      }
  
-@@ -389,6 +496,9 @@ QCoro::Task<void> CellularModem::addProfile(QString name, QString apn, QString u
+@@ -389,6 +524,9 @@ QCoro::Task<void> CellularModem::addProfile(QString name, QString apn, QString u
      gsmSetting->setPasswordFlags(password.isEmpty() ? NetworkManager::Setting::NotRequired : NetworkManager::Setting::AgentOwned);
      gsmSetting->setNetworkType(CellularConnectionProfile::networkTypeFlag(networkType));
      gsmSetting->setHomeOnly(true); // New profiles default to roaming disabled
@@ -250,7 +298,7 @@ Last-Update: 2026-11-25
  
      gsmSetting->setInitialized(true);
  
-@@ -516,6 +626,21 @@ QList<CellularSim *> CellularModem::sims()
+@@ -516,6 +654,21 @@ QList<CellularSim *> CellularModem::sims()
      return m_sims;
  }
  
@@ -283,7 +331,24 @@ Last-Update: 2026-11-25
  
      Q_PROPERTY(bool hasSim READ hasSim NOTIFY hasSimChanged)
      Q_PROPERTY(bool simLocked READ simLocked NOTIFY simLockedChanged)
-@@ -93,6 +95,12 @@ public:
+@@ -54,6 +56,8 @@ class PLASMANM_CELLULAR_EXPORT CellularModem : public QObject
+     Q_PROPERTY(bool needsAPNAdded READ needsAPNAdded NOTIFY mobileDataEnabledChanged)
+ 
+     Q_PROPERTY(int signalStrength READ signalStrength NOTIFY signalStrengthChanged)
++    // radio access technology as named in the network-mobile-<strength>-<type> icons ("lte", "5g", ...), empty if none
++    Q_PROPERTY(QString networkType READ networkType NOTIFY networkTypeChanged)
+     Q_PROPERTY(QString operatorName READ operatorName NOTIFY operatorNameChanged)
+ 
+     Q_PROPERTY(QStringList errors READ errors NOTIFY errorsChanged)
+@@ -80,6 +84,7 @@ public:
+     bool simEmpty() const;
+ 
+     int signalStrength() const;
++    QString networkType() const;
+     QString operatorName() const;
+ 
+     QStringList errors() const;
+@@ -93,6 +98,12 @@ public:
      Q_INVOKABLE void addDetectedProfileSettings(); // detect modem connection settings (ex. apn) and add a new connection
  
      QList<CellularSim *> sims();
@@ -296,7 +361,7 @@ Last-Update: 2026-11-25
  
      ModemManager::ModemDevice::Ptr mmModemDevice();
      NetworkManager::ModemDevice::Ptr nmModemDevice();
-@@ -109,6 +117,7 @@ Q_SIGNALS:
+@@ -109,10 +120,12 @@ Q_SIGNALS:
      void mobileDataEnabledChanged();
      void mobileDataSupportedChanged();
      void simsChanged();
@@ -304,7 +369,12 @@ Last-Update: 2026-11-25
      void hasSimChanged();
      void simLockedChanged();
      void simEmptyChanged();
-@@ -120,6 +129,9 @@ Q_SIGNALS:
+     void signalStrengthChanged();
++    void networkTypeChanged();
+     void operatorNameChanged();
+     void errorsChanged();
+     void errorOccurred(const QString &message);
+@@ -120,6 +133,9 @@ Q_SIGNALS:
  
  private:
      void findNetworkManagerDevice();
@@ -314,7 +384,7 @@ Last-Update: 2026-11-25
      void refreshSims();
      void refreshProfiles();
      void addError(const QString &message);
-@@ -133,5 +145,6 @@ private:
+@@ -133,5 +149,6 @@ private:
      ModemManager::Modem3gpp::Ptr m_mm3gppDevice = nullptr; // may be nullptr if no sim is inserted
  
      QList<CellularSim *> m_sims;
@@ -323,17 +393,31 @@ Last-Update: 2026-11-25
  };
 --- a/libs/cellular/cellularmodemlist.cpp
 +++ b/libs/cellular/cellularmodemlist.cpp
-@@ -10,6 +10,9 @@
+@@ -7,9 +7,15 @@
+ #include "cellularmodemlist.h"
+ #include "cellularmodem.h"
+ #include "cellularsim.h"
++#include "simidentities.h"
  
  #include "plasma_nm_cellular.h"
  
 +#include <NetworkManagerQt/GsmSetting>
 +#include <NetworkManagerQt/ModemDevice>
 +
++#include <limits>
++
  CellularModemList::CellularModemList(QObject *parent)
      : QObject{parent}
  {
-@@ -32,6 +35,112 @@ CellularModem *CellularModemList::primaryModem() const
+@@ -17,6 +23,7 @@ CellularModemList::CellularModemList(QObject *parent)
+ 
+     connect(ModemManager::notifier(), &ModemManager::Notifier::modemAdded, this, &CellularModemList::updateModemList);
+     connect(ModemManager::notifier(), &ModemManager::Notifier::modemRemoved, this, &CellularModemList::updateModemList);
++    connect(SimIdentities::instance(), &SimIdentities::changed, this, &CellularModemList::updateDefaultModem);
+ }
+ 
+ QList<CellularModem *> CellularModemList::modems() const
+@@ -32,6 +39,157 @@ CellularModem *CellularModemList::primaryModem() const
      return nullptr;
  }
  
@@ -443,57 +527,112 @@ Last-Update: 2026-11-25
 +    }
 +}
 +
++CellularModem *CellularModemList::defaultModem() const
++{
++    return m_defaultModem;
++}
++
++void CellularModemList::setDefaultModem(CellularModem *modem)
++{
++    if (!modem || !m_modemList.contains(modem) || modem->simIdentifier().isEmpty()) {
++        return;
++    }
++    SimIdentities::instance()->setDefaultSim(modem->simIdentifier());
++    updateDefaultModem();
++}
++
++void CellularModemList::updateDefaultModem()
++{
++    CellularModem *defaultModem = nullptr;
++
++    const QString chosen = SimIdentities::instance()->defaultSim();
++    if (!chosen.isEmpty()) {
++        for (auto modem : std::as_const(m_modemList)) {
++            if (modem->simIdentifier() == chosen) {
++                defaultModem = modem;
++                break;
++            }
++        }
++    }
++    // the SIM in the first slot, SIMs without a known slot last
++    if (!defaultModem) {
++        const auto slotOrder = [](CellularModem *modem) {
++            return modem->simSlot() > 0 ? modem->simSlot() : std::numeric_limits<int>::max();
++        };
++        for (auto modem : std::as_const(m_modemList)) {
++            if (modem->sim() && (!defaultModem || slotOrder(modem) < slotOrder(defaultModem))) {
++                defaultModem = modem;
++            }
++        }
++    }
++
++    if (m_defaultModem != defaultModem) {
++        m_defaultModem = defaultModem;
++        Q_EMIT defaultModemChanged();
++    }
++}
++
  bool CellularModemList::modemAvailable() const
  {
      return !m_modemList.empty();
-@@ -49,6 +158,7 @@ QList<CellularSim *> CellularModemList::sims() const
+@@ -49,6 +207,8 @@ QList<CellularSim *> CellularModemList::sims() const
  void CellularModemList::updateModemList()
  {
      // Clean up old modems
 +    m_dataModem = nullptr;
++    m_defaultModem = nullptr;
      qDeleteAll(m_modemList);
      m_modemList.clear();
  
-@@ -59,6 +169,9 @@ void CellularModemList::updateModemList()
+@@ -59,6 +219,11 @@ void CellularModemList::updateModemList()
  
          auto cellModem = new CellularModem(this, device, modem);
          connect(cellModem, &CellularModem::simsChanged, this, &CellularModemList::simsChanged);
 +        connect(cellModem, &CellularModem::mobileDataEnabledChanged, this, &CellularModemList::updateDataModem);
 +        connect(cellModem, &CellularModem::activeConnectionUniChanged, this, &CellularModemList::updateDataModem);
 +        connect(cellModem, &CellularModem::profilesChanged, this, &CellularModemList::updateDataModem);
++        connect(cellModem, &CellularModem::simsChanged, this, &CellularModemList::updateDefaultModem);
++        connect(cellModem, &CellularModem::simSlotChanged, this, &CellularModemList::updateDefaultModem);
          m_modemList.push_back(cellModem);
      }
  
-@@ -66,8 +179,11 @@ void CellularModemList::updateModemList()
+@@ -66,8 +231,13 @@ void CellularModemList::updateModemList()
          qCDebug(PLASMA_NM_CELLULAR_LOG) << "No modems found.";
      }
  
 +    updateDataModem();
++    updateDefaultModem();
 +
      Q_EMIT modemsChanged();
      Q_EMIT primaryModemChanged();
 +    Q_EMIT dataModemChanged();
++    Q_EMIT defaultModemChanged();
      Q_EMIT modemAvailableChanged();
      Q_EMIT simsChanged();
  }
 --- a/libs/cellular/cellularmodemlist.h
 +++ b/libs/cellular/cellularmodemlist.h
-@@ -24,6 +24,8 @@ class PLASMANM_CELLULAR_EXPORT CellularModemList : public QObject
+@@ -24,6 +24,10 @@ class PLASMANM_CELLULAR_EXPORT CellularModemList : public QObject
      QML_ELEMENT
      Q_PROPERTY(QList<CellularModem *> modems READ modems NOTIFY modemsChanged)
      Q_PROPERTY(CellularModem *primaryModem READ primaryModem NOTIFY primaryModemChanged)
 +    // the modem used for mobile data: the one connected or set to connect by itself, else the one used last
 +    Q_PROPERTY(CellularModem *dataModem READ dataModem NOTIFY dataModemChanged)
++    // the modem with the SIM for calls and text messages: the chosen SIM if inserted, else the SIM in the first slot
++    Q_PROPERTY(CellularModem *defaultModem READ defaultModem NOTIFY defaultModemChanged)
      Q_PROPERTY(bool modemAvailable READ modemAvailable NOTIFY modemAvailableChanged)
      Q_PROPERTY(QList<CellularSim *> sims READ sims NOTIFY simsChanged)
  
-@@ -32,17 +34,23 @@ public:
+@@ -32,17 +36,29 @@ public:
  
      QList<CellularModem *> modems() const;
      CellularModem *primaryModem() const;
 +    CellularModem *dataModem() const;
 +    // makes the modem the one for mobile data and enables mobile data on it
 +    Q_INVOKABLE void setDataModem(CellularModem *modem);
++    CellularModem *defaultModem() const;
++    // makes the SIM of the modem the one for calls and text messages
++    Q_INVOKABLE void setDefaultModem(CellularModem *modem);
      bool modemAvailable() const;
      QList<CellularSim *> sims() const;
  
@@ -501,15 +640,18 @@ Last-Update: 2026-11-25
      void modemsChanged();
      void primaryModemChanged();
 +    void dataModemChanged();
++    void defaultModemChanged();
      void modemAvailableChanged();
      void simsChanged();
  
  private:
      void updateModemList();
 +    void updateDataModem();
++    void updateDefaultModem();
  
      QList<CellularModem *> m_modemList;
 +    CellularModem *m_dataModem = nullptr;
++    CellularModem *m_defaultModem = nullptr;
  };
 --- a/libs/cellular/cellularsim.cpp
 +++ b/libs/cellular/cellularsim.cpp
@@ -625,7 +767,7 @@ Last-Update: 2026-11-25
  };
 --- /dev/null
 +++ b/libs/cellular/simidentities.cpp
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,130 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
 +
@@ -643,6 +785,8 @@ Last-Update: 2026-11-25
 +static const auto s_configName = u"simidentitiesrc"_s;
 +static const auto s_simsGroup = u"Sim"_s;
 +static const auto s_iconKey = u"Icon"_s;
++static const auto s_defaultsGroup = u"Defaults"_s;
++static const auto s_defaultSimKey = u"Sim"_s;
 +
 +SimIdentities *SimIdentities::instance()
 +{
@@ -711,8 +855,10 @@ Last-Update: 2026-11-25
 +        return icon;
 +    }
 +
++    // stored at once, so that the SIM keeps the icon; changed() is not emitted here, since
++    // this is called from property getters: the icons of other SIMs stay as they are
 +    icon = defaultIcon();
-+    setIcon(simIdentifier, icon);
++    writeEntry(simGroup(simIdentifier), s_iconKey, icon);
 +    return icon;
 +}
 +
@@ -722,17 +868,39 @@ Last-Update: 2026-11-25
 +        return;
 +    }
 +
-+    KConfigGroup group = simGroup(simIdentifier);
-+    if (group.readEntry(s_iconKey, QString()) == icon) {
++    if (writeEntry(simGroup(simIdentifier), s_iconKey, icon)) {
++        Q_EMIT changed();
++    }
++}
++
++QString SimIdentities::defaultSim() const
++{
++    return KConfigGroup(m_config, s_defaultsGroup).readEntry(s_defaultSimKey, QString());
++}
++
++void SimIdentities::setDefaultSim(const QString &simIdentifier)
++{
++    if (simIdentifier.isEmpty()) {
 +        return;
 +    }
-+    group.writeEntry(s_iconKey, icon, KConfig::Notify);
++
++    if (writeEntry(KConfigGroup(m_config, s_defaultsGroup), s_defaultSimKey, simIdentifier)) {
++        Q_EMIT changed();
++    }
++}
++
++bool SimIdentities::writeEntry(KConfigGroup group, const QString &key, const QString &value)
++{
++    if (group.readEntry(key, QString()) == value) {
++        return false;
++    }
++    group.writeEntry(key, value, KConfig::Notify);
 +    m_config->sync();
-+    Q_EMIT changed();
++    return true;
 +}
 --- /dev/null
 +++ b/libs/cellular/simidentities.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,69 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
 +
@@ -757,9 +925,13 @@ Last-Update: 2026-11-25
 + * (when all are in use, the least used one, earlier ones first), and the
 + * choice is stored at once, so every application shows the same icon.
 + *
++ * The SIM used for calls and text messages by default is stored by its
++ * ICCID as well.
++ *
 + * Storage: simidentitiesrc in the configuration directory, one group per SIM
-+ * below the group "Sim", named after the ICCID, with the entry Icon. Writes
-+ * are notified, so that other processes follow at once.
++ * below the group "Sim", named after the ICCID, with the entry Icon; the
++ * default SIM for calls and text messages in the entry Sim of the group
++ * "Defaults". Writes are notified, so that other processes follow at once.
 + */
 +class SimIdentities : public QObject
 +{
@@ -777,7 +949,14 @@ Last-Update: 2026-11-25
 +    /** Stores the icon chosen for the SIM. */
 +    void setIcon(const QString &simIdentifier, const QString &icon);
 +
++    /** Identifier of the SIM chosen for calls and text messages, empty if none was chosen. */
++    QString defaultSim() const;
++
++    /** Stores the SIM chosen for calls and text messages. */
++    void setDefaultSim(const QString &simIdentifier);
++
 +Q_SIGNALS:
++    /** An icon or the default SIM changed, in this or another process. */
 +    void changed();
 +
 +private:
@@ -785,6 +964,8 @@ Last-Update: 2026-11-25
 +
 +    KConfigGroup simGroup(const QString &simIdentifier) const;
 +    QString defaultIcon() const;
++    // writes the entry if it differs, returns whether it was written
++    bool writeEntry(KConfigGroup group, const QString &key, const QString &value);
 +
 +    KSharedConfig::Ptr m_config;
 +    KConfigWatcher::Ptr m_watcher;
