@@ -1,0 +1,22 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 01:00:00 +0100
+Subject: [PATCH] kcms/users: FingerprintDialog: no flatFooterButtons
+Description:
+ The port from Kirigami.Dialog to QQC2.Dialog kept the binding of the
+ footer buttons to flatFooterButtons, a property of Kirigami.Dialog only.
+ Every footer button logged "Unable to assign [undefined] to bool"; the
+ buttons are not flat either way.
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-27
+---
+--- a/kcms/users/src/ui/FingerprintDialog.qml
++++ b/kcms/users/src/ui/FingerprintDialog.qml
+@@ -69,7 +69,6 @@
+             delegate: QQC2.Button {
+                 required property Kirigami.Action modelData
+ 
+-                flat: root.flatFooterButtons
+                 action: modelData
+             }
+         }

@@ -1,0 +1,88 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 01:00:00 +0100
+Subject: [PATCH] kcms/users: no D-Bus timeout while fprintd waits for authorization
+Description:
+ fprintd authorizes EnrollStart and DeleteEnrolledFinger (and Claim for
+ another user) through polkit with user interaction allowed, so its reply
+ only comes after the user has answered the authentication dialog. The KCM
+ made these calls with the default D-Bus timeout of 25 s: when entering the
+ password took longer, EnrollStart failed with "Did not receive a reply",
+ the KCM released the device and showed the error, while the authentication
+ dialog stayed open; authenticating afterwards started nothing, since the
+ device was no longer claimed. On a phone, opening the on-screen keyboard
+ and typing the password easily takes longer than 25 s.
+ .
+ These three calls are now made without a timeout
+ (DBUS_TIMEOUT_INFINITE, as plasma-shutdown does for calls that wait for
+ user prompts). The other calls keep the default timeout.
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-27
+---
+--- a/kcms/users/src/fprintdevice.cpp
++++ b/kcms/users/src/fprintdevice.cpp
+@@ -6,8 +6,28 @@
+ 
+ #include "fprintdevice.h"
+ 
++#include <cstdint>
++
+ using namespace Qt::StringLiterals;
+ 
++namespace
++{
++// fprintd checks polkit with user interaction allowed for Claim (of another user), DeleteEnrolledFinger and
++// EnrollStart: the reply only comes once the user has answered the authentication dialog, which can take longer
++// than the default D-Bus timeout of 25 s. Value corresponds to DBUS_TIMEOUT_INFINITE.
++constexpr int interactiveAuthorizationTimeout = INT32_MAX;
++
++template<typename Call>
++QDBusError callWithInteractiveAuthorization(QDBusAbstractInterface *interface, Call call)
++{
++    interface->setTimeout(interactiveAuthorizationTimeout);
++    auto reply = call();
++    interface->setTimeout(-1);
++    reply.waitForFinished();
++    return reply.error();
++}
++}
++
+ FprintDevice::FprintDevice(QDBusObjectPath path, QObject *parent)
+     : QObject(parent)
+     , m_devicePath(path.path())
+@@ -24,9 +44,9 @@
+ 
+ QDBusError FprintDevice::claim(const QString &username)
+ {
+-    auto reply = m_fprintInterface->Claim(username);
+-    reply.waitForFinished();
+-    return reply.error();
++    return callWithInteractiveAuthorization(m_fprintInterface, [&] {
++        return m_fprintInterface->Claim(username);
++    });
+ }
+ 
+ QDBusError FprintDevice::release()
+@@ -38,16 +58,16 @@
+ 
+ QDBusError FprintDevice::deleteEnrolledFinger(const QString &finger)
+ {
+-    auto reply = m_fprintInterface->DeleteEnrolledFinger(finger);
+-    reply.waitForFinished();
+-    return reply.error();
++    return callWithInteractiveAuthorization(m_fprintInterface, [&] {
++        return m_fprintInterface->DeleteEnrolledFinger(finger);
++    });
+ }
+ 
+ QDBusError FprintDevice::startEnrolling(const QString &finger)
+ {
+-    auto reply = m_fprintInterface->EnrollStart(finger);
+-    reply.waitForFinished();
+-    return reply.error();
++    return callWithInteractiveAuthorization(m_fprintInterface, [&] {
++        return m_fprintInterface->EnrollStart(finger);
++    });
+ }
+ 
+ QDBusError FprintDevice::stopEnrolling()
