@@ -102,8 +102,8 @@ Last-Update: 2026-11-26
 +    Q_PROPERTY(MobileDataState mobileDataState READ mobileDataState NOTIFY mobileDataStateChanged)
  
      Q_PROPERTY(int signalStrength READ signalStrength NOTIFY signalStrengthChanged)
-     // short name of the radio access technology in use as shown in status bars ("5G", "LTE", "H+", "H", "3G", "E",
-@@ -66,6 +68,16 @@ class PLASMANM_CELLULAR_EXPORT CellularModem : public QObject
+     // radio access technology as named in the network-mobile-<strength>-<type> icons ("lte", "5g", ...), empty if none
+@@ -65,6 +67,16 @@ class PLASMANM_CELLULAR_EXPORT CellularModem : public QObject
      Q_PROPERTY(QStringList errors READ errors NOTIFY errorsChanged)
  
  public:
@@ -120,7 +120,7 @@ Last-Update: 2026-11-26
      CellularModem(QObject *parent = nullptr);
      CellularModem(QObject *parent, ModemManager::ModemDevice::Ptr mmModem, ModemManager::Modem::Ptr mmInterface);
  
-@@ -81,6 +93,7 @@ public:
+@@ -80,6 +92,7 @@ public:
      void setMobileDataEnabled(bool enabled);
      bool mobileDataSupported() const;
      bool needsAPNAdded() const;
@@ -128,7 +128,7 @@ Last-Update: 2026-11-26
  
      bool hasSim() const;
      bool simLocked() const;
-@@ -123,6 +136,7 @@ Q_SIGNALS:
+@@ -122,6 +135,7 @@ Q_SIGNALS:
      void nmModemChanged();
      void mobileDataEnabledChanged();
      void mobileDataSupportedChanged();
@@ -136,7 +136,7 @@ Last-Update: 2026-11-26
      void simsChanged();
      void simSlotChanged();
      void hasSimChanged();
-@@ -137,6 +151,7 @@ Q_SIGNALS:
+@@ -136,6 +150,7 @@ Q_SIGNALS:
  
  private:
      void findNetworkManagerDevice();
@@ -144,7 +144,7 @@ Last-Update: 2026-11-26
      void loadSimSlot();
      // name of the provider of a network (MCC and MNC) from the mobile broadband provider database
      static QString networkProviderName(const QString &mccmnc);
-@@ -156,5 +171,7 @@ private:
+@@ -155,5 +170,7 @@ private:
  
      QList<CellularSim *> m_sims;
      int m_simSlot = 0;

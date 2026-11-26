@@ -30,8 +30,8 @@ Description:
  CellularModemList: defaultModem, the modem with the SIM chosen for calls
  and text messages (shared with the dialer and messaging applications),
  else the SIM in the first slot; setDefaultModem() chooses it.
- CellularModem: networkType, the short name of the radio access technology
- in use as status bars show it (5G, LTE, H+, H, 3G, E, G).
+ CellularModem: networkType, the radio access technology as named in the
+ network-mobile-<strength>-<type> icons.
  .
  While mobile data moves to another SIM, dataModem is the modem chosen
  with setDataModem() until it is connected (at most two minutes,
@@ -314,7 +314,7 @@ Last-Update: 2026-11-25
  bool CellularModem::hasSim() const
  {
      if (!m_mmModem) {
-@@ -267,9 +397,75 @@ int CellularModem::signalStrength() const
+@@ -267,9 +397,69 @@ int CellularModem::signalStrength() const
      return m_mmInterface ? m_mmInterface->signalQuality().signal : 0;
  }
  
@@ -325,28 +325,22 @@ Last-Update: 2026-11-25
 +    }
 +    // the newest technology in use, e.g. LTE and 5G NR together with 5G NSA
 +    const auto technologies = m_mmInterface->accessTechnologies();
-+    uint lte = MM_MODEM_ACCESS_TECHNOLOGY_LTE;
-+#if MM_CHECK_VERSION(1, 20, 0)
-+    lte |= MM_MODEM_ACCESS_TECHNOLOGY_LTE_CAT_M | MM_MODEM_ACCESS_TECHNOLOGY_LTE_NB_IOT;
-+#endif
 +    if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_5GNR) {
-+        return u"5G"_s;
-+    } else if (technologies & lte) {
-+        return u"LTE"_s;
-+    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_HSPA_PLUS) {
-+        return u"H+"_s;
-+    } else if (technologies & (MM_MODEM_ACCESS_TECHNOLOGY_HSPA | MM_MODEM_ACCESS_TECHNOLOGY_HSUPA | MM_MODEM_ACCESS_TECHNOLOGY_HSDPA)) {
-+        return u"H"_s;
-+    } else if (technologies & (MM_MODEM_ACCESS_TECHNOLOGY_UMTS | MM_MODEM_ACCESS_TECHNOLOGY_EVDO0 | MM_MODEM_ACCESS_TECHNOLOGY_EVDOA | MM_MODEM_ACCESS_TECHNOLOGY_EVDOB)) {
-+        return u"3G"_s;
++        return u"5g"_s;
++    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_LTE) {
++        return u"lte"_s;
++    } else if (technologies & (MM_MODEM_ACCESS_TECHNOLOGY_HSPA | MM_MODEM_ACCESS_TECHNOLOGY_HSPA_PLUS)) {
++        return u"hspa"_s;
++    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_HSUPA) {
++        return u"hsupa"_s;
++    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_HSDPA) {
++        return u"hsdpa"_s;
++    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_UMTS) {
++        return u"umts"_s;
 +    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_EDGE) {
-+        return u"E"_s;
++        return u"edge"_s;
 +    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_GPRS) {
-+        return u"G"_s;
-+    } else if (technologies & MM_MODEM_ACCESS_TECHNOLOGY_1XRTT) {
-+        return u"1X"_s;
-+    } else if (technologies & (MM_MODEM_ACCESS_TECHNOLOGY_GSM | MM_MODEM_ACCESS_TECHNOLOGY_GSM_COMPACT)) {
-+        return u"2G"_s;
++        return u"gprs"_s;
 +    }
 +    return {};
 +}
@@ -391,7 +385,7 @@ Last-Update: 2026-11-25
  }
  
  QStringList CellularModem::errors() const
-@@ -313,10 +509,13 @@ void CellularModem::refreshSims()
+@@ -313,10 +503,13 @@ void CellularModem::refreshSims()
  
      if (m_mmModem->sim()) {
          m_sims.append(new CellularSim{this, this, m_mmModem->sim(), m_mmInterface, m_mm3gppDevice});
@@ -405,7 +399,7 @@ Last-Update: 2026-11-25
          connect(sim, &CellularSim::errorOccurred, this, &CellularModem::addError);
      }
  
-@@ -389,6 +588,9 @@ QCoro::Task<void> CellularModem::addProfile(QString name, QString apn, QString u
+@@ -389,6 +582,9 @@ QCoro::Task<void> CellularModem::addProfile(QString name, QString apn, QString u
      gsmSetting->setPasswordFlags(password.isEmpty() ? NetworkManager::Setting::NotRequired : NetworkManager::Setting::AgentOwned);
      gsmSetting->setNetworkType(CellularConnectionProfile::networkTypeFlag(networkType));
      gsmSetting->setHomeOnly(true); // New profiles default to roaming disabled
@@ -415,7 +409,7 @@ Last-Update: 2026-11-25
  
      gsmSetting->setInitialized(true);
  
-@@ -459,21 +661,21 @@ QCoro::Task<void> CellularModem::updateProfile(QString connectionUni, QString na
+@@ -459,21 +655,21 @@ QCoro::Task<void> CellularModem::updateProfile(QString connectionUni, QString na
      }
  }
  
@@ -441,7 +435,7 @@ Last-Update: 2026-11-25
      }
  
      bool found = false;
-@@ -509,6 +711,7 @@ void CellularModem::addDetectedProfileSettings()
+@@ -509,6 +705,7 @@ void CellularModem::addDetectedProfileSettings()
          qCDebug(PLASMA_NM_CELLULAR_LOG) << "No profiles were found.";
          Q_EMIT couldNotAutodetectSettings();
      }
@@ -449,7 +443,7 @@ Last-Update: 2026-11-25
  }
  
  QList<CellularSim *> CellularModem::sims()
-@@ -516,6 +719,21 @@ QList<CellularSim *> CellularModem::sims()
+@@ -516,6 +713,21 @@ QList<CellularSim *> CellularModem::sims()
      return m_sims;
  }
  
@@ -482,19 +476,18 @@ Last-Update: 2026-11-25
  
      Q_PROPERTY(bool hasSim READ hasSim NOTIFY hasSimChanged)
      Q_PROPERTY(bool simLocked READ simLocked NOTIFY simLockedChanged)
-@@ -54,6 +56,11 @@ class PLASMANM_CELLULAR_EXPORT CellularModem : public QObject
+@@ -54,6 +56,10 @@ class PLASMANM_CELLULAR_EXPORT CellularModem : public QObject
      Q_PROPERTY(bool needsAPNAdded READ needsAPNAdded NOTIFY mobileDataEnabledChanged)
  
      Q_PROPERTY(int signalStrength READ signalStrength NOTIFY signalStrengthChanged)
-+    // short name of the radio access technology in use as shown in status bars ("5G", "LTE", "H+", "H", "3G", "E",
-+    // "G", ...), empty if none
++    // radio access technology as named in the network-mobile-<strength>-<type> icons ("lte", "5g", ...), empty if none
 +    Q_PROPERTY(QString networkType READ networkType NOTIFY networkTypeChanged)
 +    // name of the network operator; the name of the provider of the network from the mobile broadband provider
 +    // database when the network sends no name
      Q_PROPERTY(QString operatorName READ operatorName NOTIFY operatorNameChanged)
  
      Q_PROPERTY(QStringList errors READ errors NOTIFY errorsChanged)
-@@ -80,6 +87,7 @@ public:
+@@ -80,6 +86,7 @@ public:
      bool simEmpty() const;
  
      int signalStrength() const;
@@ -502,7 +495,7 @@ Last-Update: 2026-11-25
      QString operatorName() const;
  
      QStringList errors() const;
-@@ -90,9 +98,16 @@ public:
+@@ -90,9 +97,16 @@ public:
      Q_INVOKABLE QCoro::Task<void> addProfile(QString name, QString apn, QString username, QString password, QString networkType);
      Q_INVOKABLE QCoro::Task<void> removeProfile(const QString &connectionUni);
      Q_INVOKABLE QCoro::Task<void> updateProfile(QString connectionUni, QString name, QString apn, QString username, QString password, QString networkType);
@@ -520,7 +513,7 @@ Last-Update: 2026-11-25
  
      ModemManager::ModemDevice::Ptr mmModemDevice();
      NetworkManager::ModemDevice::Ptr nmModemDevice();
-@@ -109,10 +124,12 @@ Q_SIGNALS:
+@@ -109,10 +123,12 @@ Q_SIGNALS:
      void mobileDataEnabledChanged();
      void mobileDataSupportedChanged();
      void simsChanged();
@@ -533,7 +526,7 @@ Last-Update: 2026-11-25
      void operatorNameChanged();
      void errorsChanged();
      void errorOccurred(const QString &message);
-@@ -120,6 +137,11 @@ Q_SIGNALS:
+@@ -120,6 +136,11 @@ Q_SIGNALS:
  
  private:
      void findNetworkManagerDevice();
@@ -545,7 +538,7 @@ Last-Update: 2026-11-25
      void refreshSims();
      void refreshProfiles();
      void addError(const QString &message);
-@@ -133,5 +155,6 @@ private:
+@@ -133,5 +154,6 @@ private:
      ModemManager::Modem3gpp::Ptr m_mm3gppDevice = nullptr; // may be nullptr if no sim is inserted
  
      QList<CellularSim *> m_sims;
