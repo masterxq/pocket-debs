@@ -1,0 +1,540 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Wed, 26 Nov 2026 12:00:00 +0100
+Subject: [PATCH] mobileshell: status bar: one indicator per connection, states of activation and failure
+Description:
+ The internet indicator showed the icon of the primary connection and,
+ while any connection was being activated (mobile data included), a busy
+ indicator in its place. With Wi-Fi connected and mobile data activating,
+ the Wi-Fi icon turned into a spinner that told nothing about the
+ connection it stood for.
+ .
+ The status bar now has a fixed indicator per connection, each shown only
+ when it matters: the signal of every SIM; the Wi-Fi signal while Wi-Fi is
+ connected or connecting; the hotspot while it is active; the airplane
+ icon in place of the signals in airplane mode. There is no generic
+ internet icon and no busy indicator; wired and USB connections have no
+ indicator.
+ .
+ The SIM used for mobile data carries the network type (5G, LTE, H+, E,
+ ...) left of its signal while mobile data is connected. While mobile data
+ or Wi-Fi is being activated, the network type or the Wi-Fi icon pulses,
+ after a minute in the negative color (still trying, not working yet).
+ After a failed activation a red cross replaces the network type, or sits
+ at the bottom right of the Wi-Fi icon, until the connection is up or the
+ user disables and enables mobile data or Wi-Fi; retries of
+ NetworkManager do not bring the pulsing back. Mobile data disabled, the
+ SIM not used for mobile data, Wi-Fi disabled or not connecting: nothing.
+ .
+ Pulsing: opacity from invisible to visible, 1 s fade in (sine), 0.2 s
+ visible, 1 s fade out, 0.2 s invisible, one phase for all indicators
+ (IndicatorPulse); the space of the indicator stays reserved. The
+ animation runs only while an indicator pulses and a screen is on (DPMS);
+ with animations disabled the indicator is shown half transparent.
+ .
+ Needs the plasma-nm libraries with WirelessStatus.wifiState/
+ wifiSignalStrength and CellularModem.mobileDataState/networkType.
+Forwarded: no
+License: GPL-2.0-or-later, LGPL-2.0-or-later (as the patched files; new files GPL-2.0-or-later)
+Last-Update: 2026-11-26
+---
+--- a/components/mobileshell/CMakeLists.txt
++++ b/components/mobileshell/CMakeLists.txt
+@@ -29,6 +29,7 @@ set_source_files_properties(
+     qml/dataproviders/NetworkInfo.qml
+     qml/dataproviders/SignalStrengthInfo.qml
+     qml/popups/PopupProviderLoader.qml
++    qml/statusbar/indicators/IndicatorPulse.qml
+     PROPERTIES
+     QT_QML_SINGLETON_TYPE TRUE
+ )
+@@ -97,9 +98,12 @@ ecm_target_qml_sources(mobileshellplugin SOURCES
+ 
+     qml/statusbar/indicators/BatteryIndicator.qml
+     qml/statusbar/indicators/BluetoothIndicator.qml
+-    qml/statusbar/indicators/InternetIndicator.qml
++    qml/statusbar/indicators/FailureMark.qml
++    qml/statusbar/indicators/HotspotIndicator.qml
++    qml/statusbar/indicators/IndicatorPulse.qml
+     qml/statusbar/indicators/SignalStrengthIndicator.qml
+     qml/statusbar/indicators/VolumeIndicator.qml
++    qml/statusbar/indicators/WifiIndicator.qml
+     qml/statusbar/ClockText.qml
+     qml/statusbar/StatusBar.qml
+ 
+--- a/components/mobileshell/qml/dataproviders/NetworkInfo.qml
++++ b/components/mobileshell/qml/dataproviders/NetworkInfo.qml
+@@ -8,8 +8,34 @@ import QtQuick
+ import org.kde.plasma.networkmanagement as PlasmaNM
+ 
+ QtObject {
++    id: root
++
+     // Initialization of PlasmaNM.Handler is quite heavy, initialize it once for the shell as a singleton.
+     readonly property PlasmaNM.Handler handler: PlasmaNM.Handler {}
+ 
+     readonly property PlasmaNM.WirelessStatus wirelessStatus: PlasmaNM.WirelessStatus {}
+-}
+\ No newline at end of file
++
++    readonly property bool wifiActivating: wirelessStatus.wifiState === PlasmaNM.WirelessStatus.WifiActivating
++    // whether the Wi-Fi connection has been activating for a minute or longer
++    readonly property bool wifiActivatingLong: _wifiActivatingLong
++
++    property bool _wifiActivatingLong: false
++    property Timer _wifiTimer: Timer {
++        interval: 60000
++        onTriggered: root._wifiActivatingLong = true
++    }
++
++    onWifiActivatingChanged: {
++        _wifiActivatingLong = false;
++        if (wifiActivating) {
++            _wifiTimer.restart();
++        } else {
++            _wifiTimer.stop();
++        }
++    }
++    Component.onCompleted: {
++        if (wifiActivating) {
++            _wifiTimer.restart();
++        }
++    }
++}
+--- a/components/mobileshell/qml/dataproviders/SignalStrengthInfo.qml
++++ b/components/mobileshell/qml/dataproviders/SignalStrengthInfo.qml
+@@ -8,15 +8,14 @@
+ 
+ pragma Singleton
+ 
+-import QtQuick 2.1
++import QtQuick
++import org.kde.plasma.networkmanagement as PlasmaNM
+ import org.kde.plasma.networkmanagement.cellular as Cellular
+ 
+ QtObject {
+-    property Cellular.CellularModemList _modemList: Cellular.CellularModemList {}
++    id: root
+ 
+-    function _strengthIcon(modem) {
+-        return "network-mobile-" + Math.floor((modem ? modem.signalStrength : 0) / 20) * 20;
+-    }
++    property Cellular.CellularModemList _modemList: Cellular.CellularModemList {}
+ 
+     function _label(modem) {
+         if (!modem) return "";
+@@ -24,19 +23,40 @@ QtObject {
+         return modem.operatorName;
+     }
+ 
+-    // the modem used for mobile data
+-    readonly property string icon: _strengthIcon(_modemList.dataModem)
+-    readonly property string label: modems.length > 1 ? modems.map(modem => modem.label).filter(text => text !== "").join(" · ") : _label(_modemList.dataModem)
++    readonly property string label: modems.length > 1 ? modems.map(modem => _label(modem)).filter(text => text !== "").join(" · ") : _label(dataModem)
+ 
+-    // every modem with a SIM, in the order of the SIM slots (SIMs without a known slot last); the
+-    // icon of a modem with a mobile data connection names the network type (network-mobile-<strength>-<type>)
++    // every modem with a SIM, in the order of the SIM slots (SIMs without a known slot last)
+     readonly property var modems: _modemList.modems
+-        .filter(modem => modem.sim !== null)
++        .filter(modem => modem.hasSim)
+         .sort((a, b) => (a.simSlot > 0 ? a.simSlot : Number.MAX_SAFE_INTEGER) - (b.simSlot > 0 ? b.simSlot : Number.MAX_SAFE_INTEGER))
+-        .map(modem => ({
+-            "icon": (modem.activeConnectionUni !== "" && modem.networkType !== "") ? _strengthIcon(modem) + "-" + modem.networkType : _strengthIcon(modem),
+-            "label": _label(modem)
+-        }))
+ 
+-    readonly property bool showIndicator: _modemList.modemAvailable
++    // the modem used for mobile data
++    readonly property Cellular.CellularModem dataModem: _modemList.dataModem
++
++    readonly property bool airplaneMode: PlasmaNM.Configuration.airplaneModeEnabled
++
++    // state of mobile data on the modem used for it (CellularModem.MobileDataState)
++    readonly property int mobileDataState: dataModem ? dataModem.mobileDataState : Cellular.CellularModem.MobileDataDisconnected
++    readonly property bool mobileDataActivating: mobileDataState === Cellular.CellularModem.MobileDataActivating
++    // whether mobile data has been activating for a minute or longer
++    readonly property bool mobileDataActivatingLong: _mobileDataActivatingLong
++
++    property bool _mobileDataActivatingLong: false
++    property Timer _mobileDataTimer: Timer {
++        interval: 60000
++        onTriggered: root._mobileDataActivatingLong = true
++    }
++
++    function _restartMobileDataTimer() {
++        _mobileDataActivatingLong = false;
++        if (mobileDataActivating) {
++            _mobileDataTimer.restart();
++        } else {
++            _mobileDataTimer.stop();
++        }
++    }
++
++    onMobileDataActivatingChanged: _restartMobileDataTimer()
++    onDataModemChanged: _restartMobileDataTimer()
++    Component.onCompleted: _restartMobileDataTimer()
+ }
+--- a/components/mobileshell/qml/statusbar/StatusBar.qml
++++ b/components/mobileshell/qml/statusbar/StatusBar.qml
+@@ -111,6 +111,7 @@ Item {
+                     showLabel: true
+                     visible: !root.showTime
+                     textPixelSize: root.textPixelSize
++                    networkTypePixelSize: root.smallerTextPixelSize
+                 }
+ 
+                 // spacing in the middle
+@@ -130,7 +131,7 @@ Item {
+                     MobileShell.SignalStrengthIndicator {
+                         showLabel: false
+                         visible: root.showTime
+-                        internetIndicator: internetIndicatorItem
++                        networkTypePixelSize: root.smallerTextPixelSize
+                         implicitHeight: mainRow.rowHeight
+                         Layout.preferredWidth: implicitWidth
+                     }
+@@ -138,12 +139,13 @@ Item {
+                         implicitHeight: mainRow.rowHeight
+                         Layout.preferredWidth: height
+                     }
+-                    MobileShell.InternetIndicator {
+-                        id: internetIndicatorItem
++                    MobileShell.WifiIndicator {
++                        implicitHeight: mainRow.rowHeight
++                        Layout.preferredWidth: height
++                    }
++                    MobileShell.HotspotIndicator {
+                         implicitHeight: mainRow.rowHeight
+                         Layout.preferredWidth: height
+-                        // with several SIMs the signal indicator shows mobile data on the signal of its SIM
+-                        visible: indicatorRunning || !icon.startsWith("network-mobile-") || MobileShell.SignalStrengthInfo.modems.length <= 1
+                     }
+                     MobileShell.VolumeIndicator {
+                         implicitHeight: mainRow.rowHeight
+--- /dev/null
++++ b/components/mobileshell/qml/statusbar/indicators/FailureMark.qml
+@@ -0,0 +1,31 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++import QtQuick
++
++import org.kde.kirigami as Kirigami
++
++/**
++ * Red cross of a status bar indicator whose connection failed.
++ */
++Item {
++    id: root
++
++    readonly property real lineWidth: Math.max(1.5, Math.min(width, height) * 0.18)
++
++    Repeater {
++        model: [45, -45]
++
++        delegate: Rectangle {
++            required property int modelData
++
++            anchors.centerIn: parent
++            width: Math.min(root.width, root.height) * 1.25
++            height: root.lineWidth
++            radius: height / 2
++            rotation: modelData
++            antialiasing: true
++            color: Kirigami.Theme.negativeTextColor
++        }
++    }
++}
+--- /dev/null
++++ b/components/mobileshell/qml/statusbar/indicators/HotspotIndicator.qml
+@@ -0,0 +1,15 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++import QtQuick
++
++import org.kde.kirigami as Kirigami
++import org.kde.plasma.private.mobileshell as MobileShell
++
++/**
++ * Wi-Fi hotspot, shown while it is active.
++ */
++Kirigami.Icon {
++    source: "network-wireless-hotspot"
++    visible: MobileShell.NetworkInfo.wirelessStatus.hotspotSSID.length !== 0
++}
+--- /dev/null
++++ b/components/mobileshell/qml/statusbar/indicators/IndicatorPulse.qml
+@@ -0,0 +1,73 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++pragma Singleton
++
++import QtQuick
++
++import org.kde.kirigami as Kirigami
++import org.kde.plasma.private.mobileshell as MobileShell
++import org.kde.plasma.private.mobileshell.dpmsplugin as DPMS
++
++/**
++ * Opacity of the status bar indicators of connections that are being activated.
++ *
++ * All of them pulse in the same phase: 1 s fade in, 0.2 s visible, 1 s fade out, 0.2 s invisible. The animation
++ * runs only while an indicator pulses and a screen is on. With animations disabled the indicators are shown half
++ * transparent instead.
++ */
++QtObject {
++    id: root
++
++    readonly property bool animated: Kirigami.Units.longDuration > 0
++    readonly property real opacity: animated ? _value : 0.5
++
++    property real _value: 0
++
++    readonly property bool _needed: MobileShell.SignalStrengthInfo.mobileDataActivating || MobileShell.NetworkInfo.wifiActivating
++
++    // names of the screens that DPMS turned off
++    property var _screensOff: []
++    readonly property bool _screenOn: _screensOff.length < Qt.application.screens.length
++
++    property DPMS.DPMSUtil _dpms: DPMS.DPMSUtil {
++        onDpmsTurnedOff: (screen) => {
++            if (screen && !root._screensOff.includes(screen.name)) {
++                root._screensOff = root._screensOff.concat([screen.name]);
++            }
++        }
++        onDpmsTurnedOn: (screen) => {
++            if (screen) {
++                root._screensOff = root._screensOff.filter(name => name !== screen.name);
++            }
++        }
++    }
++
++    property SequentialAnimation _animation: SequentialAnimation {
++        running: root.animated && root._needed && root._screenOn
++        loops: Animation.Infinite
++
++        NumberAnimation {
++            target: root
++            property: "_value"
++            from: 0
++            to: 1
++            duration: 1000
++            easing.type: Easing.InOutSine
++        }
++        PauseAnimation {
++            duration: 200
++        }
++        NumberAnimation {
++            target: root
++            property: "_value"
++            from: 1
++            to: 0
++            duration: 1000
++            easing.type: Easing.InOutSine
++        }
++        PauseAnimation {
++            duration: 200
++        }
++    }
++}
+--- a/components/mobileshell/qml/statusbar/indicators/InternetIndicator.qml
++++ /dev/null
+@@ -1,46 +0,0 @@
+-/*
+-    SPDX-FileCopyrightText: 2021 Devin Lin <espidev@gmail.com>
+-    SPDX-FileCopyrightText: 2019 Marco Martin <mart@kde.org>
+-    SPDX-FileCopyrightText: 2013-2017 Jan Grulich <jgrulich@redhat.com>
+-
+-    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
+-*/
+-
+-import QtQuick
+-import QtQuick.Layouts
+-import QtQuick.Controls as QQC2
+-import org.kde.plasma.networkmanagement as PlasmaNM
+-import org.kde.kirigami as Kirigami
+-
+-Item {
+-    id: connectionIcon
+-
+-    readonly property string icon: wirelessStatus.hotspotSSID.length !== 0 ? "network-wireless-hotspot" : connectionIconProvider.connectionIcon
+-    readonly property bool indicatorRunning: connectionIconProvider.connecting
+-
+-    readonly property var wirelessStatus: PlasmaNM.WirelessStatus {
+-        id: wirelessStatus
+-    }
+-
+-    readonly property var connectionIcon: PlasmaNM.ConnectionIcon {
+-        id: connectionIconProvider
+-    }
+-
+-    // Internet icon, only show while visible
+-    Kirigami.Icon {
+-        id: internetIcon
+-
+-        anchors.fill: parent
+-        visible: !connectingIndicator.visible
+-        source: connectionIcon.icon
+-    }
+-
+-    // Connecting indicator
+-    QQC2.BusyIndicator {
+-        id: connectingIndicator
+-
+-        anchors.fill: parent
+-        running: connectionIcon.indicatorRunning
+-        visible: running
+-    }
+-}
+--- a/components/mobileshell/qml/statusbar/indicators/SignalStrengthIndicator.qml
++++ b/components/mobileshell/qml/statusbar/indicators/SignalStrengthIndicator.qml
+@@ -11,21 +11,20 @@ import QtQuick.Layouts
+ import org.kde.plasma.core as PlasmaCore
+ import org.kde.plasma.components 3.0 as PlasmaComponents
+ import org.kde.kirigami as Kirigami
++import org.kde.plasma.networkmanagement.cellular as Cellular
+ import org.kde.plasma.private.mobileshell as MobileShell
+ 
++/**
++ * The signal of every SIM. The SIM used for mobile data carries the network type while mobile data is connected,
++ * the network type pulsing while it is activated (in the negative color after a minute), a red cross when an
++ * activation failed. In airplane mode the airplane icon replaces the signals.
++ */
+ Item {
+     id: root
+ 
+-    property InternetIndicator internetIndicator
+-
+-    // check if the internet indicator icon is a mobile data related one
+-    readonly property bool isInternetIndicatorMobileData: internetIndicator && internetIndicator.icon && internetIndicator.icon.startsWith('network-mobile-')
+-
+-    // with several SIMs, the signal of each SIM is shown
+-    readonly property bool severalSims: MobileShell.SignalStrengthInfo.modems.length > 1
+-
+     property bool showLabel: true
+     property real textPixelSize: Kirigami.Units.gridUnit * 0.6
++    property real networkTypePixelSize: textPixelSize
+ 
+     // the row takes the implicit width of each visible item, no width is bound to an implicit width
+     implicitWidth: row.width
+@@ -39,26 +38,59 @@ Item {
+         spacing: Kirigami.Units.smallSpacing
+ 
+         Kirigami.Icon {
+-            id: strengthIcon
+             width: height
+             height: row.height
+-
+-            source: MobileShell.SignalStrengthInfo.icon
+-
+-            // don't show mobile indicator icon if the networkmanager one is already showing
+-            visible: !root.severalSims && (!isInternetIndicatorMobileData || wirelessStatus.hotspotSSID.length !== 0) && MobileShell.SignalStrengthInfo.showIndicator
++            source: "network-flightmode-on"
++            visible: MobileShell.SignalStrengthInfo.airplaneMode
+         }
+ 
+-        // with several SIMs: the signal of each SIM, mobile data shown with the network type on its SIM
+         Repeater {
+-            model: root.severalSims ? MobileShell.SignalStrengthInfo.modems : []
++            model: MobileShell.SignalStrengthInfo.airplaneMode ? [] : MobileShell.SignalStrengthInfo.modems
++
++            delegate: Row {
++                id: sim
++
++                required property Cellular.CellularModem modelData
+ 
+-            delegate: Kirigami.Icon {
+-                required property var modelData
++                readonly property int mobileDataState: modelData === MobileShell.SignalStrengthInfo.dataModem
++                    ? MobileShell.SignalStrengthInfo.mobileDataState : Cellular.CellularModem.MobileDataDisconnected
++                readonly property bool activating: mobileDataState === Cellular.CellularModem.MobileDataActivating
++                readonly property bool failed: mobileDataState === Cellular.CellularModem.MobileDataFailed
+ 
+-                width: height
+                 height: row.height
+-                source: modelData.icon
++                spacing: Math.round(Kirigami.Units.smallSpacing / 2)
++
++                // network type, or the failure; the space stays the same while the network type pulses
++                Item {
++                    anchors.verticalCenter: parent.verticalCenter
++                    width: sim.failed ? failureMark.width : networkType.implicitWidth
++                    height: sim.failed ? failureMark.height : networkType.implicitHeight
++                    visible: sim.mobileDataState !== Cellular.CellularModem.MobileDataDisconnected
++
++                    PlasmaComponents.Label {
++                        id: networkType
++                        visible: !sim.failed
++                        // no network type is known while the modem is not registered
++                        text: sim.modelData.networkType !== "" ? sim.modelData.networkType : "…"
++                        color: sim.activating && MobileShell.SignalStrengthInfo.mobileDataActivatingLong ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
++                        opacity: sim.activating ? MobileShell.IndicatorPulse.opacity : 1
++                        font.pixelSize: root.networkTypePixelSize
++                        font.weight: Font.DemiBold
++                    }
++
++                    FailureMark {
++                        id: failureMark
++                        visible: sim.failed
++                        width: Math.round(root.networkTypePixelSize)
++                        height: width
++                    }
++                }
++
++                Kirigami.Icon {
++                    width: height
++                    height: row.height
++                    source: "network-mobile-" + Math.floor(sim.modelData.signalStrength / 20) * 20
++                }
+             }
+         }
+ 
+--- /dev/null
++++ b/components/mobileshell/qml/statusbar/indicators/WifiIndicator.qml
+@@ -0,0 +1,44 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++import QtQuick
++
++import org.kde.kirigami as Kirigami
++import org.kde.plasma.networkmanagement as PlasmaNM
++import org.kde.plasma.private.mobileshell as MobileShell
++
++/**
++ * Wi-Fi client connection: the signal strength while connected, pulsing while it is activated (in the negative
++ * color after a minute), a red cross when an activation failed. Hidden while Wi-Fi is off or not connecting.
++ */
++Item {
++    id: root
++
++    readonly property var wirelessStatus: MobileShell.NetworkInfo.wirelessStatus
++    readonly property bool activating: wirelessStatus.wifiState === PlasmaNM.WirelessStatus.WifiActivating
++    readonly property bool failed: wirelessStatus.wifiState === PlasmaNM.WirelessStatus.WifiFailed
++
++    visible: wirelessStatus.wifiState !== PlasmaNM.WirelessStatus.WifiDisconnected
++
++    function strengthIcon(strength) {
++        if (strength <= 0) {
++            return "network-wireless-0";
++        }
++        return "network-wireless-" + Math.min(100, (Math.floor(strength / 20) + 1) * 20);
++    }
++
++    Kirigami.Icon {
++        anchors.fill: parent
++        source: root.failed ? "network-wireless-0" : root.strengthIcon(root.wirelessStatus.wifiSignalStrength)
++        color: root.activating && MobileShell.NetworkInfo.wifiActivatingLong ? Kirigami.Theme.negativeTextColor : "transparent"
++        opacity: root.activating ? MobileShell.IndicatorPulse.opacity : 1
++    }
++
++    FailureMark {
++        anchors.right: parent.right
++        anchors.bottom: parent.bottom
++        width: Math.round(parent.width * 0.45)
++        height: width
++        visible: root.failed
++    }
++}
