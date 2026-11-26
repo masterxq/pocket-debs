@@ -1,6 +1,6 @@
 From: pocket-debs <masterxq@users.noreply.github.com>
 Date: Wed, 26 Nov 2026 12:00:00 +0100
-Subject: [PATCH] wirelessstatus: state and signal strength of the Wi-Fi connection
+Subject: [PATCH] wirelessstatus, connectionicon: state of the Wi-Fi connection, VPN and limited connectivity
 Description:
  WirelessStatus only told the SSID of a connected Wi-Fi network or hotspot.
  A status indicator also needs to know whether a Wi-Fi connection is being
@@ -16,10 +16,55 @@ Description:
  lost does not count as a failure. Hotspot (access point and ad-hoc)
  connections are left out. wifiSignalStrength: the signal strength of the
  access point of the connection being shown.
+ .
+ ConnectionIcon: vpn and limited, the states behind the "-locked" and
+ "-limited" icon variants, for indicators that draw the icon of a
+ connection themselves.
 Forwarded: no
-License: LGPL-2.0-or-later (as the patched files)
+License: LGPL-2.0-or-later (wirelessstatus), LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (connectionicon), as the patched files
 Last-Update: 2026-11-26
 ---
+--- a/libs/connectionicon.cpp
++++ b/libs/connectionicon.cpp
+@@ -84,6 +84,16 @@ QString ConnectionIcon::connectionTooltipIcon() const
+     return m_connectionTooltipIcon;
+ }
+ 
++bool ConnectionIcon::vpn() const
++{
++    return m_vpn;
++}
++
++bool ConnectionIcon::limited() const
++{
++    return m_limited;
++}
++
+ NetworkManager::Connectivity ConnectionIcon::connectivity() const
+ {
+     return m_connectivity;
+--- a/libs/connectionicon.h
++++ b/libs/connectionicon.h
+@@ -23,6 +23,10 @@ class ConnectionIcon : public QObject
+     Q_PROPERTY(bool connecting READ connecting NOTIFY connectingChanged)
+     Q_PROPERTY(QString connectionIcon READ connectionIcon NOTIFY connectionIconChanged)
+     Q_PROPERTY(QString connectionTooltipIcon READ connectionTooltipIcon NOTIFY connectionTooltipIconChanged)
++    // whether a VPN connection is active (connectionIcon then ends in "-locked")
++    Q_PROPERTY(bool vpn READ vpn NOTIFY connectionIconChanged)
++    // whether the connectivity is limited or behind a portal (connectionIcon then ends in "-limited" unless a VPN is active)
++    Q_PROPERTY(bool limited READ limited NOTIFY connectionIconChanged)
+ 
+     Q_PROPERTY(NetworkManager::Connectivity connectivity READ connectivity WRITE setConnectivity NOTIFY connectivityChanged)
+ public:
+@@ -32,6 +36,8 @@ public:
+     bool connecting() const;
+     QString connectionIcon() const;
+     QString connectionTooltipIcon() const;
++    bool vpn() const;
++    bool limited() const;
+ 
+     NetworkManager::Connectivity connectivity() const;
+     void setConnectivity(NetworkManager::Connectivity connectivity);
 --- a/libs/wirelessstatus.cpp
 +++ b/libs/wirelessstatus.cpp
 @@ -3,16 +3,37 @@
