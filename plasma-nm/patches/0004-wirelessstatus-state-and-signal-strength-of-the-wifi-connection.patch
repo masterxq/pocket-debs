@@ -1,0 +1,262 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Wed, 26 Nov 2026 12:00:00 +0100
+Subject: [PATCH] wirelessstatus: state and signal strength of the Wi-Fi connection
+Description:
+ WirelessStatus only told the SSID of a connected Wi-Fi network or hotspot.
+ A status indicator also needs to know whether a Wi-Fi connection is being
+ activated and whether an activation failed.
+ .
+ wifiState: WifiConnected while a Wi-Fi device is connected to a network,
+ WifiActivating while one is being connected (NetworkManager device states
+ prepare to secondaries, including need-auth), WifiFailed after an
+ activation failed (device state failed reached from an activating state),
+ else WifiDisconnected. The failure is kept until a network is connected
+ or Wi-Fi is disabled, also while NetworkManager retries the activation and
+ after it blocks autoconnect; a connected network whose access point is
+ lost does not count as a failure. Hotspot (access point and ad-hoc)
+ connections are left out. wifiSignalStrength: the signal strength of the
+ access point of the connection being shown.
+Forwarded: no
+License: LGPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-26
+---
+--- a/libs/wirelessstatus.cpp
++++ b/libs/wirelessstatus.cpp
+@@ -3,16 +3,37 @@
+ 
+ #include "wirelessstatus.h"
+ 
++#include <NetworkManagerQt/AccessPoint>
+ #include <NetworkManagerQt/ActiveConnection>
+ #include <NetworkManagerQt/Manager>
++#include <NetworkManagerQt/WirelessDevice>
+ #include <NetworkManagerQt/WirelessSetting>
+ 
++static bool isActivating(NetworkManager::Device::State state)
++{
++    return state >= NetworkManager::Device::Preparing && state < NetworkManager::Device::Activated;
++}
++
++static bool isHotspot(const NetworkManager::ActiveConnection::Ptr &active)
++{
++    if (!active || !active->connection()) {
++        return false;
++    }
++    NetworkManager::WirelessSetting::Ptr wifiSetting =
++        active->connection()->settings()->setting(NetworkManager::Setting::Wireless).dynamicCast<NetworkManager::WirelessSetting>();
++    return wifiSetting && (wifiSetting->mode() == NetworkManager::WirelessSetting::Ap || wifiSetting->mode() == NetworkManager::WirelessSetting::Adhoc);
++}
++
+ WirelessStatus::WirelessStatus(QObject *parent)
+     : QObject(parent)
+ {
+     connect(NetworkManager::notifier(), &NetworkManager::Notifier::activeConnectionsChanged, this, &WirelessStatus::activeConnectionsChanged);
++    connect(NetworkManager::notifier(), &NetworkManager::Notifier::deviceAdded, this, &WirelessStatus::addWifiDevices);
++    connect(NetworkManager::notifier(), &NetworkManager::Notifier::deviceRemoved, this, &WirelessStatus::updateWifiState);
++    connect(NetworkManager::notifier(), &NetworkManager::Notifier::wirelessEnabledChanged, this, &WirelessStatus::wirelessEnabledChanged);
+ 
+     activeConnectionsChanged();
++    addWifiDevices();
+ }
+ 
+ WirelessStatus::~WirelessStatus() = default;
+@@ -27,6 +48,16 @@ QString WirelessStatus::hotspotSSID() const
+     return m_hotspotSSID;
+ }
+ 
++WirelessStatus::WifiState WirelessStatus::wifiState() const
++{
++    return m_wifiState;
++}
++
++int WirelessStatus::wifiSignalStrength() const
++{
++    return m_wifiSignalStrength;
++}
++
+ void WirelessStatus::activeConnectionsChanged()
+ {
+     for (const NetworkManager::ActiveConnection::Ptr &active : NetworkManager::activeConnections()) {
+@@ -66,4 +97,113 @@ void WirelessStatus::stateChanged()
+     }
+ }
+ 
++void WirelessStatus::addWifiDevices()
++{
++    for (const NetworkManager::Device::Ptr &device : NetworkManager::networkInterfaces()) {
++        if (device->type() != NetworkManager::Device::Wifi) {
++            continue;
++        }
++        connect(device.data(), &NetworkManager::Device::stateChanged, this, &WirelessStatus::wifiDeviceStateChanged, Qt::UniqueConnection);
++        connect(device.data(), &NetworkManager::Device::activeConnectionChanged, this, &WirelessStatus::updateWifiState, Qt::UniqueConnection);
++        NetworkManager::WirelessDevice::Ptr wifiDevice = device.objectCast<NetworkManager::WirelessDevice>();
++        if (wifiDevice) {
++            connect(wifiDevice.data(), &NetworkManager::WirelessDevice::activeAccessPointChanged, this, &WirelessStatus::updateWifiState, Qt::UniqueConnection);
++        }
++    }
++
++    updateWifiState();
++}
++
++void WirelessStatus::wifiDeviceStateChanged(NetworkManager::Device::State newState, NetworkManager::Device::State oldState)
++{
++    auto device = qobject_cast<NetworkManager::Device *>(sender());
++    if (!device) {
++        return;
++    }
++
++    if (isActivating(newState)) {
++        // the active connection may be announced after the first state of the activation
++        const NetworkManager::ActiveConnection::Ptr active = device->activeConnection();
++        if (active && isHotspot(active)) {
++            m_hotspotDevices.insert(device->uni());
++        } else if (active) {
++            m_hotspotDevices.remove(device->uni());
++        }
++    } else if (newState == NetworkManager::Device::Failed) {
++        // only a failed activation counts: a connection that was connected and lost its access point fails as well
++        if (isActivating(oldState) && !m_hotspotDevices.contains(device->uni())) {
++            m_wifiFailed = true;
++        }
++    } else if (newState != NetworkManager::Device::Activated) {
++        m_hotspotDevices.remove(device->uni());
++    }
++
++    updateWifiState();
++}
++
++void WirelessStatus::wirelessEnabledChanged(bool enabled)
++{
++    if (!enabled) {
++        m_wifiFailed = false;
++    }
++    updateWifiState();
++}
++
++void WirelessStatus::updateWifiState()
++{
++    WifiState state = WifiDisconnected;
++    int signalStrength = 0;
++
++    if (NetworkManager::isWirelessEnabled()) {
++        for (const NetworkManager::Device::Ptr &device : NetworkManager::networkInterfaces()) {
++            if (device->type() != NetworkManager::Device::Wifi) {
++                continue;
++            }
++            const NetworkManager::Device::State deviceState = device->state();
++            if (deviceState != NetworkManager::Device::Activated && !isActivating(deviceState)) {
++                continue;
++            }
++            const NetworkManager::ActiveConnection::Ptr active = device->activeConnection();
++            if (active ? isHotspot(active) : m_hotspotDevices.contains(device->uni())) {
++                continue;
++            }
++
++            int accessPointStrength = 0;
++            NetworkManager::WirelessDevice::Ptr wifiDevice = device.objectCast<NetworkManager::WirelessDevice>();
++            NetworkManager::AccessPoint::Ptr accessPoint = wifiDevice ? wifiDevice->activeAccessPoint() : NetworkManager::AccessPoint::Ptr();
++            if (accessPoint) {
++                connect(accessPoint.data(), &NetworkManager::AccessPoint::signalStrengthChanged, this, &WirelessStatus::updateWifiState, Qt::UniqueConnection);
++                accessPointStrength = accessPoint->signalStrength();
++            }
++
++            if (deviceState == NetworkManager::Device::Activated) {
++                state = WifiConnected;
++                signalStrength = accessPointStrength;
++                break;
++            }
++            if (state == WifiDisconnected) {
++                state = WifiActivating;
++                signalStrength = accessPointStrength;
++            }
++        }
++    } else {
++        m_wifiFailed = false;
++    }
++
++    if (state == WifiConnected) {
++        m_wifiFailed = false;
++    } else if (m_wifiFailed) {
++        state = WifiFailed;
++    }
++
++    if (m_wifiState != state) {
++        m_wifiState = state;
++        Q_EMIT wifiStateChanged();
++    }
++    if (m_wifiSignalStrength != signalStrength) {
++        m_wifiSignalStrength = signalStrength;
++        Q_EMIT wifiSignalStrengthChanged();
++    }
++}
++
+ #include "moc_wirelessstatus.cpp"
+--- a/libs/wirelessstatus.h
++++ b/libs/wirelessstatus.h
+@@ -5,6 +5,9 @@
+ #define WIRELESSSTATUS_H
+ 
+ #include <QObject>
++#include <QSet>
++
++#include <NetworkManagerQt/Device>
+ 
+ #include <qqmlregistration.h>
+ 
+@@ -21,24 +24,56 @@ class WirelessStatus : public QObject
+      * Returns the SSID of the currently active wireless connection, if any, otherwise an empty string
+      */
+     Q_PROPERTY(QString wifiSSID READ wifiSSID NOTIFY wifiSSIDChanged)
++    /**
++     * Returns the state of the wireless client connection (not of a hotspot), see WifiState
++     */
++    Q_PROPERTY(WifiState wifiState READ wifiState NOTIFY wifiStateChanged)
++    /**
++     * Returns the signal strength (0-100) of the access point of the wireless client connection while it is
++     * connected or being connected, otherwise 0
++     */
++    Q_PROPERTY(int wifiSignalStrength READ wifiSignalStrength NOTIFY wifiSignalStrengthChanged)
+ public:
++    enum WifiState {
++        WifiDisconnected, // Wi-Fi is disabled, or no connection is active or being activated
++        WifiActivating,
++        WifiConnected,
++        // an activation failed; kept until a connection is connected or Wi-Fi is disabled, also while the
++        // activation is retried
++        WifiFailed,
++    };
++    Q_ENUM(WifiState)
++
+     explicit WirelessStatus(QObject *parent = nullptr);
+     ~WirelessStatus() override;
+ 
+     QString wifiSSID() const;
+     QString hotspotSSID() const;
++    WifiState wifiState() const;
++    int wifiSignalStrength() const;
+ 
+ private Q_SLOTS:
+     void activeConnectionsChanged();
+     void stateChanged();
++    void addWifiDevices();
++    void wifiDeviceStateChanged(NetworkManager::Device::State newState, NetworkManager::Device::State oldState);
++    void wirelessEnabledChanged(bool enabled);
++    void updateWifiState();
+ 
+ Q_SIGNALS:
+     void hotspotSSIDChanged(const QString &ssid);
+     void wifiSSIDChanged(const QString &ssid);
++    void wifiStateChanged();
++    void wifiSignalStrengthChanged();
+ 
+ private:
+     QString m_wifiSSID;
+     QString m_hotspotSSID;
++    WifiState m_wifiState = WifiDisconnected;
++    int m_wifiSignalStrength = 0;
++    bool m_wifiFailed = false;
++    // Wi-Fi devices whose current activation is one of a hotspot
++    QSet<QString> m_hotspotDevices;
+ };
+ 
+ #endif // WIRELESSSTATUS_H
