@@ -1,0 +1,115 @@
+From: Devin Lin <espidev@gmail.com>
+Date: Fri, 18 Sep 2026 18:47:05 -0400
+Subject: [PATCH] quicksettings: Ensure MarqueeLabel is off when panel is hidden
+Description:
+ To enhance quicksettings panel opening performance, we avoided setting
+ visible: false on the quicksettings panel. However, this means that all
+ animations must be turned off manually when not in view.
+ .
+ This MR disables MarqueeLabel when the quicksettings panel is hidden,
+ and also caches a TextMetrics property in it to avoid lots of heavy
+ queries when it doesn't change.
+ .
+ Without it, a quick setting whose text or status does not fit its tile
+ scrolls it endlessly while the action drawer is closed: the animation
+ runs on a timer of the GUI thread of plasmashell (about 60 wakeups per
+ second) and shapes the text again on every step (TextMetrics), whether
+ or not the drawer is shown. 6.7 passes the status text as root.status;
+ the hunk for the second label is adapted to that.
+Origin: backport, https://invent.kde.org/plasma/plasma-mobile/-/commit/ce647d803a65b3b425c19a848c9b4f46fc138f80 (master, Plasma 6.8)
+License: LGPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-26
+---
+--- a/components/mobileshell/qml/actiondrawer/private/QuickSettings.qml
++++ b/components/mobileshell/qml/actiondrawer/private/QuickSettings.qml
+@@ -161,6 +161,7 @@ Item {
+                                 padding: Kirigami.Units.smallSpacing
+ 
+                                 contentItem: QuickSettingsFullDelegate {
++                                    animationsEnabled: actionDrawer.intendedToBeVisible && root.fullViewProgress > 0 && flow.index === swipeView.currentIndex
+                                     restrictedPermissions: actionDrawer.restrictedPermissions
+ 
+                                     text: modelData.text
+--- a/components/mobileshell/qml/actiondrawer/private/QuickSettingsFullDelegate.qml
++++ b/components/mobileshell/qml/actiondrawer/private/QuickSettingsFullDelegate.qml
+@@ -18,6 +18,8 @@ import org.kde.plasma.components 3.0 as PlasmaComponents
+ QuickSettingsDelegate {
+     id: root
+ 
++    required property bool animationsEnabled
++
+     padding: Kirigami.Units.smallSpacing * 2
+     iconItem: icon
+ 
+@@ -87,6 +89,7 @@ QuickSettingsDelegate {
+             anchors.bottom: parent.bottom
+ 
+             MobileShell.MarqueeLabel {
++                scrollingEnabled: root.animationsEnabled
+                 Layout.fillWidth: true
+                 inputText: root.text
+                 font.pointSize: Kirigami.Theme.defaultFont.pointSize * 0.75 // TODO base height off of size of delegate
+@@ -94,6 +97,7 @@ QuickSettingsDelegate {
+             }
+ 
+             MobileShell.MarqueeLabel {
++                scrollingEnabled: root.animationsEnabled
+                 // if no status is given, just use On/Off
+                 inputText: root.status ? root.status : (root.enabled ? i18n("On") : i18n("Off"))
+                 opacity: 0.6
+@@ -104,4 +108,3 @@ QuickSettingsDelegate {
+         }
+     }
+ }
+-
+--- a/components/mobileshell/qml/components/MarqueeLabel.qml
++++ b/components/mobileshell/qml/components/MarqueeLabel.qml
+@@ -23,15 +23,19 @@ OpacityMask {
+     required property string inputText
+     property font font
+     property var textFormat: Text.RichText
++    property bool scrollingEnabled: true
+     // properties for the marquee label scroll speed and wait duration
+     readonly property real scrollSpeed: 0.025
+     readonly property int waitDuration: 2000
+ 
+     readonly property string filteredText: inputText.replace(/\n/g, ' ') // remove new line characters
+-    readonly property bool charactersOverflowing: txtMeter.advanceWidth > root.width // true when text is overflowing
++
++    readonly property real textAdvanceWidth: txtMeter.advanceWidth // Cache TextMetrics.advanceWidth
++    readonly property bool charactersOverflowing: textAdvanceWidth > root.width // true when text is overflowing
++    readonly property bool shouldAnimate: scrollingEnabled && charactersOverflowing && visible && Window.window && Window.window.visible
+ 
+     // update animation values and text positions whenever the label overflows or changes
+-    onFilteredTextChanged: if (root.charactersOverflowing) { textAnimationLoop.restart() }
++    onFilteredTextChanged: if (root.shouldAnimate) { textAnimationLoop.restart() }
+     onCharactersOverflowingChanged: if (charactersOverflowing) { row.scrollPosition = 0 }
+ 
+     Item {
+@@ -91,11 +95,11 @@ OpacityMask {
+     // if the label is overflowing, this animation in a loop smoothly scrolling thought the text
+     SequentialAnimation {
+         id: textAnimationLoop
+-        running: root.charactersOverflowing && root.visible
++        running: root.shouldAnimate
+         onRunningChanged: row.scrollPosition = 0
+         loops: Animation.Infinite
+         PauseAnimation { duration: root.waitDuration }
+-        NumberAnimation { target: row; property: "scrollPosition"; from: 0; to: -txtMeter.advanceWidth - row.spacing; duration: (txtMeter.advanceWidth + row.spacing) / root.scrollSpeed }
++        NumberAnimation { target: row; property: "scrollPosition"; from: 0; to: -root.textAdvanceWidth - row.spacing; duration: (root.textAdvanceWidth + row.spacing) / root.scrollSpeed }
+     }
+ 
+     // gradient mask to smoothly fade the ends of the label when it is scrolling
+@@ -109,11 +113,10 @@ OpacityMask {
+         gradient: Gradient {
+             orientation: Gradient.Horizontal
+ 
+-            GradientStop { position: 0; color: row.scrollPosition == 0 || row.scrollPosition < -txtMeter.advanceWidth ? 'white' : 'transparent' } // remove the beginning of the gradient when at the start of the label so the front text is fully visible
++            GradientStop { position: 0; color: row.scrollPosition == 0 || row.scrollPosition < -root.textAdvanceWidth ? 'white' : 'transparent' } // remove the beginning of the gradient when at the start of the label so the front text is fully visible
+             GradientStop { position: 0 + mask.gradientPct; color: 'white' }
+             GradientStop { position: 1.0 - mask.gradientPct; color: 'white' }
+             GradientStop { position: 1.0; color: 'transparent' }
+         }
+     }
+ }
+-
