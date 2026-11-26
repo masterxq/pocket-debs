@@ -1,0 +1,109 @@
+Description: lockscreen: show hints and errors of the fingerprint reader
+ The lock screen ignored the messages of the non-interactive fingerprint
+ authenticator. Show its last hint (where to place the finger, or why only
+ the PIN works now) above the indicator icon, show an error (finger not
+ recognized) for three seconds and vibrate on it, also while the display is
+ off.
+Author: pocket-debs
+Forwarded: no
+License: GPL-2.0-or-later
+---
+diff -ruN a/shell/contents/lockscreen/LockScreen.qml b/shell/contents/lockscreen/LockScreen.qml
+--- a/shell/contents/lockscreen/LockScreen.qml	2026-08-04 11:24:47.000000000 +0200
++++ b/shell/contents/lockscreen/LockScreen.qml	2026-11-26 10:14:38.536469284 +0100
+@@ -13,6 +13,7 @@
+ import org.kde.plasma.private.mobileshell.dpmsplugin as DPMS
+ import org.kde.plasma.components 3.0 as PC3
+ import org.kde.plasma.private.mobileshell.shellsettingsplugin as ShellSettings
++import org.kde.plasma.private.mobileshell.hapticsplugin as HapticsPlugin
+ 
+ import org.kde.kirigami as Kirigami
+ 
+@@ -143,6 +144,32 @@
+                 }
+             }
+ 
++            // hint or error of the fingerprint reader, above the indicator icon
++            PC3.Label {
++                id: fingerprintMessage
++                visible: text !== ""
++                text: root.lockScreenState.fingerprintMessage
++                opacity: Math.max(0, 1 - flickable.openFactor * 2)
++                color: "white"
++                horizontalAlignment: Text.AlignHCenter
++                wrapMode: Text.WordWrap
++                width: Math.min(parent.width - Kirigami.Units.gridUnit * 2, Kirigami.Units.gridUnit * 20)
++
++                anchors.bottom: scrollUpIconLoader.top
++                anchors.bottomMargin: Kirigami.Units.largeSpacing
++                anchors.horizontalCenter: parent.horizontalCenter
++            }
++
++            Connections {
++                target: root.lockScreenState
++                function onFingerprintFailed() {
++                    // a rejected finger is felt also while the display is off
++                    if (ShellSettings.Settings.vibrationsEnabled) {
++                        HapticsPlugin.VibrationManager.vibrate(ShellSettings.Settings.vibrationDuration * 4);
++                    }
++                }
++            }
++
+             // scroll up icon
+             BottomIconIndicator {
+                 id: scrollUpIconLoader
+diff -ruN a/shell/contents/lockscreen/LockScreenState.qml b/shell/contents/lockscreen/LockScreenState.qml
+--- a/shell/contents/lockscreen/LockScreenState.qml	2026-08-04 11:24:47.000000000 +0200
++++ b/shell/contents/lockscreen/LockScreenState.qml	2026-11-26 10:14:38.536435530 +0100
+@@ -24,6 +24,14 @@
+     // whether the device can log in with fingerprint
+     readonly property bool isFingerprintSupported: authenticator.authenticatorTypes & ScreenLocker.Authenticator.Fingerprint
+ 
++    // last hint of the fingerprint authenticator (e.g. where to place the finger, or why only the PIN works now)
++    property string fingerprintInfo: ""
++
++    // last error of the fingerprint authenticator (e.g. finger not recognized), shown for a few seconds
++    property string fingerprintError: ""
++
++    readonly property string fingerprintMessage: fingerprintError !== "" ? fingerprintError : fingerprintInfo
++
+     // whether we are in keyboard mode (hiding the numpad)
+     property bool isKeyboardMode: false
+ 
+@@ -34,6 +42,7 @@
+     signal reset()
+     signal unlockSucceeded()
+     signal unlockFailed()
++    signal fingerprintFailed()
+ 
+     Component.onCompleted: authenticator.startAuthenticating();
+ 
+@@ -67,9 +76,28 @@
+         }
+     }
+ 
++    property var fingerprintErrorTimer: Timer {
++        interval: 3000
++        onTriggered: root.fingerprintError = ""
++    }
++
+     property var connections: Connections {
+         target: authenticator
+ 
++        function onNoninteractiveInfo(what: int, authenticator: var): void {
++            if (what & ScreenLocker.Authenticator.Fingerprint) {
++                root.fingerprintInfo = authenticator.infoMessage;
++            }
++        }
++
++        function onNoninteractiveError(what: int, authenticator: var): void {
++            if (what & ScreenLocker.Authenticator.Fingerprint) {
++                root.fingerprintError = authenticator.errorMessage;
++                root.fingerprintErrorTimer.restart();
++                root.fingerprintFailed();
++            }
++        }
++
+         function onSucceeded() {
+             if (authenticator.hadPrompt) {
+                 console.log('login succeeded');
