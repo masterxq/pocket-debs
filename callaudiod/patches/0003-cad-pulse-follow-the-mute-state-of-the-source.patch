@@ -1,0 +1,128 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:00:00 +0100
+Subject: [PATCH] cad-pulse: follow the mute state of the source
+Description:
+ The D-Bus properties of callaudiod start at 0 until the card has been seen,
+ and 0 is CALL_AUDIO_MIC_OFF. A client that starts callaudiod through D-Bus
+ activation and reads MicState right away (kde-telephony-daemon does so when
+ it starts with the session) gets "microphone off" and may pass it back as a
+ mute request: the microphone of the card is muted at every login, and
+ WirePlumber stores the muted route and restores it in the next call. Publish
+ CALL_AUDIO_MODE_UNKNOWN, CALL_AUDIO_SPEAKER_UNKNOWN and
+ CALL_AUDIO_MIC_UNKNOWN until the state is known.
+ .
+ MicState was taken from the source only once and then followed the requests
+ of callaudiod. The session manager restores a stored mute state when it
+ switches to the voice call profile (a new source), and other clients mute
+ the source as well; a request to unmute was then skipped as "nothing to be
+ done" while the microphone stayed muted. Take the state from every new
+ source and from change events of the source, and always pass a mute request
+ on to the source.
+Forwarded: no
+License: GPL-3.0-or-later (as the patched files)
+Last-Update: 2026-11-26
+---
+--- a/src/cad-pulse.c
++++ b/src/cad-pulse.c
+@@ -129,6 +129,23 @@ static const gchar *get_available_source_port(const pa_source_info *source, cons
+     return NULL;
+ }
+ 
++/*
++ * The microphone state is the mute state of the source of the card. Another
++ * client (the session manager restoring a stored route, a volume applet) may
++ * change it, and a profile switch replaces the source: follow the source
++ * instead of remembering the last request.
++ */
++static void update_mic_state(CadPulse *self, const pa_source_info *info)
++{
++    CallAudioMicState state = info->mute ? CALL_AUDIO_MIC_OFF : CALL_AUDIO_MIC_ON;
++
++    if (self->mic_state != state) {
++        g_debug("mic state %u -> %u (source %u)", self->mic_state, state, info->index);
++        self->mic_state = state;
++        g_object_set(self->manager, "mic-state", state, NULL);
++    }
++}
++
+ static void change_source_info(pa_context *ctx, const pa_source_info *info, int eol, void *data)
+ {
+     CadPulse *self = data;
+@@ -148,6 +165,8 @@ static void change_source_info(pa_context *ctx, const pa_source_info *info, int
+     if (info->index != self->source_id)
+         return;
+ 
++    update_mic_state(self, info);
++
+     for (i = 0; i < info->n_ports; i++) {
+         pa_source_port_info *port = info->ports[i];
+ 
+@@ -226,13 +245,7 @@ static void init_source_info(pa_context *ctx, const pa_source_info *info, int eo
+     if (op)
+         pa_operation_unref(op);
+ 
+-    if (self->mic_state == CALL_AUDIO_MIC_UNKNOWN) {
+-        if (info->mute)
+-            self->mic_state = CALL_AUDIO_MIC_OFF;
+-        else
+-            self->mic_state = CALL_AUDIO_MIC_ON;
+-        g_object_set(self->manager, "mic-state", self->mic_state, NULL);
+-    }
++    update_mic_state(self, info);
+ 
+     target_port = get_available_source_port(info, NULL);
+     if (target_port) {
+@@ -656,6 +669,10 @@ static void changed_cb(pa_context *ctx, pa_subscription_event_type_t type, uint3
+             self->source_id = -1;
+             g_hash_table_destroy(self->source_ports);
+             self->source_ports = NULL;
++        } else if (idx == self->source_id && kind == PA_SUBSCRIPTION_EVENT_CHANGE) {
++            op = pa_context_get_source_info_by_index(ctx, idx, change_source_info, self);
++            if (op)
++                pa_operation_unref(op);
+         } else if (kind == PA_SUBSCRIPTION_EVENT_NEW) {
+             g_debug("new source %u", idx);
+             op = pa_context_get_source_info_by_index(ctx, idx, init_source_info, self);
+@@ -809,6 +826,16 @@ static void cad_pulse_init(CadPulse *self)
+     self->audio_mode = CALL_AUDIO_MODE_UNKNOWN;
+     self->speaker_state = CALL_AUDIO_SPEAKER_UNKNOWN;
+     self->mic_state = CALL_AUDIO_MIC_UNKNOWN;
++    /*
++     * The D-Bus properties start at 0, which reads as "default mode", "speaker
++     * off" and "microphone off" to clients: publish "unknown" until the state of
++     * the card is known.
++     */
++    g_object_set(self->manager,
++                 "audio-mode", CALL_AUDIO_MODE_UNKNOWN,
++                 "speaker-state", CALL_AUDIO_SPEAKER_UNKNOWN,
++                 "mic-state", CALL_AUDIO_MIC_UNKNOWN,
++                 NULL);
+ }
+ 
+ CadPulse *cad_pulse_get_default(void)
+@@ -1270,17 +1297,14 @@ void cad_pulse_mute_mic(gboolean mute, CadOperation *cad_op)
+     operation->op = cad_op;
+     operation->value = (guint)mute;
+ 
+-    if (operation->pulse->mic_state == CALL_AUDIO_MIC_OFF && !operation->value) {
+-        g_debug("mic is muted, unmuting...");
+-        op = pa_context_set_source_mute_by_index(operation->pulse->ctx,
+-                                                 operation->pulse->source_id, 0,
+-                                                 operation_complete_cb, operation);
+-    } else if (operation->pulse->mic_state == CALL_AUDIO_MIC_ON && operation->value) {
+-        g_debug("mic is active, muting...");
+-        op = pa_context_set_source_mute_by_index(operation->pulse->ctx,
+-                                                 operation->pulse->source_id, 1,
+-                                                 operation_complete_cb, operation);
+-    }
++    /*
++     * Always set the requested state: the source may have been muted or
++     * unmuted by another client since the state was last seen.
++     */
++    g_debug("%s the mic", mute ? "muting" : "unmuting");
++    op = pa_context_set_source_mute_by_index(operation->pulse->ctx,
++                                             operation->pulse->source_id, !!mute,
++                                             operation_complete_cb, operation);
+ 
+     if (op) {
+         pa_operation_unref(op);
