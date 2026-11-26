@@ -1,0 +1,154 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Wed, 26 Nov 2026 12:00:00 +0100
+Subject: [PATCH] cellular: state of the mobile data connection of a modem
+Description:
+ CellularModem.mobileDataState for status indicators: MobileDataConnected
+ while the NetworkManager device of the modem is activated,
+ MobileDataActivating while it is being activated (prepare to secondaries),
+ MobileDataFailed after an activation failed (device state failed reached
+ from an activating state), else MobileDataDisconnected. The failure is
+ kept until the modem is connected or mobile data is disabled (also by
+ disabling WWAN), also while NetworkManager retries the activation and
+ after it blocks autoconnect; a connection that loses its bearer does not
+ count as a failure.
+ .
+ mobileDataEnabled is notified when WWAN is enabled or disabled. The
+ signals of a NetworkManager device are connected once: finding the device
+ again (on every device added or removed) connected them once more.
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-26
+---
+--- a/libs/cellular/cellularmodem.cpp
++++ b/libs/cellular/cellularmodem.cpp
+@@ -51,6 +51,8 @@ CellularModem::CellularModem(QObject *parent, ModemManager::ModemDevice::Ptr mmM
+     connect(NetworkManager::notifier(), &NetworkManager::Notifier::activeConnectionRemoved, this, &CellularModem::mobileDataEnabledChanged);
+     connect(NetworkManager::notifier(), &NetworkManager::Notifier::deviceAdded, this, &CellularModem::findNetworkManagerDevice);
+     connect(NetworkManager::notifier(), &NetworkManager::Notifier::deviceRemoved, this, &CellularModem::findNetworkManagerDevice);
++    connect(NetworkManager::notifier(), &NetworkManager::Notifier::wwanEnabledChanged, this, &CellularModem::mobileDataEnabledChanged);
++    connect(this, &CellularModem::mobileDataEnabledChanged, this, &CellularModem::updateMobileDataState);
+ 
+     // this is guaranteed to be a GSM modem
+     m_mm3gppDevice = m_mmModem->interface(ModemManager::ModemDevice::GsmInterface).objectCast<ModemManager::Modem3gpp>();
+@@ -89,6 +91,9 @@ CellularModem::CellularModem(QObject *parent, ModemManager::ModemDevice::Ptr mmM
+ 
+ void CellularModem::findNetworkManagerDevice()
+ {
++    if (m_nmModem) {
++        disconnect(m_nmModem.data(), nullptr, this, nullptr);
++    }
+     m_nmModem = nullptr;
+ 
+     for (NetworkManager::Device::Ptr nmDevice : NetworkManager::networkInterfaces()) {
+@@ -100,6 +105,13 @@ void CellularModem::findNetworkManagerDevice()
+     if (m_nmModem) {
+         connect(m_nmModem.data(), &NetworkManager::Device::autoconnectChanged, this, &CellularModem::mobileDataEnabledChanged);
+         connect(m_nmModem.data(), &NetworkManager::Device::stateChanged, this, &CellularModem::mobileDataEnabledChanged);
++        connect(m_nmModem.data(), &NetworkManager::Device::stateChanged, this, [this](NetworkManager::Device::State newState, NetworkManager::Device::State oldState) {
++            // a connection that was connected and lost its bearer fails as well; only a failed activation counts
++            if (newState == NetworkManager::Device::Failed && oldState >= NetworkManager::Device::Preparing && oldState < NetworkManager::Device::Activated) {
++                m_mobileDataFailed = true;
++                updateMobileDataState();
++            }
++        });
+         connect(m_nmModem.data(), &NetworkManager::Device::availableConnectionAppeared, this, &CellularModem::mobileDataEnabledChanged);
+         connect(m_nmModem.data(), &NetworkManager::Device::availableConnectionDisappeared, this, &CellularModem::mobileDataEnabledChanged);
+ 
+@@ -242,6 +254,37 @@ bool CellularModem::mobileDataEnabled() const
+     return false;
+ }
+ 
++CellularModem::MobileDataState CellularModem::mobileDataState() const
++{
++    return m_mobileDataState;
++}
++
++void CellularModem::updateMobileDataState()
++{
++    MobileDataState state = MobileDataDisconnected;
++    if (m_nmModem) {
++        const NetworkManager::Device::State deviceState = m_nmModem->state();
++        if (deviceState == NetworkManager::Device::Activated) {
++            state = MobileDataConnected;
++        } else if (deviceState >= NetworkManager::Device::Preparing && deviceState < NetworkManager::Device::Activated) {
++            state = MobileDataActivating;
++        }
++    }
++
++    // a failure is shown until the modem is connected or mobile data is disabled (also by disabling WWAN); when
++    // NetworkManager gives up after failed activations, mobile data stays enabled
++    if (state == MobileDataConnected || !mobileDataEnabled()) {
++        m_mobileDataFailed = false;
++    } else if (m_mobileDataFailed) {
++        state = MobileDataFailed;
++    }
++
++    if (m_mobileDataState != state) {
++        m_mobileDataState = state;
++        Q_EMIT mobileDataStateChanged();
++    }
++}
++
+ void CellularModem::setMobileDataEnabled(bool enabled)
+ {
+     // ensure that wwan is on
+--- a/libs/cellular/cellularmodem.h
++++ b/libs/cellular/cellularmodem.h
+@@ -54,6 +54,8 @@ class PLASMANM_CELLULAR_EXPORT CellularModem : public QObject
+     Q_PROPERTY(bool mobileDataEnabled READ mobileDataEnabled WRITE setMobileDataEnabled NOTIFY mobileDataEnabledChanged)
+     Q_PROPERTY(bool mobileDataSupported READ mobileDataSupported NOTIFY mobileDataSupportedChanged)
+     Q_PROPERTY(bool needsAPNAdded READ needsAPNAdded NOTIFY mobileDataEnabledChanged)
++    // state of the mobile data connection of the modem, see MobileDataState
++    Q_PROPERTY(MobileDataState mobileDataState READ mobileDataState NOTIFY mobileDataStateChanged)
+ 
+     Q_PROPERTY(int signalStrength READ signalStrength NOTIFY signalStrengthChanged)
+     // short name of the radio access technology in use as shown in status bars ("5G", "LTE", "H+", "H", "3G", "E",
+@@ -66,6 +68,16 @@ class PLASMANM_CELLULAR_EXPORT CellularModem : public QObject
+     Q_PROPERTY(QStringList errors READ errors NOTIFY errorsChanged)
+ 
+ public:
++    enum MobileDataState {
++        MobileDataDisconnected, // not connected and not being connected
++        MobileDataActivating,
++        MobileDataConnected,
++        // an activation failed; kept until the modem is connected or mobile data is disabled, also while
++        // NetworkManager retries the activation
++        MobileDataFailed,
++    };
++    Q_ENUM(MobileDataState)
++
+     CellularModem(QObject *parent = nullptr);
+     CellularModem(QObject *parent, ModemManager::ModemDevice::Ptr mmModem, ModemManager::Modem::Ptr mmInterface);
+ 
+@@ -81,6 +93,7 @@ public:
+     void setMobileDataEnabled(bool enabled);
+     bool mobileDataSupported() const;
+     bool needsAPNAdded() const;
++    MobileDataState mobileDataState() const;
+ 
+     bool hasSim() const;
+     bool simLocked() const;
+@@ -123,6 +136,7 @@ Q_SIGNALS:
+     void nmModemChanged();
+     void mobileDataEnabledChanged();
+     void mobileDataSupportedChanged();
++    void mobileDataStateChanged();
+     void simsChanged();
+     void simSlotChanged();
+     void hasSimChanged();
+@@ -137,6 +151,7 @@ Q_SIGNALS:
+ 
+ private:
+     void findNetworkManagerDevice();
++    void updateMobileDataState();
+     void loadSimSlot();
+     // name of the provider of a network (MCC and MNC) from the mobile broadband provider database
+     static QString networkProviderName(const QString &mccmnc);
+@@ -156,5 +171,7 @@ private:
+ 
+     QList<CellularSim *> m_sims;
+     int m_simSlot = 0;
++    MobileDataState m_mobileDataState = MobileDataDisconnected;
++    bool m_mobileDataFailed = false;
+     QStringList m_errors;
+ };
