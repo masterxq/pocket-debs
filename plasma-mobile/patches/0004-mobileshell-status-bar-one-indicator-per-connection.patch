@@ -13,26 +13,34 @@ Description:
  connected or connecting; the hotspot while it is active; the airplane
  icon in place of the signals in airplane mode. There is no generic
  internet icon and no busy indicator; wired and USB connections have no
- indicator.
+ indicator. The icons are the ones the connection icon of plasma-nm
+ names: network-mobile-<strength>-<type> with the letter of the network
+ type for the SIM with mobile data, network-wireless-<strength> for Wi-Fi,
+ with the -locked (VPN) and -limited (limited connectivity) variants on
+ the icon of the primary connection.
  .
- The SIM used for mobile data carries the network type (5G, LTE, H+, E,
- ...) left of its signal while mobile data is connected. While mobile data
- or Wi-Fi is being activated, the network type or the Wi-Fi icon pulses,
- after a minute in the negative color (still trying, not working yet).
- After a failed activation a red cross replaces the network type, or sits
- at the bottom right of the Wi-Fi icon, until the connection is up or the
- user disables and enables mobile data or Wi-Fi; retries of
- NetworkManager do not bring the pulsing back. Mobile data disabled, the
- SIM not used for mobile data, Wi-Fi disabled or not connecting: nothing.
+ While mobile data is being activated only the letter of the network type
+ pulses (the part of the icon with the letter, over the icon without
+ it); the Wi-Fi icon pulses as a whole. After a minute the pulsing part
+ turns to the negative color (still trying, not working yet). After a
+ failed activation a red cross of the size of the letter takes its place,
+ or sits at the bottom right of the Wi-Fi icon, until the connection is up
+ or the user disables and enables mobile data or Wi-Fi; retries of
+ NetworkManager do not bring the pulsing back. Without a known network
+ type three dots stand in the letter area; for EDGE, whose Breeze icons
+ have no letter, an E is drawn. Nothing changes its size between states.
  .
- Pulsing: opacity from invisible to visible, 1 s fade in (sine), 0.2 s
- visible, 1 s fade out, 0.2 s invisible, one phase for all indicators
- (IndicatorPulse); the space of the indicator stays reserved. The
- animation runs only while an indicator pulses and a screen is on (DPMS);
- with animations disabled the indicator is shown half transparent.
+ Pulsing: opacity from invisible to visible, 1 s fade in, 0.2 s visible,
+ 1 s fade out, 0.2 s invisible, sine easing, one phase for all indicators
+ (IndicatorPulse). The opacity changes in steps (8 per second during the
+ fades, none during the holds) instead of an animation at the frame rate,
+ so the status bar is redrawn about 7 times per second while something
+ pulses. The pulse runs only while a screen is on (DPMS); with animations
+ disabled the pulsing part is shown half transparent.
  .
  Needs the plasma-nm libraries with WirelessStatus.wifiState/
- wifiSignalStrength and CellularModem.mobileDataState/networkType.
+ wifiSignalStrength, ConnectionIcon.vpn/limited and
+ CellularModem.mobileDataState.
 Forwarded: no
 License: GPL-2.0-or-later, LGPL-2.0-or-later (as the patched files; new files GPL-2.0-or-later)
 Last-Update: 2026-11-26
@@ -52,10 +60,10 @@ Last-Update: 2026-11-26
      qml/statusbar/indicators/BatteryIndicator.qml
      qml/statusbar/indicators/BluetoothIndicator.qml
 -    qml/statusbar/indicators/InternetIndicator.qml
-+    qml/statusbar/indicators/FailureMark.qml
 +    qml/statusbar/indicators/HotspotIndicator.qml
 +    qml/statusbar/indicators/IndicatorPulse.qml
      qml/statusbar/indicators/SignalStrengthIndicator.qml
++    qml/statusbar/indicators/StatusGlyph.qml
      qml/statusbar/indicators/VolumeIndicator.qml
 +    qml/statusbar/indicators/WifiIndicator.qml
      qml/statusbar/ClockText.qml
@@ -63,7 +71,7 @@ Last-Update: 2026-11-26
  
 --- a/components/mobileshell/qml/dataproviders/NetworkInfo.qml
 +++ b/components/mobileshell/qml/dataproviders/NetworkInfo.qml
-@@ -8,8 +8,34 @@ import QtQuick
+@@ -8,8 +8,42 @@ import QtQuick
  import org.kde.plasma.networkmanagement as PlasmaNM
  
  QtObject {
@@ -76,6 +84,14 @@ Last-Update: 2026-11-26
 -}
 \ No newline at end of file
 +
++    readonly property PlasmaNM.NetworkStatus networkStatus: PlasmaNM.NetworkStatus {}
++    readonly property PlasmaNM.ConnectionIcon connectionIcon: PlasmaNM.ConnectionIcon {
++        connectivity: root.networkStatus.connectivity
++    }
++    // icon name suffix for the primary connection, as plasma-nm adds it: a VPN is active, or the connectivity is limited
++    readonly property string iconSuffix: connectionIcon.vpn ? "-locked" : (connectionIcon.limited ? "-limited" : "")
++
++    readonly property bool wifiConnected: wirelessStatus.wifiState === PlasmaNM.WirelessStatus.WifiConnected
 +    readonly property bool wifiActivating: wirelessStatus.wifiState === PlasmaNM.WirelessStatus.WifiActivating
 +    // whether the Wi-Fi connection has been activating for a minute or longer
 +    readonly property bool wifiActivatingLong: _wifiActivatingLong
@@ -176,24 +192,15 @@ Last-Update: 2026-11-26
  }
 --- a/components/mobileshell/qml/statusbar/StatusBar.qml
 +++ b/components/mobileshell/qml/statusbar/StatusBar.qml
-@@ -111,6 +111,7 @@ Item {
-                     showLabel: true
-                     visible: !root.showTime
-                     textPixelSize: root.textPixelSize
-+                    networkTypePixelSize: root.smallerTextPixelSize
-                 }
- 
-                 // spacing in the middle
-@@ -130,7 +131,7 @@ Item {
+@@ -130,7 +130,6 @@ Item {
                      MobileShell.SignalStrengthIndicator {
                          showLabel: false
                          visible: root.showTime
 -                        internetIndicator: internetIndicatorItem
-+                        networkTypePixelSize: root.smallerTextPixelSize
                          implicitHeight: mainRow.rowHeight
                          Layout.preferredWidth: implicitWidth
                      }
-@@ -138,12 +139,13 @@ Item {
+@@ -138,12 +137,13 @@ Item {
                          implicitHeight: mainRow.rowHeight
                          Layout.preferredWidth: height
                      }
@@ -211,40 +218,6 @@ Last-Update: 2026-11-26
                      }
                      MobileShell.VolumeIndicator {
                          implicitHeight: mainRow.rowHeight
---- /dev/null
-+++ b/components/mobileshell/qml/statusbar/indicators/FailureMark.qml
-@@ -0,0 +1,31 @@
-+// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
-+// SPDX-License-Identifier: GPL-2.0-or-later
-+
-+import QtQuick
-+
-+import org.kde.kirigami as Kirigami
-+
-+/**
-+ * Red cross of a status bar indicator whose connection failed.
-+ */
-+Item {
-+    id: root
-+
-+    readonly property real lineWidth: Math.max(1.5, Math.min(width, height) * 0.18)
-+
-+    Repeater {
-+        model: [45, -45]
-+
-+        delegate: Rectangle {
-+            required property int modelData
-+
-+            anchors.centerIn: parent
-+            width: Math.min(root.width, root.height) * 1.25
-+            height: root.lineWidth
-+            radius: height / 2
-+            rotation: modelData
-+            antialiasing: true
-+            color: Kirigami.Theme.negativeTextColor
-+        }
-+    }
-+}
 --- /dev/null
 +++ b/components/mobileshell/qml/statusbar/indicators/HotspotIndicator.qml
 @@ -0,0 +1,15 @@
@@ -265,7 +238,7 @@ Last-Update: 2026-11-26
 +}
 --- /dev/null
 +++ b/components/mobileshell/qml/statusbar/indicators/IndicatorPulse.qml
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,98 @@
 +// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -280,17 +253,23 @@ Last-Update: 2026-11-26
 +/**
 + * Opacity of the status bar indicators of connections that are being activated.
 + *
-+ * All of them pulse in the same phase: 1 s fade in, 0.2 s visible, 1 s fade out, 0.2 s invisible. The animation
-+ * runs only while an indicator pulses and a screen is on. With animations disabled the indicators are shown half
-+ * transparent instead.
++ * All of them pulse in the same phase over 2.4 s: 1 s fade in, 0.2 s visible, 1 s fade out, 0.2 s invisible, with
++ * sine easing. The opacity changes in steps (stepsPerSecond during the fades, none during the holds), so the status
++ * bar is redrawn a few times per second instead of at the frame rate. The pulse runs only while an indicator pulses
++ * and a screen is on. With animations disabled the indicators are shown half transparent instead.
 + */
 +QtObject {
 +    id: root
 +
++    // opacity steps per second during the fades
++    readonly property int stepsPerSecond: 8
++
 +    readonly property bool animated: Kirigami.Units.longDuration > 0
 +    readonly property real opacity: animated ? _value : 0.5
++    readonly property bool pulsing: animated && _needed && _screenOn
 +
 +    property real _value: 0
++    property double _start: 0
 +
 +    readonly property bool _needed: MobileShell.SignalStrengthInfo.mobileDataActivating || MobileShell.NetworkInfo.wifiActivating
 +
@@ -311,31 +290,50 @@ Last-Update: 2026-11-26
 +        }
 +    }
 +
-+    property SequentialAnimation _animation: SequentialAnimation {
-+        running: root.animated && root._needed && root._screenOn
-+        loops: Animation.Infinite
++    property Timer _timer: Timer {
++        repeat: false
++        onTriggered: root._step()
++    }
 +
-+        NumberAnimation {
-+            target: root
-+            property: "_value"
-+            from: 0
-+            to: 1
-+            duration: 1000
-+            easing.type: Easing.InOutSine
++    // sine ease in and out, t from 0 to 1
++    function _ease(t) {
++        return (1 - Math.cos(Math.PI * t)) / 2;
++    }
++
++    // sets the opacity for the current time and schedules the next step: the next fade step, or the end of a hold
++    function _step() {
++        const phase = (Date.now() - _start) % 2400;
++        const stepInterval = Math.round(1000 / stepsPerSecond);
++        let next;
++        if (phase < 1000) {
++            _value = _ease(phase / 1000);
++            next = Math.min(stepInterval, 1000 - phase);
++        } else if (phase < 1200) {
++            _value = 1;
++            next = 1200 - phase;
++        } else if (phase < 2200) {
++            _value = 1 - _ease((phase - 1200) / 1000);
++            next = Math.min(stepInterval, 2200 - phase);
++        } else {
++            _value = 0;
++            next = 2400 - phase;
 +        }
-+        PauseAnimation {
-+            duration: 200
++        _timer.interval = Math.max(1, next);
++        _timer.restart();
++    }
++
++    onPulsingChanged: {
++        if (pulsing) {
++            _start = Date.now();
++            _step();
++        } else {
++            _timer.stop();
 +        }
-+        NumberAnimation {
-+            target: root
-+            property: "_value"
-+            from: 1
-+            to: 0
-+            duration: 1000
-+            easing.type: Easing.InOutSine
-+        }
-+        PauseAnimation {
-+            duration: 200
++    }
++    Component.onCompleted: {
++        if (pulsing) {
++            _start = Date.now();
++            _step();
 +        }
 +    }
 +}
@@ -390,7 +388,7 @@ Last-Update: 2026-11-26
 -}
 --- a/components/mobileshell/qml/statusbar/indicators/SignalStrengthIndicator.qml
 +++ b/components/mobileshell/qml/statusbar/indicators/SignalStrengthIndicator.qml
-@@ -11,21 +11,20 @@ import QtQuick.Layouts
+@@ -11,19 +11,18 @@ import QtQuick.Layouts
  import org.kde.plasma.core as PlasmaCore
  import org.kde.plasma.components 3.0 as PlasmaComponents
  import org.kde.kirigami as Kirigami
@@ -398,9 +396,10 @@ Last-Update: 2026-11-26
  import org.kde.plasma.private.mobileshell as MobileShell
  
 +/**
-+ * The signal of every SIM. The SIM used for mobile data carries the network type while mobile data is connected,
-+ * the network type pulsing while it is activated (in the negative color after a minute), a red cross when an
-+ * activation failed. In airplane mode the airplane icon replaces the signals.
++ * The signal of every SIM. The SIM used for mobile data shows the letter of its network type in its icon
++ * (network-mobile-<strength>-<type>) while mobile data is connected; while it is activated the letter pulses (in the
++ * negative color after a minute), after a failed activation a red cross takes its place. In airplane mode the
++ * airplane icon replaces the signals.
 + */
  Item {
      id: root
@@ -415,11 +414,8 @@ Last-Update: 2026-11-26
 -
      property bool showLabel: true
      property real textPixelSize: Kirigami.Units.gridUnit * 0.6
-+    property real networkTypePixelSize: textPixelSize
  
-     // the row takes the implicit width of each visible item, no width is bound to an implicit width
-     implicitWidth: row.width
-@@ -39,26 +38,59 @@ Item {
+@@ -39,26 +38,79 @@ Item {
          spacing: Kirigami.Units.smallSpacing
  
          Kirigami.Icon {
@@ -440,7 +436,7 @@ Last-Update: 2026-11-26
 -            model: root.severalSims ? MobileShell.SignalStrengthInfo.modems : []
 +            model: MobileShell.SignalStrengthInfo.airplaneMode ? [] : MobileShell.SignalStrengthInfo.modems
 +
-+            delegate: Row {
++            delegate: Item {
 +                id: sim
 +
 +                required property Cellular.CellularModem modelData
@@ -449,51 +445,131 @@ Last-Update: 2026-11-26
 -                required property var modelData
 +                readonly property int mobileDataState: modelData === MobileShell.SignalStrengthInfo.dataModem
 +                    ? MobileShell.SignalStrengthInfo.mobileDataState : Cellular.CellularModem.MobileDataDisconnected
++                readonly property bool connected: mobileDataState === Cellular.CellularModem.MobileDataConnected
 +                readonly property bool activating: mobileDataState === Cellular.CellularModem.MobileDataActivating
 +                readonly property bool failed: mobileDataState === Cellular.CellularModem.MobileDataFailed
++                readonly property bool negative: activating && MobileShell.SignalStrengthInfo.mobileDataActivatingLong
++
++                readonly property string strengthIcon: "network-mobile-" + Math.floor(modelData.signalStrength / 20) * 20
++                // the Breeze EDGE icons have no letter: an E is drawn instead
++                readonly property bool ownLetter: modelData.networkType === "edge"
++                readonly property string typeIcon: modelData.networkType !== "" && !ownLetter ? strengthIcon + "-" + modelData.networkType : ""
++                // a VPN or limited connectivity is shown on the icon of the primary connection
++                readonly property string suffix: connected && !MobileShell.NetworkInfo.wifiConnected ? MobileShell.NetworkInfo.iconSuffix : ""
  
--                width: height
+                 width: height
                  height: row.height
 -                source: modelData.icon
-+                spacing: Math.round(Kirigami.Units.smallSpacing / 2)
-+
-+                // network type, or the failure; the space stays the same while the network type pulses
-+                Item {
-+                    anchors.verticalCenter: parent.verticalCenter
-+                    width: sim.failed ? failureMark.width : networkType.implicitWidth
-+                    height: sim.failed ? failureMark.height : networkType.implicitHeight
-+                    visible: sim.mobileDataState !== Cellular.CellularModem.MobileDataDisconnected
-+
-+                    PlasmaComponents.Label {
-+                        id: networkType
-+                        visible: !sim.failed
-+                        // no network type is known while the modem is not registered
-+                        text: sim.modelData.networkType !== "" ? sim.modelData.networkType : "…"
-+                        color: sim.activating && MobileShell.SignalStrengthInfo.mobileDataActivatingLong ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
-+                        opacity: sim.activating ? MobileShell.IndicatorPulse.opacity : 1
-+                        font.pixelSize: root.networkTypePixelSize
-+                        font.weight: Font.DemiBold
-+                    }
-+
-+                    FailureMark {
-+                        id: failureMark
-+                        visible: sim.failed
-+                        width: Math.round(root.networkTypePixelSize)
-+                        height: width
-+                    }
-+                }
 +
 +                Kirigami.Icon {
-+                    width: height
-+                    height: row.height
-+                    source: "network-mobile-" + Math.floor(sim.modelData.signalStrength / 20) * 20
++                    id: signalIcon
++                    anchors.fill: parent
++                    source: (sim.connected && sim.typeIcon !== "" ? sim.typeIcon : sim.strengthIcon) + sim.suffix
++                }
++
++                // the letter area of the network-mobile icons (22 × 22 grid: x up to 13.5, y up to 8.5), over the
++                // icon without letter; the space never changes
++                Item {
++                    id: letterArea
++
++                    readonly property real paintedSize: signalIcon.paintedWidth > 0 ? Math.min(signalIcon.paintedWidth, signalIcon.paintedHeight) : Math.min(sim.width, sim.height)
++                    readonly property real unit: paintedSize / 22
++
++                    x: (sim.width - paintedSize) / 2
++                    y: (sim.height - paintedSize) / 2
++                    width: 13.5 * unit
++                    height: 8.5 * unit
++                    clip: true
++                    visible: sim.activating || sim.failed || (sim.connected && sim.ownLetter)
++                    opacity: sim.activating ? MobileShell.IndicatorPulse.opacity : 1
++
++                    // the letter of the Breeze icon with the network type
++                    Kirigami.Icon {
++                        x: -letterArea.x
++                        y: -letterArea.y
++                        width: signalIcon.width
++                        height: signalIcon.height
++                        visible: !sim.failed && sim.typeIcon !== ""
++                        source: sim.typeIcon
++                        color: sim.negative ? Kirigami.Theme.negativeTextColor : "transparent"
++                    }
++
++                    // E for EDGE, dots while no network type is known, the cross after a failure
++                    StatusGlyph {
++                        width: letterArea.paintedSize
++                        height: letterArea.paintedSize
++                        visible: sim.failed || sim.typeIcon === ""
++                        glyph: sim.failed ? "cross" : (sim.ownLetter ? "e" : "dots")
++                        color: sim.failed || sim.negative ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
++                    }
 +                }
              }
          }
  
 --- /dev/null
++++ b/components/mobileshell/qml/statusbar/indicators/StatusGlyph.qml
+@@ -0,0 +1,58 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++import QtQuick
++
++import org.kde.kirigami as Kirigami
++
++/**
++ * A glyph in the 22 × 22 grid of the Breeze status icons, drawn with strokes of one grid unit like the network type
++ * letters of the network-mobile icons: "e" (the letter E), "dots" (three dots on the base line) or "cross", in the
++ * 5 × 5 box whose top left corner is (boxX, boxY). The item covers the painted area of the icon.
++ */
++Item {
++    id: root
++
++    property string glyph
++    property real boxX: 3
++    property real boxY: 3
++    property color color: Kirigami.Theme.textColor
++
++    readonly property real unit: Math.min(width, height) / 22
++
++    component Stroke: Rectangle {
++        property real gridX
++        property real gridY
++        property real gridWidth: 1
++        property real gridHeight: 1
++
++        x: (root.boxX + gridX) * root.unit
++        y: (root.boxY + gridY) * root.unit
++        width: gridWidth * root.unit
++        height: gridHeight * root.unit
++        color: root.color
++        antialiasing: true
++    }
++
++    Stroke { visible: root.glyph === "e"; gridX: 0; gridY: 0; gridHeight: 5 }
++    Stroke { visible: root.glyph === "e"; gridX: 0; gridY: 0; gridWidth: 4 }
++    Stroke { visible: root.glyph === "e"; gridX: 0; gridY: 2; gridWidth: 3 }
++    Stroke { visible: root.glyph === "e"; gridX: 0; gridY: 4; gridWidth: 4 }
++
++    Stroke { visible: root.glyph === "dots"; gridX: 0; gridY: 4 }
++    Stroke { visible: root.glyph === "dots"; gridX: 2; gridY: 4 }
++    Stroke { visible: root.glyph === "dots"; gridX: 4; gridY: 4 }
++
++    Repeater {
++        model: root.glyph === "cross" ? [45, -45] : []
++
++        delegate: Stroke {
++            required property int modelData
++
++            gridX: 2.5 - gridWidth / 2
++            gridY: 2
++            gridWidth: 6
++            rotation: modelData
++        }
++    }
++}
+--- /dev/null
 +++ b/components/mobileshell/qml/statusbar/indicators/WifiIndicator.qml
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,52 @@
 +// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -504,18 +580,21 @@ Last-Update: 2026-11-26
 +import org.kde.plasma.private.mobileshell as MobileShell
 +
 +/**
-+ * Wi-Fi client connection: the signal strength while connected, pulsing while it is activated (in the negative
-+ * color after a minute), a red cross when an activation failed. Hidden while Wi-Fi is off or not connecting.
++ * Wi-Fi client connection: the icon of the signal strength while connected (with the VPN or limited connectivity
++ * variant as for the primary connection), pulsing while it is activated (in the negative color after a minute), with
++ * a red cross at the bottom right when an activation failed. Hidden while Wi-Fi is off or not connecting.
 + */
 +Item {
 +    id: root
 +
 +    readonly property var wirelessStatus: MobileShell.NetworkInfo.wirelessStatus
++    readonly property bool connected: wirelessStatus.wifiState === PlasmaNM.WirelessStatus.WifiConnected
 +    readonly property bool activating: wirelessStatus.wifiState === PlasmaNM.WirelessStatus.WifiActivating
 +    readonly property bool failed: wirelessStatus.wifiState === PlasmaNM.WirelessStatus.WifiFailed
 +
 +    visible: wirelessStatus.wifiState !== PlasmaNM.WirelessStatus.WifiDisconnected
 +
++    // as the connection icon of plasma-nm names them
 +    function strengthIcon(strength) {
 +        if (strength <= 0) {
 +            return "network-wireless-0";
@@ -524,17 +603,22 @@ Last-Update: 2026-11-26
 +    }
 +
 +    Kirigami.Icon {
++        id: icon
 +        anchors.fill: parent
-+        source: root.failed ? "network-wireless-0" : root.strengthIcon(root.wirelessStatus.wifiSignalStrength)
++        source: root.failed ? "network-wireless-0"
++            : root.strengthIcon(root.wirelessStatus.wifiSignalStrength) + (root.connected ? MobileShell.NetworkInfo.iconSuffix : "")
 +        color: root.activating && MobileShell.NetworkInfo.wifiActivatingLong ? Kirigami.Theme.negativeTextColor : "transparent"
 +        opacity: root.activating ? MobileShell.IndicatorPulse.opacity : 1
 +    }
 +
-+    FailureMark {
-+        anchors.right: parent.right
-+        anchors.bottom: parent.bottom
-+        width: Math.round(parent.width * 0.45)
-+        height: width
++    StatusGlyph {
++        anchors.centerIn: icon
++        width: icon.paintedWidth > 0 ? icon.paintedWidth : icon.width
++        height: icon.paintedHeight > 0 ? icon.paintedHeight : icon.height
 +        visible: root.failed
++        glyph: "cross"
++        boxX: 15
++        boxY: 15
++        color: Kirigami.Theme.negativeTextColor
 +    }
 +}
