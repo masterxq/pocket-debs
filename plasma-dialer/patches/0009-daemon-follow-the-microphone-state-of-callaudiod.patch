@@ -1,31 +1,29 @@
 From: pocket-debs <masterxq@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 12:00:00 +0100
-Subject: [PATCH] daemon: follow the microphone state of callaudiod, unmute at the start of a call
+Subject: [PATCH] daemon: follow the microphone and speaker state of callaudiod
 Description:
  At startup the daemon read MicState and SpeakerState of callaudiod once and
  stored them through DialerUtils::setMute()/setSpeakerMode(), which emit the
  change signals that the daemon also takes as requests from clients: the
- state read was sent back to callaudiod as a mute request. callaudiod is
- started by D-Bus activation at that moment and publishes 0 =
- CALL_AUDIO_MIC_OFF until it has seen the card, so the microphone was muted
- at every login. The members behind both properties were not initialised
- either. WirePlumber stores the muted route of the microphone and restores
- it in the next call: the other side heard nothing, while the call screen
- showed the microphone as on or off at random.
+ state read was sent back to callaudiod as a request. callaudiod is started
+ by D-Bus activation at that moment and may still publish 0 =
+ CALL_AUDIO_MIC_OFF, so the microphone was muted at login. The members behind
+ both properties were not initialised either. WirePlumber stores the muted
+ microphone route and restores it in the next call: the other side heard
+ nothing, while the call screen showed the microphone as on or off at random.
  .
- State read from callaudiod is now shown without being sent back, states
+ State read from callaudiod is now only shown, never sent back, states
  callaudiod does not know yet are ignored, and the daemon follows the
- PropertiesChanged signal of callaudiod instead of reading once. As on other
- phone systems the microphone is muted per call: the first call that becomes
- active starts with the microphone on, and a microphone muted in a call is
- unmuted when the last call ends.
+ PropertiesChanged signal of callaudiod instead of reading once, so the call
+ screen shows the microphone as it is. Requests still come only from clients;
+ resetting the microphone after a call stays with callaudiod (mode switch).
 Forwarded: no
 License: LGPL-2.1-or-later (as the patched files)
 Last-Update: 2026-11-26
 ---
 --- a/kde-telephony-daemon/src/dialer-manager.cpp
 +++ b/kde-telephony-daemon/src/dialer-manager.cpp
-@@ -93,10 +93,64 @@ void DialerManager::setDialerUtils(DialerUtils *dialerUtils)
+@@ -93,10 +93,56 @@ void DialerManager::setDialerUtils(DialerUtils *dialerUtils)
      connect(m_dialerUtils, &DialerUtils::muteRequested, this, &DialerManager::onUtilsMuteRequested);
      connect(m_dialerUtils, &DialerUtils::speakerModeRequested, this, &DialerManager::onUtilsSpeakerModeRequested);
  
@@ -57,14 +55,6 @@ Last-Update: 2026-11-26
 +    m_syncingState = false;
 +}
 +
-+// The microphone is muted per call: a call starts with the microphone on,
-+// whatever state a previous call or another application left behind.
-+void DialerManager::unmuteForCall()
-+{
-+    showMute(false);
-+    mute_mic(false);
-+}
-+
 +void DialerManager::onCallAudioPropertiesChanged(const QString &interface, const QVariantMap &changed, const QStringList &invalidated)
 +{
 +    Q_UNUSED(invalidated);
@@ -90,32 +80,7 @@ Last-Update: 2026-11-26
  void DialerManager::onUtilsCallAdded(const QString &deviceUni,
                                       const QString &callUni,
                                       const DialerTypes::CallDirection &callDirection,
-@@ -119,8 +173,14 @@ void DialerManager::onUtilsCallAdded(const QString &deviceUni,
- 
- void DialerManager::onUtilsCallsChanged(const DialerTypes::CallDataVector &calls)
- {
-+    const bool hadCalls = m_hasCalls;
-+    m_hasCalls = !calls.isEmpty();
-     if (calls.isEmpty()) {
-         unpauseMedia();
-+        // do not leave the microphone muted for other applications
-+        if (hadCalls && m_dialerUtils->mute()) {
-+            unmuteForCall();
-+        }
-     }
- }
- 
-@@ -132,6 +192,9 @@ void DialerManager::onUtilsCallStateChanged(const DialerTypes::CallData &callDat
-     qDebug() << Q_FUNC_INFO << "new call state:" << callData.state;
-     switch (callData.state) {
-     case DialerTypes::CallState::Active:
-+        if (!m_needsDefaultAudioMode) {
-+            unmuteForCall();
-+        }
-         enable_call_mode();
-         m_needsDefaultAudioMode = true;
-         break;
-@@ -153,8 +216,10 @@ void DialerManager::onUtilsSpeakerModeRequested()
+@@ -153,8 +199,10 @@ void DialerManager::onUtilsSpeakerModeRequested()
      qWarning() << "callaudio version is not supported";
      return;
  #else // LOWER_LIBCALLAUDIO_VERSION
@@ -128,7 +93,7 @@ Last-Update: 2026-11-26
  #endif // LOWER_LIBCALLAUDIO_VERSION
  }
  
-@@ -164,18 +229,26 @@ void DialerManager::onUtilsMuteRequested()
+@@ -164,18 +212,26 @@ void DialerManager::onUtilsMuteRequested()
      qWarning() << "callaudio version is not supported";
      return;
  #else // LOWER_LIBCALLAUDIO_VERSION
@@ -159,7 +124,7 @@ Last-Update: 2026-11-26
  
 --- a/kde-telephony-daemon/src/dialer-manager.h
 +++ b/kde-telephony-daemon/src/dialer-manager.h
-@@ -35,16 +35,23 @@ private Q_SLOTS:
+@@ -35,16 +35,21 @@ private Q_SLOTS:
      void onUtilsSpeakerModeChanged(bool enabled);
      void onUtilsMuteRequested();
      void onUtilsSpeakerModeRequested();
@@ -170,7 +135,6 @@ Last-Update: 2026-11-26
      void unpauseMedia();
 +    void showMute(bool muted);
 +    void showSpeakerMode(bool enabled);
-+    void unmuteForCall();
  
      org::kde::telephony::CallUtils *m_callUtils;
      DialerUtils *m_dialerUtils;
@@ -179,7 +143,6 @@ Last-Update: 2026-11-26
      bool m_needsDefaultAudioMode;
 +    // the state shown by DialerUtils comes from callaudiod, not from a client
 +    bool m_syncingState = false;
-+    bool m_hasCalls = false;
  };
  
  #endif // CALL_MANAGER_H
