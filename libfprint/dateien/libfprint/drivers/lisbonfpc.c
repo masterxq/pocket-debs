@@ -506,6 +506,23 @@ lisbonfpc_cancel (FpDevice *device)
     send (self->fd, "CANCEL", 6, MSG_NOSIGNAL);
 }
 
+/*
+ * System sleep does not interrupt a running operation: the secure world keeps waiting for a finger and the kernel
+ * driver of the sensor wakes the system on a touch while an identification runs. The operation continues after
+ * resume, so a lock screen that waits for a finger can be woken and unlocked with one touch.
+ */
+static void
+lisbonfpc_suspend (FpDevice *device)
+{
+  fpi_device_suspend_complete (device, NULL);
+}
+
+static void
+lisbonfpc_resume (FpDevice *device)
+{
+  fpi_device_resume_complete (device, NULL);
+}
+
 static void
 fpi_device_lisbonfpc_init (FpiDeviceLisbonFpc *self)
 {
@@ -536,6 +553,8 @@ fpi_device_lisbonfpc_class_init (FpiDeviceLisbonFpcClass *klass)
   dev_class->delete = lisbonfpc_delete;
   dev_class->clear_storage = lisbonfpc_clear_storage;
   dev_class->cancel = lisbonfpc_cancel;
+  dev_class->suspend = lisbonfpc_suspend;
+  dev_class->resume = lisbonfpc_resume;
 
   fpi_device_class_auto_initialize_features (dev_class);
 }

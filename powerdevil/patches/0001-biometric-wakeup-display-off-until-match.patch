@@ -1,0 +1,183 @@
+Description: Biometric wakeups leave the display off until a match
+ A device can declare the kind of its wakeups in the udev property
+ POWERDEVIL_WAKEUP_TYPE (timer, powermanagement, network, telephony or
+ biometric). Such a device counts as wakeup source when its event count rose
+ during the sleep cycle: the wakeup count only counts while user space uses
+ /sys/power/wakeup_count, which systemd does not do, so the detection of the
+ wakeup source never matched.
+ .
+ After a wakeup by a biometric sensor the display stays off and the device
+ goes back to sleep after 5 s without user input; the screen locker asks for
+ a full wakeup on a match. A full wakeup (org.kde.Solid.PowerManagement.wakeup)
+ now ends the wait for user input after any wakeup that left the display off
+ and starts the usual display idle time; before, the device went back to sleep
+ after the idle time even though the consumer had turned the display on, and
+ the display then stayed on without idle timeout.
+Author: pocket-debs
+Forwarded: no
+License: GPL-2.0-or-later
+---
+diff -ruN a/daemon/actions/bundled/dpms.cpp b/daemon/actions/bundled/dpms.cpp
+--- a/daemon/actions/bundled/dpms.cpp	2026-08-04 11:28:49.000000000 +0200
++++ b/daemon/actions/bundled/dpms.cpp	2026-11-26 10:12:31.976082017 +0100
+@@ -274,6 +274,9 @@
+     } else if (wakeupType & SuspendController::WakeupSource::Network) {
+         qCDebug(POWERDEVIL) << "Wakeup was from network source, not turning on display, consumer will turn on if required";
+         return;
++    } else if (wakeupType & SuspendController::WakeupSource::Biometric) {
++        qCDebug(POWERDEVIL) << "Wakeup was from a biometric sensor, not turning on display, the screen locker turns it on on a match";
++        return;
+     }
+     m_dpms->switchMode(KScreen::Dpms::On);
+     registerStandardIdleTimeout();
+diff -ruN a/daemon/actions/bundled/handlebuttonevents.cpp b/daemon/actions/bundled/handlebuttonevents.cpp
+--- a/daemon/actions/bundled/handlebuttonevents.cpp	2026-08-04 11:28:49.000000000 +0200
++++ b/daemon/actions/bundled/handlebuttonevents.cpp	2026-11-26 10:12:57.990191310 +0100
+@@ -30,6 +30,8 @@
+ using namespace std::chrono_literals;
+ 
+ static constexpr std::chrono::milliseconds s_minIdleTimeWithWakeups = 30s;
++// a touch on a biometric sensor is answered within a second; without a match the device goes back to sleep soon
++static constexpr std::chrono::milliseconds s_minIdleTimeWithBiometricWakeup = 5s;
+ 
+ namespace PowerDevil::BundledActions
+ {
+@@ -41,6 +43,11 @@
+     // We enforce no policies here - after all, we just call other actions - which have their policies.
+     setRequiredPolicies(PowerDevil::PolicyAgent::None);
+     connect(core()->lidController(), &LidController::lidClosedChanged, this, &HandleButtonEvents::onLidClosedChanged);
++    // a full wakeup ends the wait for user input after a wakeup that left the display off: without it the device
++    // went back to sleep after the idle time even though the consumer of the wakeup had turned the display on
++    connect(core(), &Core::fullWakeupRequested, this, [this] {
++        unregisterIdleTimeouts();
++    });
+ 
+     KActionCollection *actionCollection = new KActionCollection(this);
+     actionCollection->setComponentDisplayName(i18nc("Name for powerdevil shortcuts category", "Power Management"));
+@@ -127,7 +134,7 @@
+ 
+ void HandleButtonEvents::onIdleTimeout(std::chrono::milliseconds timeout)
+ {
+-    if (timeout == s_minIdleTimeWithWakeups) {
++    if (timeout == s_minIdleTimeWithWakeups || timeout == s_minIdleTimeWithBiometricWakeup) {
+         qCDebug(POWERDEVIL) << "HandleButtonEvents going back to suspend on timeout";
+         processAction(m_sleepButtonAction);
+     }
+@@ -278,6 +285,13 @@
+ {
+     // We start with type of resume, if we find we don't like we ask it to suspend directly.
+     const auto wakeupType = core()->suspendController()->lastWakeupType();
++    if (wakeupType == SuspendController::WakeupSources(SuspendController::WakeupSource::Biometric)) {
++        qCDebug(POWERDEVIL) << "HandleButtonEvents wakeupType" << wakeupType << "waiting for a match or user input now";
++        // the screen locker asks for a full wakeup (org.kde.Solid.PowerManagement.wakeup) on a match
++        registerIdleTimeout(s_minIdleTimeWithBiometricWakeup);
++        registerIdleTimeout(1s);
++        return;
++    }
+     if (wakeupType & SuspendController::WakeupSource::Network || wakeupType & SuspendController::WakeupSource::Telephony
+         || wakeupType & SuspendController::WakeupSource::Timer) {
+         qCDebug(POWERDEVIL) << "HandleButtonEvents wakeupType" << wakeupType << "waiting for user input now";
+diff -ruN a/daemon/controllers/suspendcontroller.cpp b/daemon/controllers/suspendcontroller.cpp
+--- a/daemon/controllers/suspendcontroller.cpp	2026-08-04 11:28:49.000000000 +0200
++++ b/daemon/controllers/suspendcontroller.cpp	2026-11-26 10:12:31.976048925 +0100
+@@ -124,6 +124,7 @@
+     // clear out previously recorded values
+     if (active) {
+         m_wakeupCounts.clear();
++        m_eventCounts.clear();
+     } else {
+         m_lastWakeupSources.clear();
+     }
+@@ -149,13 +150,27 @@
+             count = countFile.readAll().trimmed().toInt();
+         }
+ 
++        // read event count: wakeup_count only counts while user space uses /sys/power/wakeup_count, which
++        // systemd does not do. A device that declares its wakeup type in udev (POWERDEVIL_WAKEUP_TYPE) reports
++        // wakeup events only for wakeups, so any event of it during the sleep cycle counts.
++        QFile eventCountFile(wakeupDir.absoluteFilePath(u"event_count"_s));
++        int eventCount = 0;
++        if (eventCountFile.open(QIODevice::ReadOnly)) {
++            eventCount = eventCountFile.readAll().trimmed().toInt();
++        }
++
+         // if the count after waking up is higher than before waking up,
+         // then this wakeup source is responsible for the wakeup
+         if (active) {
+             m_wakeupCounts.insert(name, count);
++            m_eventCounts.insert(name, eventCount);
+         } else {
++            const QString devicePath = wakeupDir.absoluteFilePath(u"device"_s);
+             if (m_wakeupCounts.value(name, 0) < count) {
+-                m_lastWakeupSources << wakeupDir.absoluteFilePath(u"device"_s);
++                m_lastWakeupSources << devicePath;
++            } else if (m_eventCounts.contains(name) && m_eventCounts.value(name) < eventCount
++                       && !m_udevClient->deviceBySysfsPath(devicePath).deviceProperty(u"POWERDEVIL_WAKEUP_TYPE"_s).toString().isEmpty()) {
++                m_lastWakeupSources << devicePath;
+             }
+         }
+     }
+@@ -171,7 +186,18 @@
+     WakeupSources sources = WakeupSource::UnknownSource;
+     for (const QString &wakeupDevice : m_lastWakeupSources) {
+         UdevQt::Device device = m_udevClient->deviceBySysfsPath(wakeupDevice);
+-        if (device.subsystem() == u"power_supply"_s) {
++        const QString declaredType = device.deviceProperty(u"POWERDEVIL_WAKEUP_TYPE"_s).toString();
++        if (declaredType == u"timer"_s) {
++            sources |= WakeupSource::Timer;
++        } else if (declaredType == u"powermanagement"_s) {
++            sources |= WakeupSource::PowerManagement;
++        } else if (declaredType == u"network"_s) {
++            sources |= WakeupSource::Network;
++        } else if (declaredType == u"telephony"_s) {
++            sources |= WakeupSource::Telephony;
++        } else if (declaredType == u"biometric"_s) {
++            sources |= WakeupSource::Biometric;
++        } else if (device.subsystem() == u"power_supply"_s) {
+             sources |= WakeupSource::PowerManagement;
+         } else if (device.subsystem() == u"rpmsg"_s) {
+             sources |= WakeupSource::Telephony;
+diff -ruN a/daemon/controllers/suspendcontroller.h b/daemon/controllers/suspendcontroller.h
+--- a/daemon/controllers/suspendcontroller.h	2026-08-04 11:28:49.000000000 +0200
++++ b/daemon/controllers/suspendcontroller.h	2026-11-26 10:12:31.975948414 +0100
+@@ -34,6 +34,7 @@
+         PowerManagement = 2,
+         Network = 4,
+         Telephony = 8,
++        Biometric = 16,
+     };
+     Q_ENUM(WakeupSource)
+ 
+@@ -81,6 +82,7 @@
+     void snapshotWakeupCounts(bool active);
+ #endif
+     QHash<QString, int> m_wakeupCounts;
++    QHash<QString, int> m_eventCounts;
+     QStringList m_lastWakeupSources;
+     UdevQt::Client *m_udevClient;
+ };
+diff -ruN a/daemon/powerdevilcore.cpp b/daemon/powerdevilcore.cpp
+--- a/daemon/powerdevilcore.cpp	2026-11-26 10:12:01.175868707 +0100
++++ b/daemon/powerdevilcore.cpp	2026-11-26 10:12:57.990154380 +0100
+@@ -1156,6 +1156,7 @@
+ 
+ void Core::wakeup()
+ {
++    Q_EMIT fullWakeupRequested();
+     onResumingFromIdle();
+     PowerDevil::Action *helperAction = action(QStringLiteral("DPMSControl"));
+     if (helperAction) {
+diff -ruN a/daemon/powerdevilcore.h b/daemon/powerdevilcore.h
+--- a/daemon/powerdevilcore.h	2026-08-04 11:28:49.000000000 +0200
++++ b/daemon/powerdevilcore.h	2026-11-26 10:12:57.989989417 +0100
+@@ -120,6 +120,10 @@
+ 
+ Q_SIGNALS:
+     void coreReady();
++    /**
++     * A consumer of a wakeup that does not turn on the display asked for a full wakeup (wakeup())
++     */
++    void fullWakeupRequested();
+     void profileChanged(const QString &newProfile);
+     void configurationReloaded();
+     void batteryRemainingTimeChanged(qulonglong time);
