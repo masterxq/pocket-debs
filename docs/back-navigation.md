@@ -38,12 +38,38 @@ races, lifetime, versioning) are defined only in the descriptions of the two XML
 The shell protocol is a separate file so that applications do not need the Plasma window management protocol to
 use the application protocol.
 
+## Design decisions
+
+- **The application decides, not the shell.** Only the application knows whether back has an effect (an open
+  popup, a page below the current one, a history). Key emulation was rejected for the reasons above; a heuristic
+  in the shell (for example "the window has a dialog") would show the arrow where back does nothing.
+- **A state, not only an event.** Back without a state would force the shell to show a back button always and
+  lose the close button. With the state, the button only changes where the application promised an effect, and
+  every application without support keeps today's behaviour.
+- **Per `xdg_toplevel`.** Back belongs to a window, not to a client or a surface: one application can have several
+  windows with different states, and the shell already thinks in toplevels. Subsurfaces and popups are internal to
+  the window; the application folds them into its one state (Kirigami: the topmost popup first).
+- **State takes effect immediately.** It is not double-buffered with `wl_surface.commit`, because it does not
+  describe what is on screen but what the next back would do, and it often changes without a new frame (a page
+  pushed in the model before the transition is drawn).
+- **Races are resolved on the client.** A `back` can cross a state change to `unavailable`. The client ignores it
+  then; it must never close the window or quit. The compositor only filters what it knows: no back while the state
+  is unavailable, while a modal dialog blocks the window or while the session is locked.
+- **Two protocols.** Applications must not need the Plasma window management protocol, and only a privileged
+  client (the shell) may send back to other windows. Binding the shell side to `org_kde_plasma_window` reuses the
+  access control that already exists for window management.
+- **Toolkit, not applications.** The work belongs in Kirigami (and later Qt Quick Controls, GTK): navigation
+  components already know their depth, so applications get back for free and stay consistent. An application
+  only adds code for its own navigation outside these components.
+- **Back never closes.** Android ends the activity on the last back; here the last step turns the arrow back into
+  the close button, so closing stays an explicit action with its own symbol.
+
 ## Parts
 
 | Project | Package here | What it does |
 |---|---|---|
 | KWin | `kwin` | offers both globals, keeps the state per window (`Window::isBackAvailable()`, also passed to `PlasmaWindowInterface`), forwards a back request of the shell to the window only while the state is available and the window can take input (not while a modal dialog blocks it or the session is locked); integration test `testBackNavigation` |
-| Plasma Mobile | `plasma-mobile` | `WindowUtil` tracks the state of every window (`activeWindowCanGoBack`, `goBackInActiveWindow()`); the navigation bar shows `go-previous-symbolic` instead of the close button while the active window can go back, and tapping it sends back to that window. The button still hides the on-screen keyboard first when it is shown |
+| Plasma Mobile | `plasma-mobile` | `WindowUtil` tracks the state of every window (`activeWindowCanGoBack`, `goBackInActiveWindow()`); the navigation bar shows a back arrow instead of the close button while the active window can go back, and tapping it sends back to that window. The button still hides the on-screen keyboard first when it is shown. The arrow and the hide keyboard icon are drawn like `mobile-close-app` (12px grid, same stroke width) and carried by the applet until they have a place in breeze-icons |
 | Kirigami | `kf6-kirigami` | the application side: an attached type `BackNavigation` lets items report that back has an effect for them and handle it; a dispatcher per window combines them with the open popups of the window (the topmost one is closed as on Escape) and talks to the compositor. `PageRow` (layers, then pages), the submenus of `GlobalDrawer`, drawers and dialogs take part, so applications built from these components need no code of their own |
 
 The XML files are copied into each project until they have an upstream home, because the packages are built
