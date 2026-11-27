@@ -1,0 +1,677 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:37:00 +0100
+Subject: [PATCH] autotests: add an integration test for back navigation
+Description:
+ Covers the state as seen by the compositor and by a shell client, back
+ delivery and its suppression when the state is unavailable, destruction of
+ the back navigation object, unmapping and remapping, a toplevel destroyed
+ before its back navigation object, transient and modal dialogs and the lock
+ screen.
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-27
+---
+diff --git a/autotests/integration/CMakeLists.txt b/autotests/integration/CMakeLists.txt
+index ac776a4..4d57f22 100644
+--- a/autotests/integration/CMakeLists.txt
++++ b/autotests/integration/CMakeLists.txt
+@@ -35,11 +35,14 @@ qt6_generate_wayland_protocol_client_sources(KWinIntegrationTestFramework
+         ${WaylandProtocols_DATADIR}/unstable/text-input/text-input-unstable-v3.xml
+         ${WaylandProtocols_DATADIR}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+ 
++        ${CMAKE_SOURCE_DIR}/src/wayland/protocols/kde-back-navigation-shell-v1.xml
++        ${CMAKE_SOURCE_DIR}/src/wayland/protocols/kde-back-navigation-v1.xml
+         ${PLASMA_WAYLAND_PROTOCOLS_DIR}/fake-input.xml
+         ${PLASMA_WAYLAND_PROTOCOLS_DIR}/kde-output-device-v2.xml
+         ${PLASMA_WAYLAND_PROTOCOLS_DIR}/kde-output-management-v2.xml
+         ${PLASMA_WAYLAND_PROTOCOLS_DIR}/kde-screen-edge-v1.xml
+         ${PLASMA_WAYLAND_PROTOCOLS_DIR}/keystate.xml
++        ${PLASMA_WAYLAND_PROTOCOLS_DIR}/plasma-window-management.xml
+         ${PLASMA_WAYLAND_PROTOCOLS_DIR}/zkde-screencast-unstable-v1.xml
+ )
+ target_sources(KWinIntegrationTestFramework PRIVATE
+@@ -148,6 +151,7 @@ integrationTest(NAME testTiles SRCS tiles_test.cpp OPTIONAL_LIBS XCB::ICCCM)
+ integrationTest(NAME testFractionalScaling SRCS fractional_scaling_test.cpp)
+ integrationTest(NAME testMoveResize SRCS move_resize_window_test.cpp)
+ integrationTest(NAME testPlasmaWindow SRCS plasmawindow_test.cpp OPTIONAL_LIBS XCB::ICCCM PROPERTIES RUN_SERIAL TRUE)
++integrationTest(NAME testBackNavigation SRCS backnavigation_test.cpp)
+ integrationTest(NAME testQuickTiling SRCS quick_tiling_test.cpp LIBS KDecoration3::KDecoration OPTIONAL_LIBS XCB::ICCCM)
+ integrationTest(NAME testStackingOrder SRCS stacking_order_test.cpp OPTIONAL_LIBS XCB::ICCCM)
+ integrationTest(NAME testDbusInterface SRCS dbus_interface_test.cpp OPTIONAL_LIBS XCB::ICCCM)
+diff --git a/autotests/integration/backnavigation_test.cpp b/autotests/integration/backnavigation_test.cpp
+new file mode 100644
+index 0000000..176a50a
+--- /dev/null
++++ b/autotests/integration/backnavigation_test.cpp
+@@ -0,0 +1,421 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-FileCopyrightText: 2026 masterxq
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "kwin_wayland_test.h"
++
++#include "wayland_server.h"
++#include "window.h"
++#include "workspace.h"
++
++#include <KWayland/Client/plasmawindowmanagement.h>
++#include <KWayland/Client/surface.h>
++
++namespace KWin
++{
++
++using BackState = Test::BackNavigationWindowV1::state;
++
++class BackNavigationTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void initTestCase();
++    void init();
++    void cleanup();
++
++    void testNoBackNavigation();
++    void testState();
++    void testBack();
++    void testBackWhenUnavailable();
++    void testDestroy();
++    void testRemap();
++    void testToplevelDestroyedFirst();
++    void testDialogHasOwnState();
++    void testModalBlocksBack();
++    void testLockScreenBlocksBack();
++
++private:
++    KWayland::Client::PlasmaWindow *waitForPlasmaWindow(Window *window);
++};
++
++void BackNavigationTest::initTestCase()
++{
++    qRegisterMetaType<KWin::Window *>();
++    QVERIFY(waylandServer()->init(qAppName()));
++    kwinApp()->start();
++    Test::setOutputConfig({
++        Rect(0, 0, 1280, 1024),
++    });
++}
++
++void BackNavigationTest::init()
++{
++    QVERIFY(Test::setupWaylandConnection(Test::AdditionalWaylandInterface::WindowManagement
++                                         | Test::AdditionalWaylandInterface::BackNavigationV1
++                                         | Test::AdditionalWaylandInterface::XdgDialogV1));
++}
++
++void BackNavigationTest::cleanup()
++{
++    Test::destroyWaylandConnection();
++}
++
++KWayland::Client::PlasmaWindow *BackNavigationTest::waitForPlasmaWindow(Window *window)
++{
++    const QByteArray uuid = window->internalId().toByteArray();
++    auto find = [&uuid]() -> KWayland::Client::PlasmaWindow * {
++        const auto windows = Test::waylandWindowManagement()->windows();
++        for (auto *plasmaWindow : windows) {
++            if (plasmaWindow->uuid() == uuid) {
++                return plasmaWindow;
++            }
++        }
++        return nullptr;
++    };
++    if (auto plasmaWindow = find()) {
++        return plasmaWindow;
++    }
++    QSignalSpy windowCreatedSpy(Test::waylandWindowManagement(), &KWayland::Client::PlasmaWindowManagement::windowCreated);
++    while (windowCreatedSpy.wait()) {
++        if (auto plasmaWindow = find()) {
++            return plasmaWindow;
++        }
++    }
++    return nullptr;
++}
++
++void BackNavigationTest::testNoBackNavigation()
++{
++    // A window of a client that does not use kde_back_navigation_v1 reports back as unavailable,
++    // and a back request from the shell has no effect.
++    auto surface = Test::createSurface();
++    auto toplevel = Test::createXdgToplevelSurface(surface.get());
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
++    QVERIFY(window);
++    QVERIFY(!window->isBackAvailable());
++
++    auto plasmaWindow = waitForPlasmaWindow(window);
++    QVERIFY(plasmaWindow);
++    auto shellWindow = Test::createBackNavigationWindowV1(plasmaWindow);
++    QSignalSpy stateSpy(shellWindow.get(), &Test::BackNavigationWindowV1::stateReceived);
++    QVERIFY(stateSpy.wait());
++    QCOMPARE(stateSpy.count(), 1);
++    QCOMPARE(stateSpy.last().at(0).value<uint32_t>(), BackState::state_unavailable);
++
++    shellWindow->back();
++    QVERIFY(Test::waylandSync());
++    QVERIFY(!window->isBackAvailable());
++}
++
++void BackNavigationTest::testState()
++{
++    auto surface = Test::createSurface();
++    auto toplevel = Test::createXdgToplevelSurface(surface.get());
++    auto backNavigation = Test::createBackNavigationV1(toplevel.get());
++    QVERIFY(backNavigation);
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
++    QVERIFY(window);
++    QVERIFY(!window->isBackAvailable());
++
++    auto plasmaWindow = waitForPlasmaWindow(window);
++    QVERIFY(plasmaWindow);
++    auto shellWindow = Test::createBackNavigationWindowV1(plasmaWindow);
++    QSignalSpy stateSpy(shellWindow.get(), &Test::BackNavigationWindowV1::stateReceived);
++    QVERIFY(stateSpy.wait());
++    QCOMPARE(stateSpy.last().at(0).value<uint32_t>(), BackState::state_unavailable);
++
++    QSignalSpy availableChangedSpy(window, &Window::backAvailableChanged);
++    backNavigation->set_state(Test::BackNavigationV1::state_available);
++    QVERIFY(availableChangedSpy.wait());
++    QVERIFY(window->isBackAvailable());
++    QVERIFY(stateSpy.wait());
++    QCOMPARE(stateSpy.count(), 2);
++    QCOMPARE(stateSpy.last().at(0).value<uint32_t>(), BackState::state_available);
++
++    // Setting the same state again changes nothing.
++    backNavigation->set_state(Test::BackNavigationV1::state_available);
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(availableChangedSpy.count(), 1);
++
++    backNavigation->set_state(Test::BackNavigationV1::state_unavailable);
++    QVERIFY(availableChangedSpy.wait());
++    QVERIFY(!window->isBackAvailable());
++    QVERIFY(stateSpy.wait());
++    QCOMPARE(stateSpy.count(), 3);
++    QCOMPARE(stateSpy.last().at(0).value<uint32_t>(), BackState::state_unavailable);
++
++    // A second shell object for the same window starts with the current state.
++    backNavigation->set_state(Test::BackNavigationV1::state_available);
++    QVERIFY(availableChangedSpy.wait());
++    auto secondShellWindow = Test::createBackNavigationWindowV1(plasmaWindow);
++    QSignalSpy secondStateSpy(secondShellWindow.get(), &Test::BackNavigationWindowV1::stateReceived);
++    QVERIFY(secondStateSpy.wait());
++    QCOMPARE(secondStateSpy.count(), 1);
++    QCOMPARE(secondStateSpy.last().at(0).value<uint32_t>(), BackState::state_available);
++}
++
++void BackNavigationTest::testBack()
++{
++    auto surface = Test::createSurface();
++    auto toplevel = Test::createXdgToplevelSurface(surface.get());
++    auto backNavigation = Test::createBackNavigationV1(toplevel.get());
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
++    QVERIFY(window);
++
++    QSignalSpy availableChangedSpy(window, &Window::backAvailableChanged);
++    backNavigation->set_state(Test::BackNavigationV1::state_available);
++    QVERIFY(availableChangedSpy.wait());
++
++    auto shellWindow = Test::createBackNavigationWindowV1(waitForPlasmaWindow(window));
++    QSignalSpy backSpy(backNavigation.get(), &Test::BackNavigationV1::back);
++    shellWindow->back();
++    QVERIFY(backSpy.wait());
++    QCOMPARE(backSpy.count(), 1);
++
++    // Each request is one event.
++    shellWindow->back();
++    shellWindow->back();
++    QVERIFY(backSpy.wait());
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(backSpy.count(), 3);
++}
++
++void BackNavigationTest::testBackWhenUnavailable()
++{
++    // The compositor checks the state when it processes the request of the shell.
++    auto surface = Test::createSurface();
++    auto toplevel = Test::createXdgToplevelSurface(surface.get());
++    auto backNavigation = Test::createBackNavigationV1(toplevel.get());
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
++    QVERIFY(window);
++
++    QSignalSpy availableChangedSpy(window, &Window::backAvailableChanged);
++    backNavigation->set_state(Test::BackNavigationV1::state_available);
++    QVERIFY(availableChangedSpy.wait());
++
++    auto shellWindow = Test::createBackNavigationWindowV1(waitForPlasmaWindow(window));
++    QSignalSpy backSpy(backNavigation.get(), &Test::BackNavigationV1::back);
++
++    backNavigation->set_state(Test::BackNavigationV1::state_unavailable);
++    QVERIFY(availableChangedSpy.wait());
++    shellWindow->back();
++    QVERIFY(Test::waylandSync());
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(backSpy.count(), 0);
++
++    // Also a request on the server side is dropped.
++    window->requestBack();
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(backSpy.count(), 0);
++}
++
++void BackNavigationTest::testDestroy()
++{
++    // Destroying the back navigation object makes back unavailable.
++    auto surface = Test::createSurface();
++    auto toplevel = Test::createXdgToplevelSurface(surface.get());
++    auto backNavigation = Test::createBackNavigationV1(toplevel.get());
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
++    QVERIFY(window);
++
++    QSignalSpy availableChangedSpy(window, &Window::backAvailableChanged);
++    backNavigation->set_state(Test::BackNavigationV1::state_available);
++    QVERIFY(availableChangedSpy.wait());
++
++    auto shellWindow = Test::createBackNavigationWindowV1(waitForPlasmaWindow(window));
++    QSignalSpy stateSpy(shellWindow.get(), &Test::BackNavigationWindowV1::stateReceived);
++    QVERIFY(stateSpy.wait());
++    QCOMPARE(stateSpy.last().at(0).value<uint32_t>(), BackState::state_available);
++
++    backNavigation.reset();
++    QVERIFY(availableChangedSpy.wait());
++    QVERIFY(!window->isBackAvailable());
++    QVERIFY(stateSpy.wait());
++    QCOMPARE(stateSpy.last().at(0).value<uint32_t>(), BackState::state_unavailable);
++
++    // A new object can be created for the same toplevel.
++    backNavigation = Test::createBackNavigationV1(toplevel.get());
++    backNavigation->set_state(Test::BackNavigationV1::state_available);
++    QVERIFY(availableChangedSpy.wait());
++    QVERIFY(window->isBackAvailable());
++}
++
++void BackNavigationTest::testRemap()
++{
++    // The state belongs to the xdg_toplevel and survives an unmap and remap of the surface.
++    auto surface = Test::createSurface();
++    auto toplevel = Test::createXdgToplevelSurface(surface.get(), Test::CreationSetup::CreateOnly);
++    auto backNavigation = Test::createBackNavigationV1(toplevel.get());
++    backNavigation->set_state(Test::BackNavigationV1::state_available);
++
++    QSignalSpy configureRequestedSpy(toplevel->xdgSurface(), &Test::XdgSurface::configureRequested);
++    surface->commit(KWayland::Client::Surface::CommitFlag::None);
++    QVERIFY(configureRequestedSpy.wait());
++    toplevel->xdgSurface()->ack_configure(configureRequestedSpy.last().at(0).value<quint32>());
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
++    QVERIFY(window);
++    QVERIFY(window->isBackAvailable());
++
++    surface->attachBuffer(KWayland::Client::Buffer::Ptr());
++    surface->commit(KWayland::Client::Surface::CommitFlag::None);
++    QVERIFY(Test::waitForWindowClosed(window));
++
++    surface->commit(KWayland::Client::Surface::CommitFlag::None);
++    QVERIFY(configureRequestedSpy.wait());
++    toplevel->xdgSurface()->ack_configure(configureRequestedSpy.last().at(0).value<quint32>());
++    window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
++    QVERIFY(window);
++    QVERIFY(window->isBackAvailable());
++
++    auto shellWindow = Test::createBackNavigationWindowV1(waitForPlasmaWindow(window));
++    QSignalSpy stateSpy(shellWindow.get(), &Test::BackNavigationWindowV1::stateReceived);
++    QVERIFY(stateSpy.wait());
++    QCOMPARE(stateSpy.last().at(0).value<uint32_t>(), BackState::state_available);
++
++    QSignalSpy backSpy(backNavigation.get(), &Test::BackNavigationV1::back);
++    shellWindow->back();
++    QVERIFY(backSpy.wait());
++}
++
++void BackNavigationTest::testToplevelDestroyedFirst()
++{
++    // After the xdg_toplevel is gone the object is inert; using it must not crash the compositor.
++    auto surface = Test::createSurface();
++    auto toplevel = Test::createXdgToplevelSurface(surface.get());
++    auto backNavigation = Test::createBackNavigationV1(toplevel.get());
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
++    QVERIFY(window);
++
++    auto shellWindow = Test::createBackNavigationWindowV1(waitForPlasmaWindow(window));
++    QSignalSpy stateSpy(shellWindow.get(), &Test::BackNavigationWindowV1::stateReceived);
++    QVERIFY(stateSpy.wait());
++
++    toplevel.reset();
++    QVERIFY(Test::waitForWindowClosed(window));
++
++    backNavigation->set_state(Test::BackNavigationV1::state_available);
++    shellWindow->back();
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(stateSpy.count(), 1);
++
++    backNavigation.reset();
++    shellWindow.reset();
++    QVERIFY(Test::waylandSync());
++}
++
++void BackNavigationTest::testDialogHasOwnState()
++{
++    // A transient toplevel has its own state; back is never forwarded between parent and child.
++    auto parentSurface = Test::createSurface();
++    auto parentToplevel = Test::createXdgToplevelSurface(parentSurface.get());
++    auto parentBack = Test::createBackNavigationV1(parentToplevel.get());
++    Window *parentWindow = Test::renderAndWaitForShown(parentSurface.get(), QSize(200, 200), Qt::cyan);
++    QVERIFY(parentWindow);
++    QSignalSpy parentAvailableSpy(parentWindow, &Window::backAvailableChanged);
++    parentBack->set_state(Test::BackNavigationV1::state_available);
++    QVERIFY(parentAvailableSpy.wait());
++
++    auto childSurface = Test::createSurface();
++    auto childToplevel = Test::createXdgToplevelSurface(childSurface.get(), [&parentToplevel](Test::XdgToplevel *toplevel) {
++        toplevel->set_parent(parentToplevel->object());
++    });
++    Window *childWindow = Test::renderAndWaitForShown(childSurface.get(), QSize(100, 100), Qt::yellow);
++    QVERIFY(childWindow);
++    QCOMPARE(childWindow->transientFor(), parentWindow);
++    QVERIFY(!childWindow->isBackAvailable());
++
++    QSignalSpy parentBackSpy(parentBack.get(), &Test::BackNavigationV1::back);
++    auto childShellWindow = Test::createBackNavigationWindowV1(waitForPlasmaWindow(childWindow));
++    QSignalSpy childStateSpy(childShellWindow.get(), &Test::BackNavigationWindowV1::stateReceived);
++    QVERIFY(childStateSpy.wait());
++    QCOMPARE(childStateSpy.last().at(0).value<uint32_t>(), BackState::state_unavailable);
++    childShellWindow->back();
++    QVERIFY(Test::waylandSync());
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(parentBackSpy.count(), 0);
++
++    auto childBack = Test::createBackNavigationV1(childToplevel.get());
++    QSignalSpy childBackSpy(childBack.get(), &Test::BackNavigationV1::back);
++    childBack->set_state(Test::BackNavigationV1::state_available);
++    QVERIFY(childStateSpy.wait());
++    QCOMPARE(childStateSpy.last().at(0).value<uint32_t>(), BackState::state_available);
++    childShellWindow->back();
++    QVERIFY(childBackSpy.wait());
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(parentBackSpy.count(), 0);
++}
++
++void BackNavigationTest::testModalBlocksBack()
++{
++    // A window blocked by a modal dialog receives no back event.
++    auto parentSurface = Test::createSurface();
++    auto parentToplevel = Test::createXdgToplevelSurface(parentSurface.get());
++    auto parentBack = Test::createBackNavigationV1(parentToplevel.get());
++    Window *parentWindow = Test::renderAndWaitForShown(parentSurface.get(), QSize(200, 200), Qt::cyan);
++    QVERIFY(parentWindow);
++    QSignalSpy parentAvailableSpy(parentWindow, &Window::backAvailableChanged);
++    parentBack->set_state(Test::BackNavigationV1::state_available);
++    QVERIFY(parentAvailableSpy.wait());
++    auto parentShellWindow = Test::createBackNavigationWindowV1(waitForPlasmaWindow(parentWindow));
++    QSignalSpy parentBackSpy(parentBack.get(), &Test::BackNavigationV1::back);
++
++    auto childSurface = Test::createSurface();
++    auto childToplevel = Test::createXdgToplevelSurface(childSurface.get(), [&parentToplevel](Test::XdgToplevel *toplevel) {
++        toplevel->set_parent(parentToplevel->object());
++    });
++    Window *childWindow = Test::renderAndWaitForShown(childSurface.get(), QSize(100, 100), Qt::yellow);
++    QVERIFY(childWindow);
++    auto dialog = Test::createXdgDialogV1(childToplevel.get());
++    QSignalSpy modalChangedSpy(childWindow, &Window::modalChanged);
++    dialog->set_modal();
++    QVERIFY(modalChangedSpy.wait());
++    QVERIFY(childWindow->isModal());
++
++    parentShellWindow->back();
++    QVERIFY(Test::waylandSync());
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(parentBackSpy.count(), 0);
++
++    dialog->unset_modal();
++    QVERIFY(modalChangedSpy.wait());
++    parentShellWindow->back();
++    QVERIFY(parentBackSpy.wait());
++}
++
++void BackNavigationTest::testLockScreenBlocksBack()
++{
++#if KWIN_BUILD_SCREENLOCKER
++    auto surface = Test::createSurface();
++    auto toplevel = Test::createXdgToplevelSurface(surface.get());
++    auto backNavigation = Test::createBackNavigationV1(toplevel.get());
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(100, 50), Qt::blue);
++    QVERIFY(window);
++    QSignalSpy availableChangedSpy(window, &Window::backAvailableChanged);
++    backNavigation->set_state(Test::BackNavigationV1::state_available);
++    QVERIFY(availableChangedSpy.wait());
++    auto shellWindow = Test::createBackNavigationWindowV1(waitForPlasmaWindow(window));
++    QSignalSpy backSpy(backNavigation.get(), &Test::BackNavigationV1::back);
++
++    QVERIFY(Test::lockScreen());
++    shellWindow->back();
++    QVERIFY(Test::waylandSync());
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(backSpy.count(), 0);
++
++    QVERIFY(Test::unlockScreen());
++    shellWindow->back();
++    QVERIFY(backSpy.wait());
++#endif
++}
++
++}
++
++WAYLANDTEST_MAIN(KWin::BackNavigationTest)
++#include "backnavigation_test.moc"
+diff --git a/autotests/integration/kwin_wayland_test.h b/autotests/integration/kwin_wayland_test.h
+index 34a50a2..c6a59a1 100644
+--- a/autotests/integration/kwin_wayland_test.h
++++ b/autotests/integration/kwin_wayland_test.h
+@@ -34,6 +34,8 @@
+ #include "qwayland-fifo-v1.h"
+ #include "qwayland-fractional-scale-v1.h"
+ #include "qwayland-idle-inhibit-unstable-v1.h"
++#include "qwayland-kde-back-navigation-shell-v1.h"
++#include "qwayland-kde-back-navigation-v1.h"
+ #include "qwayland-input-method-unstable-v1.h"
+ #include "qwayland-kde-output-device-v2.h"
+ #include "qwayland-kde-output-management-v2.h"
+@@ -66,6 +68,7 @@ class DataSource;
+ class EventQueue;
+ class LogicalOutput;
+ class PlasmaShell;
++class PlasmaWindow;
+ class PlasmaWindowManagement;
+ class Pointer;
+ class PointerConstraints;
+@@ -638,6 +641,50 @@ public:
+     ~XdgDialogV1() override;
+ };
+ 
++class BackNavigationManagerV1 : public QtWayland::kde_back_navigation_manager_v1
++{
++public:
++    BackNavigationManagerV1(::wl_registry *registry, uint32_t id, int version);
++    ~BackNavigationManagerV1() override;
++};
++
++class BackNavigationV1 : public QObject, public QtWayland::kde_back_navigation_v1
++{
++    Q_OBJECT
++
++public:
++    explicit BackNavigationV1(::kde_back_navigation_v1 *object);
++    ~BackNavigationV1() override;
++
++Q_SIGNALS:
++    void back();
++
++protected:
++    void kde_back_navigation_v1_back() override;
++};
++
++class BackNavigationShellV1 : public QtWayland::kde_back_navigation_shell_v1
++{
++public:
++    BackNavigationShellV1(::wl_registry *registry, uint32_t id, int version);
++    ~BackNavigationShellV1() override;
++};
++
++class BackNavigationWindowV1 : public QObject, public QtWayland::kde_back_navigation_window_v1
++{
++    Q_OBJECT
++
++public:
++    explicit BackNavigationWindowV1(::kde_back_navigation_window_v1 *object);
++    ~BackNavigationWindowV1() override;
++
++Q_SIGNALS:
++    void stateReceived(uint32_t state);
++
++protected:
++    void kde_back_navigation_window_v1_state(uint32_t state) override;
++};
++
+ class WpTabletManagerV2 : public QtWayland::zwp_tablet_manager_v2
+ {
+ public:
+@@ -828,6 +875,7 @@ enum class AdditionalWaylandInterface : uint64_t {
+     ColorRepresentation = 1ull << 32,
+     Viewporter = 1ull << 33,
+     AlphaModifierV1 = 1ull << 34,
++    BackNavigationV1 = 1ull << 35,
+ };
+ Q_DECLARE_FLAGS(AdditionalWaylandInterfaces, AdditionalWaylandInterface)
+ 
+@@ -1206,6 +1254,8 @@ struct Connection
+     std::unique_ptr<ColorRepresentationV1> colorRepresentation;
+     std::unique_ptr<WaylandClient::Viewporter> viewporter;
+     std::unique_ptr<AlphaModifierV1> alphaModifier;
++    std::unique_ptr<BackNavigationManagerV1> backNavigationManager;
++    std::unique_ptr<BackNavigationShellV1> backNavigationShell;
+     // TODO port everything away from KWayland::Client::Seat
+     std::unique_ptr<WlSeat> kwinSeat;
+ };
+@@ -1350,6 +1400,8 @@ std::unique_ptr<IdleInhibitorV1> createIdleInhibitorV1(KWayland::Client::Surface
+ std::unique_ptr<AutoHideScreenEdgeV1> createAutoHideScreenEdgeV1(KWayland::Client::Surface *surface, uint32_t border);
+ std::unique_ptr<CursorShapeDeviceV1> createCursorShapeDeviceV1(KWayland::Client::Pointer *pointer);
+ std::unique_ptr<XdgDialogV1> createXdgDialogV1(XdgToplevel *toplevel);
++std::unique_ptr<BackNavigationV1> createBackNavigationV1(XdgToplevel *toplevel);
++std::unique_ptr<BackNavigationWindowV1> createBackNavigationWindowV1(KWayland::Client::PlasmaWindow *window);
+ std::unique_ptr<XdgSessionV1> createXdgSessionV1(XdgSessionManagerV1::reason reason, const QString &sessionId = QString());
+ std::unique_ptr<XdgSessionV1> createXdgSessionV1(XdgSessionManagerV1 *manager, XdgSessionManagerV1::reason reason, const QString &sessionId = QString());
+ 
+diff --git a/autotests/integration/test_helpers.cpp b/autotests/integration/test_helpers.cpp
+index e986797..92c9da0 100644
+--- a/autotests/integration/test_helpers.cpp
++++ b/autotests/integration/test_helpers.cpp
+@@ -299,6 +299,56 @@ XdgDialogV1::~XdgDialogV1()
+     destroy();
+ }
+ 
++BackNavigationManagerV1::BackNavigationManagerV1(::wl_registry *registry, uint32_t id, int version)
++    : QtWayland::kde_back_navigation_manager_v1(registry, id, version)
++{
++}
++
++BackNavigationManagerV1::~BackNavigationManagerV1()
++{
++    destroy();
++}
++
++BackNavigationV1::BackNavigationV1(::kde_back_navigation_v1 *object)
++    : QtWayland::kde_back_navigation_v1(object)
++{
++}
++
++BackNavigationV1::~BackNavigationV1()
++{
++    destroy();
++}
++
++void BackNavigationV1::kde_back_navigation_v1_back()
++{
++    Q_EMIT back();
++}
++
++BackNavigationShellV1::BackNavigationShellV1(::wl_registry *registry, uint32_t id, int version)
++    : QtWayland::kde_back_navigation_shell_v1(registry, id, version)
++{
++}
++
++BackNavigationShellV1::~BackNavigationShellV1()
++{
++    destroy();
++}
++
++BackNavigationWindowV1::BackNavigationWindowV1(::kde_back_navigation_window_v1 *object)
++    : QtWayland::kde_back_navigation_window_v1(object)
++{
++}
++
++BackNavigationWindowV1::~BackNavigationWindowV1()
++{
++    destroy();
++}
++
++void BackNavigationWindowV1::kde_back_navigation_window_v1_state(uint32_t state)
++{
++    Q_EMIT stateReceived(state);
++}
++
+ MockInputMethod *inputMethod()
+ {
+     return s_waylandConnection->inputMethodV1;
+@@ -529,6 +579,14 @@ std::unique_ptr<Connection> Connection::setup(AdditionalWaylandInterfaces flags)
+                 c->xdgWmDialogV1->init(*c->registry, name, version);
+             }
+         }
++        if (flags & AdditionalWaylandInterface::BackNavigationV1) {
++            if (interface == kde_back_navigation_manager_v1_interface.name) {
++                c->backNavigationManager = std::make_unique<BackNavigationManagerV1>(*c->registry, name, version);
++            }
++            if (interface == kde_back_navigation_shell_v1_interface.name) {
++                c->backNavigationShell = std::make_unique<BackNavigationShellV1>(*c->registry, name, version);
++            }
++        }
+         if (flags & AdditionalWaylandInterface::ColorManagement) {
+             if (interface == wp_color_manager_v1_interface.name) {
+                 c->colorManager = std::make_unique<ColorManagerV1>(*c->registry, name, version);
+@@ -733,6 +791,8 @@ Connection::~Connection()
+     colorRepresentation.reset();
+     viewporter.reset();
+     alphaModifier.reset();
++    backNavigationManager.reset();
++    backNavigationShell.reset();
+     kwinSeat.reset();
+ 
+     delete queue; // Must be destroyed last
+@@ -1359,6 +1419,26 @@ std::unique_ptr<XdgDialogV1> createXdgDialogV1(XdgToplevel *toplevel)
+     return std::make_unique<XdgDialogV1>(wm, toplevel);
+ }
+ 
++std::unique_ptr<BackNavigationV1> createBackNavigationV1(XdgToplevel *toplevel)
++{
++    BackNavigationManagerV1 *manager = s_waylandConnection->backNavigationManager.get();
++    if (!manager) {
++        qWarning() << "Could not create a kde_back_navigation_v1 because kde_back_navigation_manager_v1 global is not bound";
++        return nullptr;
++    }
++    return std::make_unique<BackNavigationV1>(manager->get_back_navigation(toplevel->object()));
++}
++
++std::unique_ptr<BackNavigationWindowV1> createBackNavigationWindowV1(KWayland::Client::PlasmaWindow *window)
++{
++    BackNavigationShellV1 *shell = s_waylandConnection->backNavigationShell.get();
++    if (!shell) {
++        qWarning() << "Could not create a kde_back_navigation_window_v1 because kde_back_navigation_shell_v1 global is not bound";
++        return nullptr;
++    }
++    return std::make_unique<BackNavigationWindowV1>(shell->get_window(*window));
++}
++
+ std::unique_ptr<XdgSessionV1> createXdgSessionV1(XdgSessionManagerV1::reason reason, const QString &sessionId)
+ {
+     XdgSessionManagerV1 *manager = s_waylandConnection->sessionManager.get();

@@ -1,0 +1,120 @@
+Description: controls: PageRow: goBack: accept the event when a page handles back
+ goBack() emitted backRequested() on the current layer and, when the layer
+ accepted it, went on with the same accepted event to the current column:
+ the page behind the layer received backRequested() as well. When a page
+ accepted backRequested(), the event passed to goBack() stayed unaccepted,
+ although back had been handled.
+ .
+ Stop at the topmost layer, and accept the event passed in whenever the
+ layer or page handled back itself or the PageRow went back.
+ .
+ ApplicationItem replaced goBack() of its PageRow with a version that
+ ignored the layers and quit the application on mobile when nothing
+ accepted the back event; the back button of the page header calls
+ goBack() too and could quit the application. Keep the PageRow
+ implementation and quit only from the back key and shortcut.
+Author: pocket-debs
+Forwarded: no
+License: LGPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-27
+---
+diff --git a/src/controls/ApplicationItem.qml b/src/controls/ApplicationItem.qml
+--- a/src/controls/ApplicationItem.qml
++++ b/src/controls/ApplicationItem.qml
+@@ -106,16 +106,12 @@ KC.AbstractApplicationItem {
+             fill: parent
+         }
+ 
+-        function goBack() {
++        // Back key and shortcut: go back, or quit the application on mobile when
++        // there is nothing to go back to. goBack() itself never quits.
++        function __goBackOrQuit(): void {
+             // NOTE: drawers are handling the back button by themselves
+             const backEvent = {accepted: false}
+-            if (root.pageStack.currentIndex >= 1) {
+-                (root.pageStack.currentItem as Page).backRequested(backEvent);
+-                if (!backEvent.accepted) {
+-                    root.pageStack.flickBack();
+-                    backEvent.accepted = true;
+-                }
+-            }
++            goBack(backEvent);
+ 
+             if (Platform.Settings.isMobile && !backEvent.accepted && Qt.platform.os !== "ios") {
+                 Qt.quit();
+@@ -125,7 +121,7 @@ KC.AbstractApplicationItem {
+             root.pageStack.currentIndex = Math.min(root.pageStack.depth - 1, root.pageStack.currentIndex + 1);
+         }
+         Keys.onBackPressed: event => {
+-            goBack();
++            __goBackOrQuit();
+             event.accepted = true;
+         }
+         Shortcut {
+@@ -134,7 +130,7 @@ KC.AbstractApplicationItem {
+         }
+         Shortcut {
+             sequences: [StandardKey.Back]
+-            onActivated: __pageStack.goBack();
++            onActivated: __pageStack.__goBackOrQuit();
+         }
+ 
+         background: Rectangle {
+diff --git a/src/controls/PageRow.qml b/src/controls/PageRow.qml
+--- a/src/controls/PageRow.qml
++++ b/src/controls/PageRow.qml
+@@ -565,26 +565,28 @@ QT.Control {
+       "going back" in the layers and page row. Results in a layer being popped if available,
+       or the currentIndex being set to currentIndex-1 if not available.
+ 
++      The page that would be left receives \l {Page::backRequested} {Page::backRequested()}
++      first; if it accepts the event, the page handles going back itself and the
++      PageRow does not change.
++
+       \a event Optional, an event that will be accepted if a page is successfully
+-      "backed" on
++      "backed" on, by the PageRow or by the page itself
+      */
+     function goBack(event = null): void {
+         const backEvent = {accepted: false}
+ 
+-        if (layersStack.depth >= 1) {
++        if (layersStack.depth > 1) {
+             try { // app code might be screwy, but we still want to continue functioning if it throws an exception
+                 layersStack.currentItem.backRequested(backEvent)
+             } catch (error) {}
+ 
+             if (!backEvent.accepted) {
+-                if (layersStack.depth > 1) {
+-                    layersStack.pop()
+-                    if (event) {
+-                        event.accepted = true
+-                    }
+-                    return
+-                }
++                layersStack.pop()
++            }
++            if (event) {
++                event.accepted = true
+             }
++            return
+         }
+ 
+         if (currentIndex >= 1) {
+@@ -593,12 +595,10 @@ QT.Control {
+             } catch (error) {}
+ 
+             if (!backEvent.accepted) {
+-                if (depth > 1) {
+-                    currentIndex = Math.max(0, currentIndex - 1)
+-                    if (event) {
+-                        event.accepted = true
+-                    }
+-                }
++                currentIndex = Math.max(0, currentIndex - 1)
++            }
++            if (event) {
++                event.accepted = true
+             }
+         }
+     }

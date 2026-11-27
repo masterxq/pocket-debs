@@ -1,0 +1,598 @@
+Description: controls: take part in the system-wide back navigation
+ PageRow reports back as available while it has a layer or a page before
+ the current one and calls goBack() for the system back control, the
+ submenus of GlobalDrawer are left before the drawer is closed, and
+ AbstractApplicationWindow and AbstractApplicationItem create the back
+ navigation of their window, so that open drawers and dialogs are
+ reported also in applications without a PageRow. Applications built
+ from these components need no code of their own.
+Author: pocket-debs
+Forwarded: no
+License: LGPL-2.0-or-later (as the patched and new files)
+Last-Update: 2026-11-27
+---
+diff --git a/autotests/CMakeLists.txt b/autotests/CMakeLists.txt
+--- a/autotests/CMakeLists.txt
++++ b/autotests/CMakeLists.txt
+@@ -39,6 +39,7 @@ kirigami_add_tests(
+     tst_abstractapplicationwindow.qml
+     tst_action.qml
+     tst_actiontoolbar.qml
++    tst_backnavigation.qml
+     tst_badge.qml
+     tst_card.qml
+     tst_colorutils.qml
+@@ -70,6 +71,7 @@ kirigami_add_tests(
+     tst_theme.qml
+     tst_titleSubtitleWithActions.qml
+ 
++    mobile/tst_backnavigation.qml
+     mobile/tst_pagerow.qml
+ 
+     pagepool/tst_layers.qml
+@@ -90,6 +92,7 @@ set_tests_properties(
+ )
+ 
+ set_tests_properties(
++    mobile/tst_backnavigation.qml
+     mobile/tst_pagerow.qml
+ 
+     PROPERTIES
+diff --git a/autotests/mobile/tst_backnavigation.qml b/autotests/mobile/tst_backnavigation.qml
+new file mode 100644
+--- /dev/null
++++ b/autotests/mobile/tst_backnavigation.qml
+@@ -0,0 +1,85 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++ *
++ *  SPDX-License-Identifier: LGPL-2.0-or-later
++ */
++
++import QtQuick
++import QtQuick.Controls as QQC2
++import QtTest
++import org.kde.kirigami as Kirigami
++
++TestCase {
++    id: testCase
++
++    width: 400
++    height: 400
++    name: "MobileBackNavigation"
++    visible: false
++
++    Component {
++        id: windowComponent
++        Kirigami.ApplicationWindow {
++            // Narrower than 40 gridUnits: pushDialogLayer pushes a layer
++            width: Kirigami.Units.gridUnit * 30
++            height: 400
++        }
++    }
++
++    Component {
++        id: itemWindowComponent
++        Window {
++            width: 400
++            height: 400
++            property alias app: app
++            Kirigami.ApplicationItem {
++                id: app
++                anchors.fill: parent
++                pageStack.initialPage: Kirigami.Page {}
++            }
++        }
++    }
++
++    Component {
++        id: pageComponent
++        Kirigami.Page {}
++    }
++
++    function test_pushDialogLayer() {
++        verify(Kirigami.Settings.isMobile);
++        const window = createTemporaryObject(windowComponent, testCase);
++        window.show();
++        window.pageStack.push(pageComponent);
++        window.pageStack.currentIndex = 0;
++        const back = window.pageStack.Kirigami.BackNavigation;
++        compare(back.__available, false);
++
++        window.pageStack.pushDialogLayer(pageComponent);
++        compare(window.pageStack.layers.depth, 2);
++        compare(back.__available, true);
++        verify(back.__trigger());
++        compare(window.pageStack.layers.depth, 1);
++        compare(back.__available, false);
++    }
++
++    function test_applicationItemLayers() {
++        const window = createTemporaryObject(itemWindowComponent, testCase);
++        window.show();
++        const pageStack = window.app.pageStack;
++        const back = pageStack.Kirigami.BackNavigation;
++        compare(back.__available, false);
++        // Nothing to go back to: the system back control is not offered and
++        // does nothing (in particular it does not quit the application)
++        compare(back.__trigger(), false);
++
++        pageStack.layers.push(pageComponent);
++        compare(back.__available, true);
++        verify(back.__trigger());
++        compare(pageStack.layers.depth, 1);
++
++        // The back key goes back in the layers first as well
++        pageStack.layers.push(pageComponent);
++        pageStack.__goBackOrQuit();
++        compare(pageStack.layers.depth, 1);
++    }
++}
+diff --git a/autotests/tst_backnavigation.qml b/autotests/tst_backnavigation.qml
+new file mode 100644
+--- /dev/null
++++ b/autotests/tst_backnavigation.qml
+@@ -0,0 +1,396 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++ *
++ *  SPDX-License-Identifier: LGPL-2.0-or-later
++ */
++
++import QtQuick
++import QtQuick.Controls as QQC2
++import QtTest
++import org.kde.kirigami as Kirigami
++
++TestCase {
++    id: testCase
++
++    width: 400
++    height: 400
++    name: "BackNavigation"
++    visible: false
++
++    Component {
++        id: windowComponent
++        Kirigami.ApplicationWindow {
++            width: 600
++            height: 500
++            pageStack.initialPage: Kirigami.Page {
++                title: "First"
++            }
++        }
++    }
++
++    Component {
++        id: pageComponent
++        Kirigami.Page {
++            property bool acceptBack: false
++            property int backRequests: 0
++            onBackRequested: event => {
++                backRequests += 1;
++                event.accepted = acceptBack;
++            }
++        }
++    }
++
++    Component {
++        id: stackPageComponent
++        Kirigami.Page {
++            property alias stack: stack
++            QQC2.StackView {
++                id: stack
++                anchors.fill: parent
++                initialItem: Item {}
++                Kirigami.BackNavigation.enabled: stack.depth > 1
++                Kirigami.BackNavigation.onTriggered: stack.pop(null, QQC2.StackView.Immediate)
++            }
++        }
++    }
++
++    Component {
++        id: handlerItemComponent
++        Item {
++            property int triggers: 0
++            Kirigami.BackNavigation.onTriggered: triggers += 1
++        }
++    }
++
++    Component {
++        id: drawerComponent
++        Kirigami.GlobalDrawer {
++            modal: true
++            actions: [
++                Kirigami.Action {
++                    text: "Sub"
++                    Kirigami.Action { text: "Leaf" }
++                }
++            ]
++        }
++    }
++
++    Component {
++        id: dialogComponent
++        Kirigami.Dialog {
++            title: "Dialog"
++            property alias inner: inner
++            Item {
++                id: inner
++                implicitWidth: 100
++                implicitHeight: 100
++                property int triggers: 0
++                Kirigami.BackNavigation.onTriggered: triggers += 1
++            }
++        }
++    }
++
++    Component {
++        id: popupComponent
++        QQC2.Popup {
++            width: 100
++            height: 100
++        }
++    }
++
++    Component {
++        id: menuComponent
++        QQC2.Menu {
++            QQC2.MenuItem { text: "Item" }
++        }
++    }
++
++    Component {
++        id: toolTipComponent
++        QQC2.ToolTip {
++            text: "Tip"
++        }
++    }
++
++    Component {
++        id: spyComponent
++        SignalSpy {}
++    }
++
++    property Kirigami.ApplicationWindow window
++
++    function back() {
++        return window.pageStack.Kirigami.BackNavigation;
++    }
++
++    function findItem(item, predicate) {
++        if (!item) {
++            return null;
++        }
++        if (predicate(item)) {
++            return item;
++        }
++        for (const child of item.children) {
++            const found = findItem(child, predicate);
++            if (found) {
++                return found;
++            }
++        }
++        return null;
++    }
++
++    function init() {
++        window = createTemporaryObject(windowComponent, testCase);
++        verify(window);
++        window.show();
++        verify(waitForRendering(window.contentItem));
++    }
++
++    function test_pageRow() {
++        compare(back().__available, false);
++        compare(back().__trigger(), false);
++
++        window.pageStack.push(pageComponent);
++        compare(window.pageStack.currentIndex, 1);
++        compare(back().__available, true);
++
++        const page = window.pageStack.currentItem;
++        verify(back().__trigger());
++        compare(page.backRequests, 1);
++        compare(window.pageStack.currentIndex, 0);
++        compare(back().__available, false);
++        compare(back().__trigger(), false);
++        compare(window.pageStack.currentIndex, 0);
++    }
++
++    function test_availableSignal() {
++        const spy = createTemporaryObject(spyComponent, testCase, {target: back(), signalName: "windowAvailableChanged"});
++        window.pageStack.push(pageComponent);
++        spy.wait();
++        compare(back().__available, true);
++        window.pageStack.currentIndex = 0;
++        spy.wait();
++        compare(back().__available, false);
++    }
++
++    function test_pageAcceptsBack() {
++        const page = window.pageStack.push(pageComponent, {acceptBack: true});
++        verify(back().__trigger());
++        compare(page.backRequests, 1);
++        compare(window.pageStack.currentIndex, 1);
++    }
++
++    function test_goBackEvent() {
++        const page = window.pageStack.push(pageComponent, {acceptBack: true});
++        const event = {accepted: false};
++        window.pageStack.goBack(event);
++        verify(event.accepted);
++        compare(window.pageStack.currentIndex, 1);
++    }
++
++    function test_layers() {
++        const page = window.pageStack.push(pageComponent);
++        const layer = window.pageStack.layers.push(pageComponent, {acceptBack: true});
++        compare(window.pageStack.layers.depth, 2);
++        compare(back().__available, true);
++
++        // The layer accepts: neither the layer nor the page behind it changes
++        verify(back().__trigger());
++        compare(layer.backRequests, 1);
++        compare(page.backRequests, 0);
++        compare(window.pageStack.layers.depth, 2);
++        compare(window.pageStack.currentIndex, 1);
++
++        layer.acceptBack = false;
++        verify(back().__trigger());
++        compare(window.pageStack.layers.depth, 1);
++        compare(page.backRequests, 0);
++        compare(window.pageStack.currentIndex, 1);
++
++        verify(back().__trigger());
++        compare(window.pageStack.currentIndex, 0);
++    }
++
++    function test_nestedHandlerFirst() {
++        const page = window.pageStack.push(stackPageComponent);
++        compare(back().__available, true);
++        page.stack.push(handlerItemComponent, {}, QQC2.StackView.Immediate);
++        compare(page.stack.depth, 2);
++
++        verify(back().__trigger());
++        compare(page.stack.depth, 1);
++        compare(window.pageStack.currentIndex, 1);
++
++        verify(back().__trigger());
++        compare(window.pageStack.currentIndex, 0);
++    }
++
++    function test_layerCoversInnerHandler() {
++        const page = window.pageStack.push(stackPageComponent);
++        page.stack.push(handlerItemComponent, {}, QQC2.StackView.Immediate);
++        window.pageStack.layers.push(pageComponent);
++        tryCompare(window.pageStack.layers, "busy", false);
++
++        verify(back().__trigger());
++        compare(window.pageStack.layers.depth, 1);
++        compare(page.stack.depth, 2);
++        tryCompare(window.pageStack.layers, "busy", false);
++
++        verify(back().__trigger());
++        compare(page.stack.depth, 1);
++    }
++
++    function test_attachedToWindow() {
++        let triggers = 0;
++        window.Kirigami.BackNavigation.triggered.connect(() => { triggers += 1; });
++        window.Kirigami.BackNavigation.enabled = true;
++        compare(back().__available, true);
++        verify(back().__trigger());
++        compare(triggers, 1);
++        window.Kirigami.BackNavigation.enabled = false;
++        compare(back().__available, false);
++    }
++
++    function test_handlerAloneAndVisibility() {
++        const item = createTemporaryObject(handlerItemComponent, window.pageStack.currentItem);
++        compare(back().__available, false);
++        item.Kirigami.BackNavigation.enabled = true;
++        compare(back().__available, true);
++        verify(back().__trigger());
++        compare(item.triggers, 1);
++
++        item.visible = false;
++        compare(back().__available, false);
++        compare(back().__trigger(), false);
++        compare(item.triggers, 1);
++    }
++
++    function test_unrelatedHandlersLastEnabledFirst() {
++        const a = createTemporaryObject(handlerItemComponent, window.pageStack.currentItem);
++        const b = createTemporaryObject(handlerItemComponent, window.pageStack.currentItem);
++        b.Kirigami.BackNavigation.enabled = true;
++        a.Kirigami.BackNavigation.enabled = true;
++        verify(back().__trigger());
++        compare(a.triggers, 1);
++        compare(b.triggers, 0);
++        a.Kirigami.BackNavigation.enabled = false;
++        verify(back().__trigger());
++        compare(b.triggers, 1);
++    }
++
++    function test_drawer() {
++        window.pageStack.push(pageComponent);
++        const drawer = createTemporaryObject(drawerComponent, window);
++        window.globalDrawer = drawer;
++        drawer.open();
++        tryCompare(drawer, "position", 1);
++        compare(back().__available, true);
++
++        // Submenu first, then the drawer, then the pages
++        const subItem = findItem(drawer.contentItem, item => item.tAction?.text === "Sub" && item.clicked !== undefined && item.visible);
++        verify(subItem);
++        mouseClick(subItem);
++        tryVerify(() => drawer.currentSubMenu !== null);
++        verify(back().__trigger());
++        tryCompare(drawer, "currentSubMenu", null);
++        verify(drawer.drawerOpen);
++
++        verify(back().__trigger());
++        tryCompare(drawer, "visible", false);
++        compare(window.pageStack.currentIndex, 1);
++
++        verify(back().__trigger());
++        compare(window.pageStack.currentIndex, 0);
++    }
++
++    function test_dialogRejectedAndInnerHandler() {
++        window.pageStack.push(pageComponent);
++        const dialog = createTemporaryObject(dialogComponent, window.contentItem);
++        const rejected = createTemporaryObject(spyComponent, testCase, {target: dialog, signalName: "rejected"});
++        dialog.open();
++        tryCompare(dialog, "opened", true);
++
++        dialog.inner.Kirigami.BackNavigation.enabled = true;
++        verify(back().__trigger());
++        compare(dialog.inner.triggers, 1);
++        verify(dialog.opened);
++
++        dialog.inner.Kirigami.BackNavigation.enabled = false;
++        verify(back().__trigger());
++        compare(rejected.count, 1);
++        tryCompare(dialog, "visible", false);
++        compare(window.pageStack.currentIndex, 1);
++    }
++
++    function test_modalPopupWithoutEscapeBlocks() {
++        window.pageStack.push(pageComponent);
++        const popup = createTemporaryObject(popupComponent, window.contentItem, {modal: true, closePolicy: QQC2.Popup.NoAutoClose});
++        popup.open();
++        tryCompare(popup, "opened", true);
++        compare(back().__available, false);
++        compare(back().__trigger(), false);
++        verify(popup.opened);
++        compare(window.pageStack.currentIndex, 1);
++
++        popup.close();
++        tryCompare(popup, "visible", false);
++        compare(back().__available, true);
++    }
++
++    function test_nonModalPopupWithoutEscapeIgnored() {
++        window.pageStack.push(pageComponent);
++        const popup = createTemporaryObject(popupComponent, window.contentItem, {modal: false, closePolicy: QQC2.Popup.NoAutoClose});
++        popup.open();
++        tryCompare(popup, "opened", true);
++        compare(back().__available, true);
++        verify(back().__trigger());
++        verify(popup.opened);
++        compare(window.pageStack.currentIndex, 0);
++        compare(back().__available, false);
++    }
++
++    function test_menuClosed() {
++        const menu = createTemporaryObject(menuComponent, window.contentItem);
++        menu.open();
++        tryCompare(menu, "opened", true);
++        compare(back().__available, true);
++        verify(back().__trigger());
++        tryCompare(menu, "visible", false);
++        compare(back().__available, false);
++    }
++
++    function test_toolTipIgnored() {
++        const toolTip = createTemporaryObject(toolTipComponent, window.contentItem);
++        toolTip.open();
++        tryCompare(toolTip, "opened", true);
++        compare(back().__available, false);
++        compare(back().__trigger(), false);
++        verify(toolTip.visible);
++    }
++
++    function test_popupHandlerInsidePopupAttached() {
++        const popup = createTemporaryObject(popupComponent, window.contentItem, {modal: true, closePolicy: QQC2.Popup.NoAutoClose});
++        let triggers = 0;
++        popup.Kirigami.BackNavigation.triggered.connect(() => { triggers += 1; });
++        popup.Kirigami.BackNavigation.enabled = true;
++        popup.open();
++        tryCompare(popup, "opened", true);
++        compare(back().__available, true);
++        verify(back().__trigger());
++        compare(triggers, 1);
++        verify(popup.opened);
++    }
++
++    function test_layerFromPushDialogLayerOnMobileIsNotForcedHere() {
++        // On the desktop pushDialogLayer opens a window of its own: its back
++        // navigation is separate from the one of the main window.
++        window.pageStack.push(pageComponent);
++        const page = window.pageStack.pushDialogLayer(pageComponent);
++        verify(page);
++        const dialogWindow = page.QQC2.ApplicationWindow.window;
++        verify(dialogWindow !== window);
++        compare(page.Kirigami.BackNavigation.__available, false);
++        compare(back().__available, true);
++        page.Kirigami.PageStack.closeDialog();
++    }
++}
+diff --git a/src/controls/AbstractApplicationItem.qml b/src/controls/AbstractApplicationItem.qml
+--- a/src/controls/AbstractApplicationItem.qml
++++ b/src/controls/AbstractApplicationItem.qml
+@@ -299,6 +299,10 @@ Item {
+     onPageStackChanged: pageStack.parent = root.contentItem;
+ //END signals handlers
+ 
++    // Report the back navigation state of the window (open drawers and
++    // dialogs) also when the application has no PageRow
++    Platform.BackNavigation.enabled: false
++
+     LayoutMirroring.enabled: Application.layoutDirection === Qt.RightToLeft
+     LayoutMirroring.childrenInherit: true
+ 
+diff --git a/src/controls/AbstractApplicationWindow.qml b/src/controls/AbstractApplicationWindow.qml
+--- a/src/controls/AbstractApplicationWindow.qml
++++ b/src/controls/AbstractApplicationWindow.qml
+@@ -221,6 +221,10 @@ QQC2.ApplicationWindow {
+     }
+ //END functions
+ 
++    // Report the back navigation state of the window (open drawers and
++    // dialogs) also when the application has no PageRow
++    Platform.BackNavigation.enabled: false
++
+     LayoutMirroring.enabled: Application.layoutDirection === Qt.RightToLeft
+     LayoutMirroring.childrenInherit: true
+ 
+diff --git a/src/controls/GlobalDrawer.qml b/src/controls/GlobalDrawer.qml
+--- a/src/controls/GlobalDrawer.qml
++++ b/src/controls/GlobalDrawer.qml
+@@ -669,6 +669,10 @@ KC.OverlayDrawer {
+                         initialItem: menuComponent
+                         implicitWidth: currentItem.implicitWidth
+ 
++                        // System-wide back control: leave a submenu before the drawer is closed
++                        Platform.BackNavigation.enabled: stackView.depth > 1
++                        Platform.BackNavigation.onTriggered: stackView.pop()
++
+                         // NOTE: it's important those are NumberAnimation and not XAnimators
+                         // as while the animation is running the drawer may close, and
+                         // the animator would stop when not drawing see BUG 381576
+diff --git a/src/controls/PageRow.qml b/src/controls/PageRow.qml
+--- a/src/controls/PageRow.qml
++++ b/src/controls/PageRow.qml
+@@ -569,6 +569,9 @@ QT.Control {
+       first; if it accepts the event, the page handles going back itself and the
+       PageRow does not change.
+ 
++      The system-wide back control of the window (see Kirigami.BackNavigation) calls this
++      function while the PageRow has a layer or a page before the current one.
++
+       \a event Optional, an event that will be accepted if a page is successfully
+       "backed" on, by the PageRow or by the page itself
+      */
+@@ -694,6 +697,11 @@ QT.Control {
+         sequences: [ StandardKey.Back ]
+         onActivated: root.goBack()
+     }
++
++    // System-wide back control of the window: available exactly when goBack() has an effect
++    Platform.BackNavigation.enabled: layersStack.depth > 1 || root.currentIndex >= 1
++    Platform.BackNavigation.onTriggered: root.goBack()
++
+     Shortcut {
+         sequences: [ StandardKey.Forward ]
+         onActivated: root.goForward()

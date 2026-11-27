@@ -1,0 +1,542 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:37:04 +0100
+Subject: [PATCH] taskpanel: show back instead of close while the active window can go back
+Description:
+ WindowUtil follows the back navigation state of every window through
+ kde_back_navigation_shell_v1 (activeWindowCanGoBack) and can ask the
+ compositor to go back in the active window (goBackInActiveWindow()). The
+ state is reported by applications through kde_back_navigation_v1.
+ .
+ The navigation bar shows a back arrow in place of the close button while
+ the active window can go back, and tapping it goes back in that window.
+ Hiding the on-screen keyboard keeps priority. Without the protocol in the
+ compositor or in the application the button closes the window as before.
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files; new files GPL-2.0-or-later, protocol XML file MIT)
+Last-Update: 2026-11-27
+---
+diff --git a/components/windowplugin/CMakeLists.txt b/components/windowplugin/CMakeLists.txt
+index c72368e..c50624e 100644
+--- a/components/windowplugin/CMakeLists.txt
++++ b/components/windowplugin/CMakeLists.txt
+@@ -3,7 +3,14 @@
+ 
+ ecm_add_qml_module(windowplugin URI org.kde.plasma.private.mobileshell.windowplugin GENERATE_PLUGIN_SOURCE)
+ 
+-target_sources(windowplugin PRIVATE windowutil.cpp)
++target_sources(windowplugin PRIVATE windowutil.cpp backnavigation.cpp)
++
++qt6_generate_wayland_protocol_client_sources(windowplugin
++    PRIVATE_CODE
++    FILES
++        ${PLASMA_WAYLAND_PROTOCOLS_DIR}/plasma-window-management.xml
++        ${CMAKE_CURRENT_SOURCE_DIR}/kde-back-navigation-shell-v1.xml
++)
+ 
+ ecm_target_qml_sources(windowplugin SOURCES qml/WindowMaximizedTracker.qml)
+ 
+@@ -13,6 +20,8 @@ target_link_libraries(windowplugin PRIVATE
+     Qt::Gui
+     Qt::Quick
+     Plasma::KWaylandClient
++    Qt::WaylandClient
++    Wayland::Client
+     KF6::Service
+     KF6::ConfigCore
+ )
+diff --git a/components/windowplugin/backnavigation.cpp b/components/windowplugin/backnavigation.cpp
+new file mode 100644
+index 0000000..9570fef
+--- /dev/null
++++ b/components/windowplugin/backnavigation.cpp
+@@ -0,0 +1,57 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "backnavigation.h"
++
++BackNavigationWindow::BackNavigationWindow(struct ::kde_back_navigation_window_v1 *object)
++    : QtWayland::kde_back_navigation_window_v1(object)
++{
++}
++
++BackNavigationWindow::~BackNavigationWindow()
++{
++    if (isInitialized()) {
++        destroy();
++    }
++}
++
++bool BackNavigationWindow::isAvailable() const
++{
++    return m_available;
++}
++
++void BackNavigationWindow::kde_back_navigation_window_v1_state(uint32_t state)
++{
++    const bool available = state == state_available;
++    if (m_available == available) {
++        return;
++    }
++    m_available = available;
++    Q_EMIT availableChanged();
++}
++
++BackNavigationShell::BackNavigationShell()
++    : QWaylandClientExtensionTemplate<BackNavigationShell>(1)
++{
++    initialize();
++}
++
++BackNavigationShell::~BackNavigationShell()
++{
++    if (isActive()) {
++        destroy();
++    }
++}
++
++std::unique_ptr<BackNavigationWindow> BackNavigationShell::windowBackNavigation(struct ::org_kde_plasma_window *window)
++{
++    if (!isActive() || !window) {
++        return nullptr;
++    }
++    return std::make_unique<BackNavigationWindow>(get_window(window));
++}
++
++#include "moc_backnavigation.cpp"
+diff --git a/components/windowplugin/backnavigation.h b/components/windowplugin/backnavigation.h
+new file mode 100644
+index 0000000..9cd97c6
+--- /dev/null
++++ b/components/windowplugin/backnavigation.h
+@@ -0,0 +1,58 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#pragma once
++
++#include <QObject>
++#include <QWaylandClientExtensionTemplate>
++
++#include <memory>
++
++#include "qwayland-kde-back-navigation-shell-v1.h"
++
++struct org_kde_plasma_window;
++
++/**
++ * Back navigation state of one window (kde_back_navigation_window_v1).
++ */
++class BackNavigationWindow : public QObject, public QtWayland::kde_back_navigation_window_v1
++{
++    Q_OBJECT
++
++public:
++    explicit BackNavigationWindow(struct ::kde_back_navigation_window_v1 *object);
++    ~BackNavigationWindow() override;
++
++    /**
++     * Whether back currently has an effect in the window.
++     */
++    bool isAvailable() const;
++
++Q_SIGNALS:
++    void availableChanged();
++
++protected:
++    void kde_back_navigation_window_v1_state(uint32_t state) override;
++
++private:
++    bool m_available = false;
++};
++
++/**
++ * The kde_back_navigation_shell_v1 global.
++ */
++class BackNavigationShell : public QWaylandClientExtensionTemplate<BackNavigationShell>, public QtWayland::kde_back_navigation_shell_v1
++{
++public:
++    BackNavigationShell();
++    ~BackNavigationShell() override;
++
++    /**
++     * Returns the back navigation of @p window, or @c null if the compositor does not offer
++     * kde_back_navigation_shell_v1.
++     */
++    std::unique_ptr<BackNavigationWindow> windowBackNavigation(struct ::org_kde_plasma_window *window);
++};
+diff --git a/components/windowplugin/kde-back-navigation-shell-v1.xml b/components/windowplugin/kde-back-navigation-shell-v1.xml
+new file mode 100644
+index 0000000..5546ab8
+--- /dev/null
++++ b/components/windowplugin/kde-back-navigation-shell-v1.xml
+@@ -0,0 +1,121 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="kde_back_navigation_shell_v1">
++  <copyright>
++    Copyright © 2026 masterxq
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <description summary="back navigation for the windows of a Plasma shell">
++    This protocol gives a shell that manages windows through
++    org_kde_plasma_window_management access to the back navigation state of
++    those windows and lets it trigger back in them. The state and the meaning
++    of back are defined by the kde_back_navigation_v1 protocol, through which
++    applications take part.
++
++    A shell would typically offer a back control for the active window while
++    its state is available, and its usual controls (for example closing the
++    window) otherwise.
++
++    Access to a window requires its org_kde_plasma_window object, so only
++    clients that the compositor allows to manage windows can use this
++    protocol.
++
++    Warning! The protocol described in this file is currently in the testing
++    phase. Backward compatible changes may be added together with the
++    corresponding interface version bump. Backward incompatible changes can
++    only be done by creating a new major version of the extension.
++  </description>
++
++  <interface name="kde_back_navigation_shell_v1" version="1">
++    <description summary="access back navigation of plasma windows">
++      A global that creates kde_back_navigation_window_v1 objects for
++      org_kde_plasma_window objects.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the global">
++        Destroy the object. Objects created through it are not affected.
++      </description>
++    </request>
++
++    <request name="get_window">
++      <description summary="get the back navigation of a window">
++        Create a kde_back_navigation_window_v1 object for the window that the
++        given org_kde_plasma_window represents. Several objects may be created
++        for the same window; each one reports the state and can trigger back.
++      </description>
++      <arg name="id" type="new_id" interface="kde_back_navigation_window_v1"/>
++      <arg name="window" type="object" interface="org_kde_plasma_window"/>
++    </request>
++  </interface>
++
++  <interface name="kde_back_navigation_window_v1" version="1">
++    <description summary="back navigation of one window">
++      The back navigation state of one window and the request to go back in
++      it.
++
++      When the window is unmapped (org_kde_plasma_window.unmapped) or its
++      org_kde_plasma_window was already unmapped when this object was created,
++      the object becomes inert: no further events are sent, also not the
++      initial state event, and back has no effect. The client should destroy
++      it.
++    </description>
++
++    <enum name="state">
++      <entry name="unavailable" value="0"
++        summary="back has no effect in the window"/>
++      <entry name="available" value="1"
++        summary="back goes back one step in the window"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the object">
++        Destroy the object.
++      </description>
++    </request>
++
++    <event name="state">
++      <description summary="back navigation state of the window">
++        The current back navigation state of the window as the application
++        set it with kde_back_navigation_v1.set_state. Windows of applications
++        that do not use kde_back_navigation_v1, and windows that are not
++        xdg_toplevels, are always unavailable.
++
++        Sent once right after the object is created, then whenever the state
++        changes.
++      </description>
++      <arg name="state" type="uint" enum="state"/>
++    </event>
++
++    <request name="back">
++      <description summary="go back in the window">
++        Ask the compositor to send kde_back_navigation_v1.back to the window.
++        Use this only in response to a user action.
++
++        The compositor sends the event only if the state of the window is
++        available when it processes this request and the window can receive
++        user input (see kde_back_navigation_v1.back); otherwise the request
++        has no effect. No answer is sent; a change of the state is reported
++        through the state event.
++      </description>
++    </request>
++  </interface>
++</protocol>
+diff --git a/components/windowplugin/windowutil.cpp b/components/windowplugin/windowutil.cpp
+index 51427e4..996eefe 100644
+--- a/components/windowplugin/windowutil.cpp
++++ b/components/windowplugin/windowutil.cpp
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "windowutil.h"
++#include "backnavigation.h"
+ 
+ #include <KApplicationTrader>
+ 
+@@ -27,6 +28,8 @@ WindowUtil::WindowUtil(QObject *parent)
+     initWayland();
+ }
+ 
++WindowUtil::~WindowUtil() = default;
++
+ bool WindowUtil::isShowingDesktop() const
+ {
+     return m_showingDesktop;
+@@ -51,6 +54,9 @@ void WindowUtil::initWayland()
+         return;
+     }
+ 
++    m_backNavigationShell = std::make_unique<BackNavigationShell>();
++    connect(m_backNavigationShell.get(), &BackNavigationShell::activeChanged, this, &WindowUtil::resetBackNavigation);
++
+     auto *registry = new Registry(this);
+     registry->create(connection);
+ 
+@@ -62,6 +68,8 @@ void WindowUtil::initWayland()
+             Q_EMIT windowCreated(window);
+         });
+         connect(m_windowManagement, &KWayland::Client::PlasmaWindowManagement::windowCreated, this, &WindowUtil::windowCreatedSlot);
++        connect(m_windowManagement, &KWayland::Client::PlasmaWindowManagement::windowCreated, this, &WindowUtil::trackBackNavigation);
++        resetBackNavigation();
+ 
+         connect(m_windowManagement, &PlasmaWindowManagement::showingDesktopChanged, this, &WindowUtil::updateShowingDesktop);
+         connect(m_windowManagement, &PlasmaWindowManagement::activeWindowChanged, m_activeWindowTimer, qOverload<>(&QTimer::start));
+@@ -139,6 +147,7 @@ void WindowUtil::updateActiveWindow()
+     }
+ 
+     Q_EMIT hasCloseableActiveWindowChanged();
++    Q_EMIT activeWindowCanGoBackChanged();
+ }
+ 
+ bool WindowUtil::hasCloseableActiveWindow() const
+@@ -165,6 +174,70 @@ void WindowUtil::closeActiveWindow()
+     }
+ }
+ 
++bool WindowUtil::activeWindowCanGoBack() const
++{
++    if (!m_activeWindow) {
++        return false;
++    }
++    const auto it = m_backNavigation.find(m_activeWindow.data());
++    return it != m_backNavigation.end() && it->second->isAvailable();
++}
++
++void WindowUtil::goBackInActiveWindow()
++{
++    if (!m_activeWindow) {
++        return;
++    }
++    // Sent to the window the state was shown for; the compositor checks the state again.
++    const auto it = m_backNavigation.find(m_activeWindow.data());
++    if (it != m_backNavigation.end() && it->second->isAvailable()) {
++        it->second->back();
++    }
++}
++
++void WindowUtil::trackBackNavigation(KWayland::Client::PlasmaWindow *window)
++{
++    if (!window || m_backNavigation.contains(window)) {
++        return;
++    }
++    auto backNavigation = m_backNavigationShell->windowBackNavigation(*window);
++    if (!backNavigation) {
++        return;
++    }
++    connect(backNavigation.get(), &BackNavigationWindow::availableChanged, this, [this, window]() {
++        if (window == m_activeWindow) {
++            Q_EMIT activeWindowCanGoBackChanged();
++        }
++    });
++    connect(window, &KWayland::Client::PlasmaWindow::unmapped, backNavigation.get(), [this, window]() {
++        untrackBackNavigation(window);
++    });
++    connect(window, &QObject::destroyed, backNavigation.get(), [this, window]() {
++        untrackBackNavigation(window);
++    });
++    m_backNavigation.emplace(window, std::move(backNavigation));
++}
++
++void WindowUtil::untrackBackNavigation(KWayland::Client::PlasmaWindow *window)
++{
++    // Deleting the object also ends the connections it is the context of.
++    if (m_backNavigation.erase(window) && window == m_activeWindow) {
++        Q_EMIT activeWindowCanGoBackChanged();
++    }
++}
++
++void WindowUtil::resetBackNavigation()
++{
++    m_backNavigation.clear();
++    if (m_windowManagement && m_backNavigationShell->isActive()) {
++        const auto windows = m_windowManagement->windows();
++        for (auto *window : windows) {
++            trackBackNavigation(window);
++        }
++    }
++    Q_EMIT activeWindowCanGoBackChanged();
++}
++
+ void WindowUtil::requestShowingDesktop(bool showingDesktop)
+ {
+     if (!m_windowManagement) {
+@@ -244,6 +317,7 @@ void WindowUtil::forgetActiveWindow()
+     }
+     m_activeWindow.clear();
+     Q_EMIT hasCloseableActiveWindowChanged();
++    Q_EMIT activeWindowCanGoBackChanged();
+ }
+ 
+ QList<KWayland::Client::PlasmaWindow *> WindowUtil::windowsFromStorageId(const QString &storageId) const
+diff --git a/components/windowplugin/windowutil.h b/components/windowplugin/windowutil.h
+index b13fdad..878609a 100644
+--- a/components/windowplugin/windowutil.h
++++ b/components/windowplugin/windowutil.h
+@@ -22,6 +22,12 @@
+ #include <KWayland/Client/registry.h>
+ #include <KWayland/Client/surface.h>
+ 
++#include <memory>
++#include <unordered_map>
++
++class BackNavigationShell;
++class BackNavigationWindow;
++
+ /**
+  * Utility class that provides useful functions related to windows and KWin+KWayland.
+  *
+@@ -35,10 +41,12 @@ class WindowUtil : public QObject
+ 
+     Q_PROPERTY(bool isShowingDesktop READ isShowingDesktop WRITE requestShowingDesktop NOTIFY showingDesktopChanged)
+     Q_PROPERTY(bool hasCloseableActiveWindow READ hasCloseableActiveWindow NOTIFY hasCloseableActiveWindowChanged)
++    Q_PROPERTY(bool activeWindowCanGoBack READ activeWindowCanGoBack NOTIFY activeWindowCanGoBackChanged)
+     Q_PROPERTY(bool activeWindowIsShell READ activeWindowIsShell NOTIFY activeWindowIsShellChanged)
+ 
+ public:
+     WindowUtil(QObject *parent = nullptr);
++    ~WindowUtil() override;
+ 
+     /**
+      * Whether the shell is in "desktop showing" mode, where all windows
+@@ -56,6 +64,12 @@ public:
+      */
+     bool hasCloseableActiveWindow() const;
+ 
++    /**
++     * Whether the application of the current active window reports that back has an effect
++     * in it (kde_back_navigation_v1).
++     */
++    bool activeWindowCanGoBack() const;
++
+     /**
+      * Get the list of windows associated to a storage id.
+      */
+@@ -74,6 +88,12 @@ public:
+      */
+     Q_INVOKABLE void closeActiveWindow();
+ 
++    /**
++     * Go back one step in the current active window. Does nothing unless
++     * activeWindowCanGoBack is true.
++     */
++    Q_INVOKABLE void goBackInActiveWindow();
++
+     /**
+      * Toggle whether we are in the "desktop showing" mode.
+      *
+@@ -98,6 +118,7 @@ Q_SIGNALS:
+     void windowCreated(KWayland::Client::PlasmaWindow *window);
+     void showingDesktopChanged(bool showingDesktop);
+     void hasCloseableActiveWindowChanged();
++    void activeWindowCanGoBackChanged();
+     void activeWindowChanged();
+     void activeWindowIsShellChanged();
+ 
+@@ -119,6 +140,9 @@ private Q_SLOTS:
+ private:
+     void initWayland();
+     void updateActiveWindow();
++    void trackBackNavigation(KWayland::Client::PlasmaWindow *window);
++    void untrackBackNavigation(KWayland::Client::PlasmaWindow *window);
++    void resetBackNavigation();
+ 
+     KWayland::Client::PlasmaWindowManagement *m_windowManagement = nullptr;
+     QPointer<KWayland::Client::PlasmaWindow> m_activeWindow;
+@@ -128,4 +152,7 @@ private:
+     bool m_activeWindowIsShell = false;
+ 
+     QHash<QString, QList<KWayland::Client::PlasmaWindow *>> m_windows; // <storageId, window>
++
++    std::unique_ptr<BackNavigationShell> m_backNavigationShell;
++    std::unordered_map<KWayland::Client::PlasmaWindow *, std::unique_ptr<BackNavigationWindow>> m_backNavigation;
+ };
+diff --git a/containments/taskpanel/qml/NavigationPanelComponent.qml b/containments/taskpanel/qml/NavigationPanelComponent.qml
+index 7634604..a044cb6 100644
+--- a/containments/taskpanel/qml/NavigationPanelComponent.qml
++++ b/containments/taskpanel/qml/NavigationPanelComponent.qml
+@@ -93,19 +93,24 @@ MobileShell.NavigationPanel {
+         }
+     }
+ 
+-    // close app/keyboard button
++    // close app/back/keyboard button
+     rightAction: MobileShell.NavigationPanelAction {
+         id: closeAppAction
+ 
+-        enabled: Keyboards.KWinVirtualKeyboard.visible || WindowPlugin.WindowUtil.hasCloseableActiveWindow
+-        iconSource: Keyboards.KWinVirtualKeyboard.visible ? "go-down-symbolic" : "mobile-close-app"
++        // back replaces close while the active window reports that back has an effect in it
++        readonly property bool showBack: !Keyboards.KWinVirtualKeyboard.visible && WindowPlugin.WindowUtil.activeWindowCanGoBack
++
++        enabled: Keyboards.KWinVirtualKeyboard.visible || showBack || WindowPlugin.WindowUtil.hasCloseableActiveWindow
++        iconSource: Keyboards.KWinVirtualKeyboard.visible ? "go-down-symbolic" : (showBack ? "go-previous-symbolic" : "mobile-close-app")
+         // mobile-close-app (from plasma-frameworks) seems to have fewer margins than icons from breeze-icons
+-        shrinkSize: Keyboards.KWinVirtualKeyboard.visible ? 0 : 4
++        shrinkSize: (Keyboards.KWinVirtualKeyboard.visible || showBack) ? 0 : 4
+ 
+         onTriggered: {
+             if (Keyboards.KWinVirtualKeyboard.visible) {
+                 // close keyboard if it is open
+                 Keyboards.KWinVirtualKeyboard.active = false;
++            } else if (showBack) {
++                WindowPlugin.WindowUtil.goBackInActiveWindow();
+             } else if (WindowPlugin.WindowUtil.hasCloseableActiveWindow) {
+                 // if task switcher is closed, but there is an active window
+                 if (tasksModel.activeTask !== 0) {

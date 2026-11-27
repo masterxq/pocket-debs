@@ -1,0 +1,1075 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:37:00 +0100
+Subject: [PATCH] wayland: back navigation: add kde_back_navigation_v1 and its shell protocol
+Description:
+ kde_back_navigation_v1 lets a client report per xdg_toplevel whether back
+ currently has an effect in it and delivers a back event to the toplevel.
+ kde_back_navigation_shell_v1 gives a client that holds an
+ org_kde_plasma_window access to that state and lets it ask for back in that
+ window, so a shell can offer one back control for all applications, for
+ example in the navigation bar of a phone.
+ .
+ The state is kept per Window (Window::isBackAvailable()) and passed on to
+ PlasmaWindowInterface. A back request reaches the client only while the
+ state is available and the window can take input: not while a modal dialog
+ blocks it and not while the session is locked, unless the window is shown
+ above the lock screen.
+Forwarded: no
+License: GPL-2.0-or-later and LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files; new files under src/wayland/ LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL, protocol XML files MIT)
+Last-Update: 2026-11-27
+---
+diff --git a/src/wayland/CMakeLists.txt b/src/wayland/CMakeLists.txt
+index 423ee5b..64d963b 100644
+--- a/src/wayland/CMakeLists.txt
++++ b/src/wayland/CMakeLists.txt
+@@ -34,6 +34,8 @@ ecm_add_qtwayland_server_protocol_kde(WaylandProtocols_xml
+         ${PLASMA_WAYLAND_PROTOCOLS_DIR}/zkde-screencast-unstable-v1.xml
+ 
+         ${PROJECT_SOURCE_DIR}/src/wayland/protocols/frog-color-management-v1.xml
++        ${PROJECT_SOURCE_DIR}/src/wayland/protocols/kde-back-navigation-shell-v1.xml
++        ${PROJECT_SOURCE_DIR}/src/wayland/protocols/kde-back-navigation-v1.xml
+         ${PROJECT_SOURCE_DIR}/src/wayland/protocols/wlr-layer-shell-unstable-v1.xml
+         ${PROJECT_SOURCE_DIR}/src/wayland/protocols/xx-fractional-scale-v2.xml
+         ${PROJECT_SOURCE_DIR}/src/wayland/protocols/xx-pip-v1.xml
+@@ -88,6 +90,7 @@ target_sources(kwin PRIVATE
+     alphamodifier_v1.cpp
+     appmenu.cpp
+     backgroundeffect_v1.cpp
++    backnavigation_v1.cpp
+     clientconnection.cpp
+     colormanagement_v1.cpp
+     colorrepresentation_v1.cpp
+@@ -181,6 +184,7 @@ install(FILES
+     alphamodifier_v1.h
+     appmenu.h
+     backgroundeffect_v1.h
++    backnavigation_v1.h
+     clientconnection.h
+     colormanagement_v1.h
+     colorrepresentation_v1.h
+diff --git a/src/wayland/backnavigation_v1.cpp b/src/wayland/backnavigation_v1.cpp
+new file mode 100644
+index 0000000..30d1ec9
+--- /dev/null
++++ b/src/wayland/backnavigation_v1.cpp
+@@ -0,0 +1,278 @@
++/*
++    SPDX-FileCopyrightText: 2026 masterxq
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#include "backnavigation_v1.h"
++
++#include "display.h"
++#include "plasmawindowmanagement.h"
++#include "xdgshell.h"
++
++#include "qwayland-server-kde-back-navigation-shell-v1.h"
++#include "qwayland-server-kde-back-navigation-v1.h"
++
++#include <QHash>
++#include <QPointer>
++
++namespace KWin
++{
++
++static constexpr int s_managerVersion = 1;
++static constexpr int s_shellVersion = 1;
++
++class BackNavigationManagerV1InterfacePrivate : public QtWaylandServer::kde_back_navigation_manager_v1
++{
++public:
++    BackNavigationManagerV1InterfacePrivate(Display *display, BackNavigationManagerV1Interface *q);
++
++    BackNavigationManagerV1Interface *const q;
++    QHash<XdgToplevelInterface *, BackNavigationV1Interface *> objects;
++
++protected:
++    void kde_back_navigation_manager_v1_destroy(Resource *resource) override;
++    void kde_back_navigation_manager_v1_get_back_navigation(Resource *resource, uint32_t id, wl_resource *toplevel) override;
++};
++
++class BackNavigationV1InterfacePrivate : public QtWaylandServer::kde_back_navigation_v1
++{
++public:
++    BackNavigationV1InterfacePrivate(wl_resource *resource, BackNavigationV1Interface *q);
++
++    void setAvailable(bool set);
++
++    BackNavigationV1Interface *const q;
++    QPointer<XdgToplevelInterface> toplevel;
++    bool available = false;
++
++protected:
++    void kde_back_navigation_v1_destroy(Resource *resource) override;
++    void kde_back_navigation_v1_destroy_resource(Resource *resource) override;
++    void kde_back_navigation_v1_set_state(Resource *resource, uint32_t state) override;
++};
++
++BackNavigationManagerV1InterfacePrivate::BackNavigationManagerV1InterfacePrivate(Display *display, BackNavigationManagerV1Interface *q)
++    : QtWaylandServer::kde_back_navigation_manager_v1(*display, s_managerVersion)
++    , q(q)
++{
++}
++
++void BackNavigationManagerV1InterfacePrivate::kde_back_navigation_manager_v1_destroy(Resource *resource)
++{
++    wl_resource_destroy(resource->handle);
++}
++
++void BackNavigationManagerV1InterfacePrivate::kde_back_navigation_manager_v1_get_back_navigation(Resource *resource, uint32_t id, wl_resource *toplevelResource)
++{
++    XdgToplevelInterface *toplevel = XdgToplevelInterface::get(toplevelResource);
++    if (!toplevel) {
++        wl_resource_post_error(resource->handle, WL_DISPLAY_ERROR_INVALID_OBJECT, "invalid xdg_toplevel");
++        return;
++    }
++    if (objects.contains(toplevel)) {
++        wl_resource_post_error(resource->handle, error_already_constructed, "the xdg_toplevel already has a kde_back_navigation_v1");
++        return;
++    }
++
++    wl_resource *objectResource = wl_resource_create(resource->client(), &kde_back_navigation_v1_interface, resource->version(), id);
++    if (!objectResource) {
++        wl_resource_post_no_memory(resource->handle);
++        return;
++    }
++
++    auto object = new BackNavigationV1Interface(objectResource, toplevel);
++    objects.insert(toplevel, object);
++
++    // The entry goes away with whichever of the two is destroyed first; a toplevel at the same
++    // address can then get a new object.
++    auto remove = [this, toplevel, object]() {
++        objects.removeIf([toplevel, object](const std::pair<XdgToplevelInterface *, BackNavigationV1Interface *> &entry) {
++            return entry.first == toplevel && entry.second == object;
++        });
++    };
++    QObject::connect(object, &QObject::destroyed, q, remove);
++    QObject::connect(toplevel, &QObject::destroyed, q, remove);
++    QObject::connect(toplevel, &QObject::destroyed, object, [object]() {
++        object->d->setAvailable(false);
++    });
++
++    Q_EMIT q->backNavigationCreated(object);
++}
++
++BackNavigationManagerV1Interface::BackNavigationManagerV1Interface(Display *display, QObject *parent)
++    : QObject(parent)
++    , d(std::make_unique<BackNavigationManagerV1InterfacePrivate>(display, this))
++{
++}
++
++BackNavigationManagerV1Interface::~BackNavigationManagerV1Interface() = default;
++
++BackNavigationV1Interface *BackNavigationManagerV1Interface::backNavigationForToplevel(XdgToplevelInterface *toplevel) const
++{
++    return d->objects.value(toplevel);
++}
++
++BackNavigationV1InterfacePrivate::BackNavigationV1InterfacePrivate(wl_resource *resource, BackNavigationV1Interface *q)
++    : QtWaylandServer::kde_back_navigation_v1(resource)
++    , q(q)
++{
++}
++
++void BackNavigationV1InterfacePrivate::setAvailable(bool set)
++{
++    if (available == set) {
++        return;
++    }
++    available = set;
++    Q_EMIT q->availableChanged(available);
++}
++
++void BackNavigationV1InterfacePrivate::kde_back_navigation_v1_destroy(Resource *resource)
++{
++    wl_resource_destroy(resource->handle);
++}
++
++void BackNavigationV1InterfacePrivate::kde_back_navigation_v1_destroy_resource(Resource *resource)
++{
++    setAvailable(false);
++    delete q;
++}
++
++void BackNavigationV1InterfacePrivate::kde_back_navigation_v1_set_state(Resource *resource, uint32_t state)
++{
++    if (state != state_unavailable && state != state_available) {
++        wl_resource_post_error(resource->handle, error_invalid_state, "invalid back navigation state %u", state);
++        return;
++    }
++    if (!toplevel) {
++        return;
++    }
++    setAvailable(state == state_available);
++}
++
++BackNavigationV1Interface::BackNavigationV1Interface(wl_resource *resource, XdgToplevelInterface *toplevel)
++    : d(std::make_unique<BackNavigationV1InterfacePrivate>(resource, this))
++{
++    d->toplevel = toplevel;
++}
++
++BackNavigationV1Interface::~BackNavigationV1Interface() = default;
++
++XdgToplevelInterface *BackNavigationV1Interface::toplevel() const
++{
++    return d->toplevel;
++}
++
++bool BackNavigationV1Interface::isAvailable() const
++{
++    return d->available;
++}
++
++void BackNavigationV1Interface::sendBack()
++{
++    if (!d->toplevel || !d->available) {
++        return;
++    }
++    d->send_back();
++}
++
++class BackNavigationWindowV1 : public QtWaylandServer::kde_back_navigation_window_v1
++{
++public:
++    BackNavigationWindowV1(wl_resource *resource, PlasmaWindowInterface *window);
++    ~BackNavigationWindowV1() override;
++
++    QPointer<PlasmaWindowInterface> window;
++    QMetaObject::Connection availableConnection;
++
++protected:
++    void kde_back_navigation_window_v1_destroy(Resource *resource) override;
++    void kde_back_navigation_window_v1_destroy_resource(Resource *resource) override;
++    void kde_back_navigation_window_v1_back(Resource *resource) override;
++};
++
++class BackNavigationShellV1InterfacePrivate : public QtWaylandServer::kde_back_navigation_shell_v1
++{
++public:
++    BackNavigationShellV1InterfacePrivate(Display *display);
++
++protected:
++    void kde_back_navigation_shell_v1_destroy(Resource *resource) override;
++    void kde_back_navigation_shell_v1_get_window(Resource *resource, uint32_t id, wl_resource *window) override;
++};
++
++static uint32_t windowState(PlasmaWindowInterface *window)
++{
++    return window->isBackAvailable() ? QtWaylandServer::kde_back_navigation_window_v1::state_available
++                                     : QtWaylandServer::kde_back_navigation_window_v1::state_unavailable;
++}
++
++BackNavigationWindowV1::BackNavigationWindowV1(wl_resource *resource, PlasmaWindowInterface *window)
++    : QtWaylandServer::kde_back_navigation_window_v1(resource)
++    , window(window)
++{
++    if (!window) {
++        return;
++    }
++    // The connection ends when the window is destroyed; the object is inert from then on.
++    availableConnection = QObject::connect(window, &PlasmaWindowInterface::backAvailableChanged, window, [this]() {
++        send_state(windowState(this->window));
++    });
++    send_state(windowState(window));
++}
++
++BackNavigationWindowV1::~BackNavigationWindowV1()
++{
++    QObject::disconnect(availableConnection);
++}
++
++void BackNavigationWindowV1::kde_back_navigation_window_v1_destroy(Resource *resource)
++{
++    wl_resource_destroy(resource->handle);
++}
++
++void BackNavigationWindowV1::kde_back_navigation_window_v1_destroy_resource(Resource *resource)
++{
++    delete this;
++}
++
++void BackNavigationWindowV1::kde_back_navigation_window_v1_back(Resource *resource)
++{
++    if (window) {
++        window->requestBack();
++    }
++}
++
++BackNavigationShellV1InterfacePrivate::BackNavigationShellV1InterfacePrivate(Display *display)
++    : QtWaylandServer::kde_back_navigation_shell_v1(*display, s_shellVersion)
++{
++}
++
++void BackNavigationShellV1InterfacePrivate::kde_back_navigation_shell_v1_destroy(Resource *resource)
++{
++    wl_resource_destroy(resource->handle);
++}
++
++void BackNavigationShellV1InterfacePrivate::kde_back_navigation_shell_v1_get_window(Resource *resource, uint32_t id, wl_resource *windowResource)
++{
++    wl_resource *objectResource = wl_resource_create(resource->client(), &kde_back_navigation_window_v1_interface, resource->version(), id);
++    if (!objectResource) {
++        wl_resource_post_no_memory(resource->handle);
++        return;
++    }
++    // An org_kde_plasma_window whose window is already gone yields an inert object.
++    new BackNavigationWindowV1(objectResource, PlasmaWindowInterface::get(windowResource));
++}
++
++BackNavigationShellV1Interface::BackNavigationShellV1Interface(Display *display, QObject *parent)
++    : QObject(parent)
++    , d(std::make_unique<BackNavigationShellV1InterfacePrivate>(display))
++{
++}
++
++BackNavigationShellV1Interface::~BackNavigationShellV1Interface() = default;
++
++}
++
++#include "moc_backnavigation_v1.cpp"
+diff --git a/src/wayland/backnavigation_v1.h b/src/wayland/backnavigation_v1.h
+new file mode 100644
+index 0000000..eae815d
+--- /dev/null
++++ b/src/wayland/backnavigation_v1.h
+@@ -0,0 +1,108 @@
++/*
++    SPDX-FileCopyrightText: 2026 masterxq
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#pragma once
++
++#include "kwin_export.h"
++
++#include <QObject>
++
++#include <memory>
++
++struct wl_resource;
++
++namespace KWin
++{
++
++class Display;
++class BackNavigationV1Interface;
++class BackNavigationV1InterfacePrivate;
++class BackNavigationManagerV1InterfacePrivate;
++class BackNavigationShellV1InterfacePrivate;
++class XdgToplevelInterface;
++
++/**
++ * The BackNavigationManagerV1Interface implements the kde_back_navigation_manager_v1 global,
++ * through which clients report whether back has an effect in a toplevel.
++ */
++class KWIN_EXPORT BackNavigationManagerV1Interface : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit BackNavigationManagerV1Interface(Display *display, QObject *parent = nullptr);
++    ~BackNavigationManagerV1Interface() override;
++
++    /**
++     * Returns the back navigation object of @p toplevel, or @c null if it has none.
++     */
++    BackNavigationV1Interface *backNavigationForToplevel(XdgToplevelInterface *toplevel) const;
++
++Q_SIGNALS:
++    void backNavigationCreated(BackNavigationV1Interface *backNavigation);
++
++private:
++    std::unique_ptr<BackNavigationManagerV1InterfacePrivate> d;
++};
++
++/**
++ * The BackNavigationV1Interface represents a kde_back_navigation_v1 object, the back navigation
++ * state of one xdg_toplevel.
++ *
++ * The object is destroyed together with its resource. When that happens while the state is
++ * available, availableChanged() is emitted with @c false first.
++ */
++class KWIN_EXPORT BackNavigationV1Interface : public QObject
++{
++    Q_OBJECT
++
++public:
++    ~BackNavigationV1Interface() override;
++
++    /**
++     * Returns the toplevel, or @c null if it has been destroyed. Without a toplevel the object
++     * is inert.
++     */
++    XdgToplevelInterface *toplevel() const;
++
++    /**
++     * Whether back currently has an effect in the toplevel.
++     */
++    bool isAvailable() const;
++
++    /**
++     * Sends the back event to the client. Does nothing if the state is not available.
++     */
++    void sendBack();
++
++Q_SIGNALS:
++    void availableChanged(bool available);
++
++private:
++    BackNavigationV1Interface(wl_resource *resource, XdgToplevelInterface *toplevel);
++    friend class BackNavigationManagerV1InterfacePrivate;
++    std::unique_ptr<BackNavigationV1InterfacePrivate> d;
++};
++
++/**
++ * The BackNavigationShellV1Interface implements the kde_back_navigation_shell_v1 global. It gives
++ * clients that hold an org_kde_plasma_window access to the back navigation state of that window
++ * (PlasmaWindowInterface::isBackAvailable()) and forwards their back requests
++ * (PlasmaWindowInterface::backRequested()).
++ */
++class KWIN_EXPORT BackNavigationShellV1Interface : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit BackNavigationShellV1Interface(Display *display, QObject *parent = nullptr);
++    ~BackNavigationShellV1Interface() override;
++
++private:
++    std::unique_ptr<BackNavigationShellV1InterfacePrivate> d;
++};
++
++}
+diff --git a/src/wayland/plasmawindowmanagement.cpp b/src/wayland/plasmawindowmanagement.cpp
+index afa69b1..fbb2c46 100644
+--- a/src/wayland/plasmawindowmanagement.cpp
++++ b/src/wayland/plasmawindowmanagement.cpp
+@@ -105,6 +105,7 @@ public:
+     QString uuid;
+     QString m_resourceName;
+     Rect clientGeometry;
++    bool backAvailable = false;
+ 
+ protected:
+     Resource *org_kde_plasma_window_allocate() override;
+@@ -805,6 +806,38 @@ PlasmaWindowInterface::PlasmaWindowInterface(PlasmaWindowManagementInterface *wm
+ 
+ PlasmaWindowInterface::~PlasmaWindowInterface() = default;
+ 
++PlasmaWindowInterface *PlasmaWindowInterface::get(wl_resource *resource)
++{
++    auto windowResource = QtWaylandServer::org_kde_plasma_window::Resource::fromResource(resource);
++    if (!windowResource) {
++        return nullptr;
++    }
++    auto window = static_cast<PlasmaWindowInterfacePrivate *>(windowResource->object());
++    if (!window || window->unmapped) {
++        return nullptr;
++    }
++    return window->q;
++}
++
++void PlasmaWindowInterface::setBackAvailable(bool set)
++{
++    if (d->backAvailable == set) {
++        return;
++    }
++    d->backAvailable = set;
++    Q_EMIT backAvailableChanged(set);
++}
++
++bool PlasmaWindowInterface::isBackAvailable() const
++{
++    return d->backAvailable;
++}
++
++void PlasmaWindowInterface::requestBack()
++{
++    Q_EMIT backRequested();
++}
++
+ void PlasmaWindowInterface::setAppId(const QString &appId)
+ {
+     d->setAppId(appId);
+diff --git a/src/wayland/plasmawindowmanagement.h b/src/wayland/plasmawindowmanagement.h
+index ef6ef81..5e3bf16 100644
+--- a/src/wayland/plasmawindowmanagement.h
++++ b/src/wayland/plasmawindowmanagement.h
+@@ -14,6 +14,8 @@
+ 
+ class QSize;
+ 
++struct wl_resource;
++
+ namespace KWin
+ {
+ 
+@@ -113,6 +115,12 @@ class KWIN_EXPORT PlasmaWindowInterface : public QObject
+ public:
+     ~PlasmaWindowInterface() override;
+ 
++    /**
++     * Returns the PlasmaWindowInterface of the org_kde_plasma_window @p resource, or @c null if
++     * the window has been destroyed.
++     */
++    static PlasmaWindowInterface *get(wl_resource *resource);
++
+     void setTitle(const QString &title);
+     void setAppId(const QString &appId);
+     void setPid(quint32 pid);
+@@ -143,6 +151,18 @@ public:
+     void setCanSetNoBorder(bool set);
+     void setExcludeFromCapture(bool set);
+ 
++    /**
++     * Sets whether back has an effect in the window (kde_back_navigation_v1). Clients of
++     * kde_back_navigation_shell_v1 observe it.
++     */
++    void setBackAvailable(bool set);
++    bool isBackAvailable() const;
++
++    /**
++     * Emits backRequested(). Called for a client that asks to go back in the window.
++     */
++    void requestBack();
++
+     /**
+      * This method removes the Window and the Client is supposed to release the resource
+      * bound for this Window.
+@@ -304,6 +324,8 @@ Q_SIGNALS:
+     void clientGeometryChanged(const KWin::Rect &geometry);
+     void noBorderRequested(bool noBorder);
+     void excludeFromCaptureRequested(bool exclude);
++    void backAvailableChanged(bool available);
++    void backRequested();
+ 
+ private:
+     friend class PlasmaWindowManagementInterface;
+diff --git a/src/wayland/protocols/kde-back-navigation-shell-v1.xml b/src/wayland/protocols/kde-back-navigation-shell-v1.xml
+new file mode 100644
+index 0000000..5546ab8
+--- /dev/null
++++ b/src/wayland/protocols/kde-back-navigation-shell-v1.xml
+@@ -0,0 +1,121 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="kde_back_navigation_shell_v1">
++  <copyright>
++    Copyright © 2026 masterxq
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <description summary="back navigation for the windows of a Plasma shell">
++    This protocol gives a shell that manages windows through
++    org_kde_plasma_window_management access to the back navigation state of
++    those windows and lets it trigger back in them. The state and the meaning
++    of back are defined by the kde_back_navigation_v1 protocol, through which
++    applications take part.
++
++    A shell would typically offer a back control for the active window while
++    its state is available, and its usual controls (for example closing the
++    window) otherwise.
++
++    Access to a window requires its org_kde_plasma_window object, so only
++    clients that the compositor allows to manage windows can use this
++    protocol.
++
++    Warning! The protocol described in this file is currently in the testing
++    phase. Backward compatible changes may be added together with the
++    corresponding interface version bump. Backward incompatible changes can
++    only be done by creating a new major version of the extension.
++  </description>
++
++  <interface name="kde_back_navigation_shell_v1" version="1">
++    <description summary="access back navigation of plasma windows">
++      A global that creates kde_back_navigation_window_v1 objects for
++      org_kde_plasma_window objects.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the global">
++        Destroy the object. Objects created through it are not affected.
++      </description>
++    </request>
++
++    <request name="get_window">
++      <description summary="get the back navigation of a window">
++        Create a kde_back_navigation_window_v1 object for the window that the
++        given org_kde_plasma_window represents. Several objects may be created
++        for the same window; each one reports the state and can trigger back.
++      </description>
++      <arg name="id" type="new_id" interface="kde_back_navigation_window_v1"/>
++      <arg name="window" type="object" interface="org_kde_plasma_window"/>
++    </request>
++  </interface>
++
++  <interface name="kde_back_navigation_window_v1" version="1">
++    <description summary="back navigation of one window">
++      The back navigation state of one window and the request to go back in
++      it.
++
++      When the window is unmapped (org_kde_plasma_window.unmapped) or its
++      org_kde_plasma_window was already unmapped when this object was created,
++      the object becomes inert: no further events are sent, also not the
++      initial state event, and back has no effect. The client should destroy
++      it.
++    </description>
++
++    <enum name="state">
++      <entry name="unavailable" value="0"
++        summary="back has no effect in the window"/>
++      <entry name="available" value="1"
++        summary="back goes back one step in the window"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the object">
++        Destroy the object.
++      </description>
++    </request>
++
++    <event name="state">
++      <description summary="back navigation state of the window">
++        The current back navigation state of the window as the application
++        set it with kde_back_navigation_v1.set_state. Windows of applications
++        that do not use kde_back_navigation_v1, and windows that are not
++        xdg_toplevels, are always unavailable.
++
++        Sent once right after the object is created, then whenever the state
++        changes.
++      </description>
++      <arg name="state" type="uint" enum="state"/>
++    </event>
++
++    <request name="back">
++      <description summary="go back in the window">
++        Ask the compositor to send kde_back_navigation_v1.back to the window.
++        Use this only in response to a user action.
++
++        The compositor sends the event only if the state of the window is
++        available when it processes this request and the window can receive
++        user input (see kde_back_navigation_v1.back); otherwise the request
++        has no effect. No answer is sent; a change of the state is reported
++        through the state event.
++      </description>
++    </request>
++  </interface>
++</protocol>
+diff --git a/src/wayland/protocols/kde-back-navigation-v1.xml b/src/wayland/protocols/kde-back-navigation-v1.xml
+new file mode 100644
+index 0000000..159e20f
+--- /dev/null
++++ b/src/wayland/protocols/kde-back-navigation-v1.xml
+@@ -0,0 +1,170 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="kde_back_navigation_v1">
++  <copyright>
++    Copyright © 2026 masterxq
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <description summary="system-wide back navigation for toplevels">
++    This protocol lets a client tell the compositor whether a "back" action
++    currently has an effect in one of its toplevels, and lets the compositor
++    ask the client to go back in that toplevel.
++
++    It is meant for environments where the system offers one back control for
++    all applications, for example a back button in the navigation bar of a
++    phone shell, a back gesture or a hardware back key. Such a control replaces
++    the per-application back buttons the user would otherwise have to reach in
++    the window content. The compositor decides how and when the control is
++    presented; this protocol only carries the state of the toplevel and the
++    back request.
++
++    A toplevel without a kde_back_navigation_v1 object, and every toplevel of a
++    compositor that does not offer this protocol, behaves as without it: back
++    is never available for it and no back event is ever sent to it.
++
++    Warning! The protocol described in this file is currently in the testing
++    phase. Backward compatible changes may be added together with the
++    corresponding interface version bump. Backward incompatible changes can
++    only be done by creating a new major version of the extension.
++  </description>
++
++  <interface name="kde_back_navigation_manager_v1" version="1">
++    <description summary="create back navigation objects for toplevels">
++      A global that creates kde_back_navigation_v1 objects for xdg_toplevels.
++    </description>
++
++    <enum name="error">
++      <entry name="already_constructed" value="0"
++        summary="the xdg_toplevel already has a kde_back_navigation_v1 object"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the manager">
++        Destroy the manager. Objects created through it are not affected.
++      </description>
++    </request>
++
++    <request name="get_back_navigation">
++      <description summary="create a back navigation object for a toplevel">
++        Create a kde_back_navigation_v1 object for the given xdg_toplevel. Its
++        state is initially unavailable.
++
++        The object may be created at any time in the life of the toplevel,
++        before or after it is mapped. Creating a second object for a toplevel
++        that already has one is a protocol error (already_constructed); after
++        the first object is destroyed a new one may be created.
++      </description>
++      <arg name="id" type="new_id" interface="kde_back_navigation_v1"/>
++      <arg name="toplevel" type="object" interface="xdg_toplevel"/>
++    </request>
++  </interface>
++
++  <interface name="kde_back_navigation_v1" version="1">
++    <description summary="back navigation state and requests of a toplevel">
++      Carries the back navigation state of one xdg_toplevel and the back
++      requests the compositor sends to it.
++
++      The state and the back event refer to this toplevel only. Every
++      xdg_toplevel has its own state, also one with a parent
++      (xdg_toplevel.set_parent) or one that is a dialog (xdg_dialog_v1). The
++      compositor never sends back to a toplevel because of the state of
++      another one, and never forwards a back action of a dialog to its parent
++      or of a parent to its dialog. A dialog that leaves its state unavailable
++      is handled as without this protocol: the compositor may offer to close
++      it (xdg_toplevel.close) instead.
++
++      xdg_popups have no state of their own. A compositor that dismisses open
++      popups when the user operates its back control should not also send
++      back for that interaction.
++
++      The object stays valid while the toplevel is unmapped and mapped again,
++      and keeps its state. If the xdg_toplevel is destroyed first, the object
++      becomes inert: requests have no effect and no events are sent. Destroying
++      this object makes the state of the toplevel unavailable.
++    </description>
++
++    <enum name="state">
++      <entry name="unavailable" value="0"
++        summary="back has no effect in the toplevel"/>
++      <entry name="available" value="1"
++        summary="back goes back one step in the toplevel"/>
++    </enum>
++
++    <enum name="error">
++      <entry name="invalid_state" value="0"
++        summary="the state is not a value of the state enum"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the back navigation object">
++        Destroy the object. The state of the toplevel becomes unavailable
++        immediately.
++      </description>
++    </request>
++
++    <request name="set_state">
++      <description summary="set whether back has an effect">
++        Set whether a back event received now would have an effect in the
++        toplevel. The new state applies as soon as the compositor processes
++        this request; it is not double-buffered and needs no wl_surface.commit,
++        because it does not describe the content of the surface.
++
++        The state must be available exactly when a back event would go back
++        one step within the toplevel, as the back button or the Back key of the
++        application itself would: return to the previous page or view, close an
++        overlay drawn inside the toplevel (a drawer, a sheet, an in-window
++        dialog, a search field), or leave a mode such as a selection or an
++        editing mode. It must be unavailable when back would do nothing, and
++        when the only thing it could do is to close the toplevel or to quit the
++        application: closing is offered by the compositor by other means.
++
++        The client keeps the state up to date at all times, also while the
++        toplevel is not focused, minimized or unmapped, so that the compositor
++        can present the right control as soon as the toplevel becomes active.
++        Setting the state it already has is allowed and has no effect.
++
++        A value that is not part of the state enum is a protocol error
++        (invalid_state).
++      </description>
++      <arg name="state" type="uint" enum="state"/>
++    </request>
++
++    <event name="back">
++      <description summary="go back one step">
++        The user asked to go back in this toplevel. The client goes back one
++        step, as described for set_state, exactly as if its own back control
++        had been used, and updates the state afterwards.
++
++        The compositor sends this event only in response to a user action and
++        only while the state is available as far as it knows. Because the
++        client can change the state at any time, the event may arrive after the
++        client has made the state unavailable. A client that has nothing to go
++        back to when it handles the event must ignore it; in particular it must
++        not close the toplevel or quit the application because of it.
++
++        The compositor does not wait for an answer and sends no further event
++        for the same action. A compositor should not send this event to a
++        toplevel that currently cannot receive user input, for example while it
++        is blocked by a modal dialog or while the session is locked.
++      </description>
++    </event>
++  </interface>
++</protocol>
+diff --git a/src/wayland_server.cpp b/src/wayland_server.cpp
+index fe09957..3d3b03c 100644
+--- a/src/wayland_server.cpp
++++ b/src/wayland_server.cpp
+@@ -28,6 +28,7 @@
+ #include "wayland/alphamodifier_v1.h"
+ #include "wayland/appmenu.h"
+ #include "wayland/backgroundeffect_v1.h"
++#include "wayland/backnavigation_v1.h"
+ #include "wayland/clientconnection.h"
+ #include "wayland/colormanagement_v1.h"
+ #include "wayland/colorrepresentation_v1.h"
+@@ -279,6 +280,9 @@ void WaylandServer::registerXdgToplevelWindow(XdgToplevelWindow *window)
+     if (auto dialog = m_xdgDialogWm->dialogForToplevel(window->shellSurface())) {
+         window->installXdgDialogV1(dialog);
+     }
++    if (auto backNavigation = m_backNavigationManager->backNavigationForToplevel(window->shellSurface())) {
++        window->installBackNavigationV1(backNavigation);
++    }
+ 
+     connect(m_XdgForeign, &XdgForeignV2Interface::transientChanged, window, [this](SurfaceInterface *child) {
+         Q_EMIT foreignTransientChanged(child);
+@@ -525,6 +529,13 @@ bool WaylandServer::init()
+             window->installXdgDialogV1(dialog);
+         }
+     });
++    m_backNavigationManager = new BackNavigationManagerV1Interface(m_display, m_display);
++    connect(m_backNavigationManager, &BackNavigationManagerV1Interface::backNavigationCreated, this, [this](BackNavigationV1Interface *backNavigation) {
++        if (auto window = findXdgToplevelWindow(backNavigation->toplevel()->surface())) {
++            window->installBackNavigationV1(backNavigation);
++        }
++    });
++    new BackNavigationShellV1Interface(m_display, m_display);
+ 
+     m_externalBrightness = new ExternalBrightnessV1(m_display, m_display);
+     m_alphaModifierManager = new AlphaModifierManagerV1(m_display, m_display);
+diff --git a/src/wayland_server.h b/src/wayland_server.h
+index f0fa218..22f7bca 100644
+--- a/src/wayland_server.h
++++ b/src/wayland_server.h
+@@ -51,6 +51,7 @@ class TearingControlManagerV1Interface;
+ class XwaylandShellV1Interface;
+ class OutputOrderV1Interface;
+ class XdgDialogWmV1Interface;
++class BackNavigationManagerV1Interface;
+ class ExternalBrightnessV1;
+ class XdgToplevelTagManagerV1;
+ class PointerWarpV1;
+@@ -296,6 +297,7 @@ private:
+     OutputOrderV1Interface *m_outputOrder = nullptr;
+     ColorManagerV1 *m_colorManager = nullptr;
+     XdgDialogWmV1Interface *m_xdgDialogWm = nullptr;
++    BackNavigationManagerV1Interface *m_backNavigationManager = nullptr;
+     ExternalBrightnessV1 *m_externalBrightness = nullptr;
+     AlphaModifierManagerV1 *m_alphaModifierManager = nullptr;
+     FifoManagerV1 *m_fifoManager = nullptr;
+diff --git a/src/window.cpp b/src/window.cpp
+index aedd275..7151028 100644
+--- a/src/window.cpp
++++ b/src/window.cpp
+@@ -1710,6 +1710,7 @@ void Window::setupWindowManagementInterface()
+     w->setNoBorder(noBorder());
+     w->setCanSetNoBorder(userCanSetNoBorder());
+     w->setExcludeFromCapture(excludeFromCapture());
++    w->setBackAvailable(isBackAvailable());
+     w->setParentWindow(transientFor() ? transientFor()->windowManagementInterface() : nullptr);
+     w->setGeometry(frameGeometry().toRect());
+     w->setClientGeometry(clientGeometry().toRect());
+@@ -1751,6 +1752,7 @@ void Window::setupWindowManagementInterface()
+     connect(this, &Window::excludeFromCaptureChanged, w, [w, this] {
+         w->setExcludeFromCapture(excludeFromCapture());
+     });
++    connect(this, &Window::backAvailableChanged, w, &PlasmaWindowInterface::setBackAvailable);
+     connect(this, &Window::transientChanged, w, [w, this]() {
+         w->setParentWindow(transientFor() ? transientFor()->windowManagementInterface() : nullptr);
+     });
+@@ -1766,6 +1768,7 @@ void Window::setupWindowManagementInterface()
+     connect(w, &PlasmaWindowInterface::closeRequested, this, [this] {
+         closeWindow();
+     });
++    connect(w, &PlasmaWindowInterface::backRequested, this, &Window::requestBack);
+     connect(w, &PlasmaWindowInterface::moveRequested, this, [this]() {
+         input()->pointer()->warp(frameGeometry().center());
+         performMousePressCommand(Options::MouseMove, Cursors::self()->mouse()->pos());
+@@ -2206,6 +2209,15 @@ bool Window::isModal() const
+     return m_modal;
+ }
+ 
++bool Window::isBackAvailable() const
++{
++    return false;
++}
++
++void Window::requestBack()
++{
++}
++
+ Window *Window::findModal() const
+ {
+     for (Window *transient : m_transients) {
+diff --git a/src/window.h b/src/window.h
+index f1a5283..d7d45d3 100644
+--- a/src/window.h
++++ b/src/window.h
+@@ -1037,6 +1037,16 @@ public:
+     virtual QString captionSuffix() const = 0;
+     virtual bool isPlaceable() const;
+     virtual bool isCloseable() const = 0;
++    /**
++     * Whether back currently has an effect in the window, as reported by the client through
++     * kde_back_navigation_v1.
++     */
++    virtual bool isBackAvailable() const;
++    /**
++     * Asks the client to go back one step in the window. Does nothing if back is not available
++     * or the window cannot take input.
++     */
++    virtual void requestBack();
+     bool isShown() const;
+     bool isHidden() const;
+     void setHidden(bool hidden);
+@@ -1513,6 +1523,7 @@ Q_SIGNALS:
+     void interactiveMoveResizeStepped(const KWin::RectF &geometry);
+     void interactiveMoveResizeFinished();
+     void closeableChanged(bool);
++    void backAvailableChanged(bool);
+     void minimizeableChanged(bool);
+     void maximizeableChanged(bool);
+     void desktopFileNameChanged();
+diff --git a/src/xdgshellwindow.cpp b/src/xdgshellwindow.cpp
+index bacafc9..f3c6678 100644
+--- a/src/xdgshellwindow.cpp
++++ b/src/xdgshellwindow.cpp
+@@ -24,6 +24,7 @@
+ #include "utils/subsurfacemonitor.h"
+ #include "virtualdesktops.h"
+ #include "wayland/appmenu.h"
++#include "wayland/backnavigation_v1.h"
+ #include "wayland/output.h"
+ #include "wayland/plasmashell.h"
+ #include "wayland/seat.h"
+@@ -1755,6 +1756,41 @@ void XdgToplevelWindow::installXdgDialogV1(XdgDialogV1Interface *dialog)
+     setModal(dialog->isModal());
+ }
+ 
++void XdgToplevelWindow::installBackNavigationV1(BackNavigationV1Interface *backNavigation)
++{
++    if (m_backNavigation == backNavigation) {
++        return;
++    }
++    m_backNavigation = backNavigation;
++
++    // Destroying the object emits availableChanged(false) first if it was available.
++    connect(backNavigation, &BackNavigationV1Interface::availableChanged, this, &Window::backAvailableChanged);
++    if (backNavigation->isAvailable()) {
++        Q_EMIT backAvailableChanged(true);
++    }
++}
++
++bool XdgToplevelWindow::isBackAvailable() const
++{
++    return m_backNavigation && m_backNavigation->isAvailable();
++}
++
++void XdgToplevelWindow::requestBack()
++{
++    if (!m_backNavigation || isDeleted()) {
++        return;
++    }
++    // Back is user input to the window: not while a modal dialog blocks the window or while
++    // the session is locked (unless the window is shown above the lock screen).
++    if (findModal()) {
++        return;
++    }
++    if (waylandServer()->isScreenLocked() && !isLockScreenOverlay()) {
++        return;
++    }
++    m_backNavigation->sendBack();
++}
++
+ void XdgToplevelWindow::setFullScreen(bool set)
+ {
+     if (!isFullScreenable()) {
+diff --git a/src/xdgshellwindow.h b/src/xdgshellwindow.h
+index 0121508..c15f7fe 100644
+--- a/src/xdgshellwindow.h
++++ b/src/xdgshellwindow.h
+@@ -35,6 +35,7 @@ class PlasmaShellSurfaceInterface;
+ class ServerSideDecorationInterface;
+ class ServerSideDecorationPaletteInterface;
+ class XdgDialogV1Interface;
++class BackNavigationV1Interface;
+ class XdgToplevelDecorationV1Interface;
+ class LogicalOutput;
+ class Tile;
+@@ -182,6 +183,8 @@ public:
+     bool wantsInput() const override;
+     void setFullScreen(bool set) override;
+     void closeWindow() override;
++    bool isBackAvailable() const override;
++    void requestBack() override;
+     void maximize(MaximizeMode mode, const RectF &restore = RectF()) override;
+ 
+     void installAppMenu(AppMenuInterface *appMenu);
+@@ -189,6 +192,7 @@ public:
+     void installPalette(ServerSideDecorationPaletteInterface *palette);
+     void installXdgDecoration(XdgToplevelDecorationV1Interface *decoration);
+     void installXdgDialogV1(XdgDialogV1Interface *dialog);
++    void installBackNavigationV1(BackNavigationV1Interface *backNavigation);
+ 
+ protected:
+     XdgSurfaceConfigure *sendRoleConfigure() override;
+@@ -260,6 +264,7 @@ private:
+     QPointer<ServerSideDecorationInterface> m_serverDecoration;
+     QPointer<XdgToplevelDecorationV1Interface> m_xdgDecoration;
+     QPointer<XdgDialogV1Interface> m_xdgDialog;
++    QPointer<BackNavigationV1Interface> m_backNavigation;
+     XdgToplevelInterface *m_shellSurface;
+     XdgToplevelInterface::States m_nextStates;
+     XdgToplevelInterface::States m_acknowledgedStates;
