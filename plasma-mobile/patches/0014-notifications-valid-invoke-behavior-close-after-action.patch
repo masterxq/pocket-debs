@@ -1,0 +1,151 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 18:00:00 +0100
+Subject: [PATCH] notifications: pass valid invoke behaviors, close after an action like the desktop
+Description:
+ The action handlers passed NotificationManager.None and
+ NotificationManager.Close, which do not exist (the enum is
+ NotificationManager.Notifications.InvokeBehavior), so the models got
+ undefined and a notification stayed after its action had been invoked.
+ Like the desktop the notification now closes after an action unless it
+ is resident.
+ .
+ The handler for file actions declared its closure under the name of the
+ signal argument; the check for "move to trash"/"delete" then looked at
+ the closure and never matched, so such a notification was only expired
+ instead of closed.
+ .
+ The handlers share one helper that runs an action now or hands it to the
+ parent when actions need an unlock.
+Forwarded: no
+License: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL (as the patched file)
+Last-Update: 2026-11-27
+---
+diff --git a/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml b/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
+index 13b68138b..c7f9f112c 100644
+--- a/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
++++ b/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
+@@ -143,93 +143,58 @@ Item {
+         pendingAction();
+     }
+ 
+-    onActionInvoked: {
+-        let action = () => {
++    // Runs the action now, or hands it to the parent if actions need an unlock first (see requestToInvoke).
++    function invokeOrRequest(action) {
++        if (notificationItem.requestToInvoke) {
++            pendingAction = action;
++            runActionRequested();
++        } else {
++            action();
++        }
++    }
++
++    // Like the desktop: the notification closes after an action, unless it is resident.
++    function invokeBehavior() {
++        return model.resident ? NotificationManager.Notifications.None : NotificationManager.Notifications.Close;
++    }
++
++    onActionInvoked: actionName => {
++        invokeOrRequest(() => {
+             if (notificationsModelType === NotificationsModelType.WatchedNotificationsModel) {
+                 if (actionName === "") {
+-                    notificationsModel.invokeDefaultAction(model.notificationId, NotificationManager.None);
++                    notificationsModel.invokeDefaultAction(model.notificationId, invokeBehavior());
+                 } else {
+-                    notificationsModel.invokeAction(notificationItem.model.notificationId, actionName, NotificationManager.None);
++                    notificationsModel.invokeAction(model.notificationId, actionName, invokeBehavior());
+                 }
+             } else if (notificationsModelType === NotificationsModelType.NotificationsModel) {
+                 if (actionName === "default") {
+-                    notificationsModel.invokeDefaultAction(notificationsModel.index(modelIndex, 0),  NotificationManager.Close); // notification closes
++                    notificationsModel.invokeDefaultAction(notificationsModel.index(modelIndex, 0), invokeBehavior());
+                 } else {
+-                    notificationsModel.invokeAction(notificationsModel.index(modelIndex, 0), actionName,  NotificationManager.Close); // notification closes
++                    notificationsModel.invokeAction(notificationsModel.index(modelIndex, 0), actionName, invokeBehavior());
+                 }
+             }
+-        }
+-
+-        if (notificationItem.requestToInvoke) {
+-            pendingAction = action;
+-            runActionRequested();
+-        } else {
+-            action();
+-        }
++        });
+     }
+ 
+-    onOpenUrl: {
+-        let action = () => {
++    onOpenUrl: url => {
++        invokeOrRequest(() => {
+             Qt.openUrlExternally(url);
+             expire();
+-        }
+-
+-        if (notificationItem.requestToInvoke) {
+-            pendingAction = action;
+-            runActionRequested();
+-        } else {
+-            action();
+-        }
++        });
+     }
+ 
+-    onFileActionInvoked: {
+-        let action = () => {
++    onFileActionInvoked: action => {
++        invokeOrRequest(() => {
+             if (action.objectName === "movetotrash" || action.objectName === "deletefile") {
+                 close();
+             } else {
+                 expire();
+             }
+-        }
+-
+-        if (notificationItem.requestToInvoke) {
+-            pendingAction = action;
+-            runActionRequested();
+-        } else {
+-            action();
+-        }
+-    }
+-
+-    onSuspendJobClicked: {
+-        let action = () => notificationsModel.suspendJob(notificationsModel.index(modelIndex, 0));
+-
+-        if (notificationItem.requestToInvoke) {
+-            pendingAction = action;
+-            runActionRequested();
+-        } else {
+-            action();
+-        }
+-    }
+-
+-    onResumeJobClicked: {
+-        let action = () => notificationsModel.resumeJob(notificationsModel.index(modelIndex, 0));
+-
+-        if (notificationItem.requestToInvoke) {
+-            pendingAction = action;
+-            runActionRequested();
+-        } else {
+-            action();
+-        }
++        });
+     }
+ 
+-    onKillJobClicked: {
+-        let action = () => notificationsModel.killJob(notificationsModel.index(modelIndex, 0));
+-
+-        if (notificationItem.requestToInvoke) {
+-            pendingAction = action;
+-            runActionRequested();
+-        } else {
+-            action();
+-        }
+-    }
++    onSuspendJobClicked: invokeOrRequest(() => notificationsModel.suspendJob(notificationsModel.index(modelIndex, 0)))
++    onResumeJobClicked: invokeOrRequest(() => notificationsModel.resumeJob(notificationsModel.index(modelIndex, 0)))
++    onKillJobClicked: invokeOrRequest(() => notificationsModel.killJob(notificationsModel.index(modelIndex, 0)))
+ }
+ 

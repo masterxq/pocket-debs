@@ -1,0 +1,88 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 18:00:00 +0100
+Subject: [PATCH] notifications: send inline replies, keep the other actions in popups
+Description:
+ The notification server advertises the "inline-reply" capability and the
+ notification UI shows a reply field, but nothing handled replied(text):
+ the text was never sent, an application using an inline reply action
+ lost every reply.
+ .
+ The reply is now sent through the model of the notification (history,
+ popups, lock screen). On the lock screen it is held back until the
+ unlock, like the actions (sending it from there needs a
+ WatchedNotificationsModel with a working reply(), plasma-workspace).
+ Like the desktop the notification closes afterwards unless it is
+ resident.
+ .
+ Popups of notifications with a reply action showed only the reply field
+ and hid every other action. Like the desktop the field is shown right
+ away only if the reply is the only action; otherwise the buttons stay,
+ Reply among them.
+Forwarded: no
+License: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL (as the patched files)
+Last-Update: 2026-11-27
+---
+diff --git a/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml b/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
+index c7f9f112c..38238de9c 100644
+--- a/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
++++ b/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
+@@ -153,7 +153,7 @@ Item {
+         }
+     }
+ 
+-    // Like the desktop: the notification closes after an action, unless it is resident.
++    // Like the desktop: the notification closes after an action or reply, unless it is resident.
+     function invokeBehavior() {
+         return model.resident ? NotificationManager.Notifications.None : NotificationManager.Notifications.Close;
+     }
+@@ -176,6 +176,16 @@ Item {
+         });
+     }
+ 
++    onReplied: text => {
++        invokeOrRequest(() => {
++            if (notificationsModelType === NotificationsModelType.WatchedNotificationsModel) {
++                notificationsModel.reply(model.notificationId, text, invokeBehavior());
++            } else if (notificationsModelType === NotificationsModelType.NotificationsModel) {
++                notificationsModel.reply(notificationsModel.index(modelIndex, 0), text, invokeBehavior());
++            }
++        });
++    }
++
+     onOpenUrl: url => {
+         invokeOrRequest(() => {
+             Qt.openUrlExternally(url);
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml b/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml
+index afc00c1db..26d867b39 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml
+@@ -17,6 +17,10 @@ Item {
+     required property BaseNotificationItem notification
+     property bool popupNotification: false
+ 
++    // Like the desktop, a popup whose only action is the reply shows the reply field right away;
++    // with other actions their buttons stay, the reply field comes with the reply button.
++    readonly property bool replyOnly: notification.hasReplyAction && (notification.actionNames || []).length === 0
++
+     implicitHeight: Math.max(actionFlow.implicitHeight, replyLoader.height)
+     visible: actionRepeater.count > 0
+ 
+@@ -66,8 +70,6 @@ Item {
+                 flat: false
+                 text: modelData.label || ""
+ 
+-                visible: !(notificationItem.hasReplyAction && actionContainer.popupNotification)
+-
+                 onClicked: {
+                     if (modelData.actionName === "inline-reply") {
+                         replyLoader.beginReply();
+@@ -85,8 +87,7 @@ Item {
+         width: parent.width
+         height: active ? item.implicitHeight : 0
+ 
+-        // When there is only one action and it is a reply action, show text field right away
+-        active: notificationItem.hasReplyAction && actionContainer.popupNotification
++        active: actionContainer.popupNotification && actionContainer.replyOnly
+         visible: active
+         opacity: active ? 1 : 0
+         x: active ? 0 : parent.width

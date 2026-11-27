@@ -1,0 +1,155 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 18:00:00 +0100
+Subject: [PATCH] notificationmanager: inline replies from watchers, deliver watcher calls before an exit
+Description:
+ WatchedNotificationsModel::reply() did nothing, so a reply typed into a
+ notification on the lock screen of Plasma Mobile was lost. The server now
+ offers InvokeReply on org.kde.NotificationManager next to InvokeAction: it
+ sends the text to the application that sent the notification, like a reply
+ from the own notification UI. It remembers the D-Bus service of every
+ notification that is not closed yet for that, and accepts the call only
+ from a registered watcher, since the application cannot tell the reply
+ from one the user typed.
+ .
+ The lock screen greeter invokes actions and replies right after the
+ unlock and then ends with _exit(). A call made with QDBus::NoBlock is
+ only queued for the D-Bus thread at that point and can be lost. The
+ watcher model now waits for the server (at most one second) for actions
+ and replies.
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-27
+---
+diff --git a/libnotificationmanager/dbus/org.kde.notificationmanager.xml b/libnotificationmanager/dbus/org.kde.notificationmanager.xml
+index 984d040388..3da3bd036c 100644
+--- a/libnotificationmanager/dbus/org.kde.notificationmanager.xml
++++ b/libnotificationmanager/dbus/org.kde.notificationmanager.xml
+@@ -7,5 +7,9 @@
+       <arg name="id" type="u" direction="in"/>
+       <arg name="action_key" type="s" direction="in"/>
+     </method>
++    <method name="InvokeReply">
++      <arg name="id" type="u" direction="in"/>
++      <arg name="text" type="s" direction="in"/>
++    </method>
+   </interface>
+ </node>
+diff --git a/libnotificationmanager/server.cpp b/libnotificationmanager/server.cpp
+index 65490958f5..59becf2715 100644
+--- a/libnotificationmanager/server.cpp
++++ b/libnotificationmanager/server.cpp
+@@ -66,6 +66,7 @@ ServerInfo *Server::currentOwner() const
+ 
+ void Server::closeNotification(uint notificationId, CloseReason reason)
+ {
++    d->m_notificationServices.remove(notificationId);
+     Q_EMIT notificationRemoved(notificationId, reason);
+     Q_EMIT d->NotificationClosed(notificationId, static_cast<uint>(reason)); // tell on DBus
+ }
+diff --git a/libnotificationmanager/server_p.cpp b/libnotificationmanager/server_p.cpp
+index 92ace6d60e..14e44dba2f 100644
+--- a/libnotificationmanager/server_p.cpp
++++ b/libnotificationmanager/server_p.cpp
+@@ -231,6 +231,7 @@ uint ServerPrivate::Notify(const QString &app_name,
+     }
+ 
+     m_lastNotification = notification;
++    m_notificationServices.insert(notificationId, message().service());
+ 
+     if (wasReplaced) {
+         notification.resetUpdated();
+@@ -554,4 +555,21 @@ void ServerPrivate::InvokeAction(uint id, const QString &actionKey)
+     Q_EMIT ActionInvoked(id, actionKey);
+ }
+ 
++void ServerPrivate::InvokeReply(uint id, const QString &text)
++{
++    // The reply goes to the application as if typed in our own UI, so only a registered watcher may send one
++    if (!m_notificationWatchers->watchedServices().contains(message().service())) {
++        sendErrorReply(QDBusError::AccessDenied, QStringLiteral("Only a registered notification watcher can reply to a notification"));
++        return;
++    }
++
++    const QString dbusService = m_notificationServices.value(id);
++    if (dbusService.isEmpty()) {
++        sendErrorReply(QDBusError::InvalidArgs, QStringLiteral("No open notification with this id"));
++        return;
++    }
++
++    sendReplyText(dbusService, id, text, Notifications::None);
++}
++
+ #include "moc_server_p.cpp"
+diff --git a/libnotificationmanager/server_p.h b/libnotificationmanager/server_p.h
+index 0c7f42c26f..825f55d7ea 100644
+--- a/libnotificationmanager/server_p.h
++++ b/libnotificationmanager/server_p.h
+@@ -63,6 +63,7 @@ public:
+     void UnRegisterWatcher();
+ 
+     void InvokeAction(uint id, const QString &actionKey);
++    void InvokeReply(uint id, const QString &text);
+ 
+ Q_SIGNALS:
+     // DBus
+@@ -124,6 +125,9 @@ private:
+     QHash<uint /*cookie*/, Inhibition> m_externalInhibitions;
+     QHash<uint /*cookie*/, QString> m_inhibitionServices;
+ 
++    // D-Bus service of every notification that is not closed yet, for replies requested by a watcher
++    QHash<uint /*notification id*/, QString> m_notificationServices;
++
+     bool m_inhibited = false;
+ 
+     Notification m_lastNotification;
+diff --git a/libnotificationmanager/watchednotificationsmodel.cpp b/libnotificationmanager/watchednotificationsmodel.cpp
+index bfa94a4c27..d716c5e374 100644
+--- a/libnotificationmanager/watchednotificationsmodel.cpp
++++ b/libnotificationmanager/watchednotificationsmodel.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include <QDebug>
+ 
++#include "debug.h"
+ #include "fdonotifications_interface.h"
+ 
+ using namespace Qt::StringLiterals;
+@@ -139,6 +140,11 @@ void WatchedNotificationsModel::invokeDefaultAction(uint notificationId, Notific
+     this->invokeAction(notificationId, QStringLiteral("default"), behavior);
+ }
+ 
++// The lock screen greeter invokes actions and replies right before it ends itself with _exit() after an unlock.
++// A call without waiting would only be queued for the D-Bus thread and could be lost, so wait for the server, but
++// not long enough to hold up the unlock noticeably when it does not answer.
++static constexpr int s_serverCallTimeout = 1000; // ms
++
+ void WatchedNotificationsModel::invokeAction(uint notificationId, const QString &actionName, Notifications::InvokeBehavior /*behavior*/)
+ {
+     QDBusConnection dbus = QDBusConnection::sessionBus();
+@@ -148,15 +154,20 @@ void WatchedNotificationsModel::invokeAction(uint notificationId, const QString
+                                                       QStringLiteral("org.kde.NotificationManager"),
+                                                       QStringLiteral("InvokeAction"));
+     msg.setArguments({notificationId, actionName});
+-    QDBusConnection::sessionBus().call(msg, QDBus::NoBlock);
++    QDBusConnection::sessionBus().call(msg, QDBus::Block, s_serverCallTimeout);
+ }
+ 
+-void WatchedNotificationsModel::reply(uint notificationId, const QString &text, Notifications::InvokeBehavior behavior)
++void WatchedNotificationsModel::reply(uint notificationId, const QString &text, Notifications::InvokeBehavior /*behavior*/)
+ {
+-    // todo
+-    Q_UNUSED(notificationId)
+-    Q_UNUSED(text)
+-    Q_UNUSED(behavior)
++    QDBusMessage msg = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.Notifications"),
++                                                      QStringLiteral("/org/freedesktop/Notifications"),
++                                                      QStringLiteral("org.kde.NotificationManager"),
++                                                      QStringLiteral("InvokeReply"));
++    msg.setArguments({notificationId, text});
++    const QDBusMessage reply = QDBusConnection::sessionBus().call(msg, QDBus::Block, s_serverCallTimeout);
++    if (reply.type() == QDBusMessage::ErrorMessage) {
++        qCWarning(NOTIFICATIONMANAGER) << "Failed to reply to notification" << notificationId << reply.errorName() << reply.errorMessage();
++    }
+ }
+ 
+ bool WatchedNotificationsModel::valid()
