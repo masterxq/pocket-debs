@@ -1,0 +1,191 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 14:00:00 +0100
+Subject: [PATCH] mobileshell: SwipeArea follows only the finger that started the interaction
+Description:
+ SwipeArea took the first point of every event as the point of the
+ interaction. When a second finger touched while the first one was still
+ down (fast typing with two thumbs on the lock screen keypad), the events of
+ the second finger moved the swipe; after the first finger lifted, the
+ position of the second finger was taken as a move of the first one, from
+ the old press position. A tap on the next key row became a swipe: the key
+ was cancelled and the lock screen keypad closed, which clears the PIN.
+ .
+ SwipeArea now remembers the id of the point that started the interaction.
+ Only that point moves and ends the swipe; points of other fingers are left
+ to the children. A new press starts an interaction as before whenever none
+ is in progress, so a missed release cannot block the area, and
+ resetSwipe() keeps its behaviour.
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-27
+---
+diff --git a/components/mobileshell/components/swipearea.cpp b/components/mobileshell/components/swipearea.cpp
+index 5ec21b7c6..28fc4fbfc 100644
+--- a/components/mobileshell/components/swipearea.cpp
++++ b/components/mobileshell/components/swipearea.cpp
+@@ -81,9 +81,13 @@ bool SwipeArea::filterPointerEvent(QQuickItem *receiver, QPointerEvent *event)
+         return false;
+     }
+ 
+-    const auto &firstPoint = event->points().first();
++    const QEventPoint *point = interactionPoint(event);
++    if (!point) {
++        // another finger than the one of the interaction: leave it to the children
++        return false;
++    }
+ 
+-    if (event->pointCount() == 1 && event->exclusiveGrabber(firstPoint) == this) {
++    if (event->pointCount() == 1 && event->exclusiveGrabber(*point) == this) {
+         // We have an exclusive grab (since we're e.g dragging), but at the same time, we have
+         // a child with a passive grab (which is why this filter is being called). And because
+         // of that, we end up getting the same pointer events twice; First in our own event
+@@ -94,7 +98,7 @@ bool SwipeArea::filterPointerEvent(QQuickItem *receiver, QPointerEvent *event)
+         return true;
+     }
+ 
+-    QPointF localPos = mapFromScene(firstPoint.scenePosition());
++    QPointF localPos = mapFromScene(point->scenePosition());
+     bool receiverDisabled = receiver && !receiver->isEnabled();
+     bool receiverKeepsGrab = receiver && (receiver->keepMouseGrab() || receiver->keepTouchGrab());
+ 
+@@ -104,14 +108,16 @@ bool SwipeArea::filterPointerEvent(QQuickItem *receiver, QPointerEvent *event)
+         QPointerEvent *localizedEvent = event->clone();
+         localizedEvent->setAccepted(false);
+ 
+-        switch (firstPoint.state()) {
++        switch (point->state()) {
+         case QEventPoint::State::Updated:
+             handleMoveEvent(localizedEvent, localPos);
+             break;
+         case QEventPoint::State::Pressed:
++            m_pointId = point->id();
+             handlePressEvent(localizedEvent, localPos);
+             break;
+         case QEventPoint::State::Released:
++            m_pointId = -1;
+             handleReleaseEvent(localizedEvent, localPos);
+             break;
+         case QEventPoint::State::Stationary:
+@@ -120,7 +126,7 @@ bool SwipeArea::filterPointerEvent(QQuickItem *receiver, QPointerEvent *event)
+         }
+ 
+         if ((receiver && m_stealMouse && !receiverKeepsGrab && receiver != this) || receiverDisabled) {
+-            event->setExclusiveGrabber(firstPoint, this);
++            event->setExclusiveGrabber(*point, this);
+         }
+ 
+         bool filtered = m_stealMouse || receiverDisabled;
+@@ -131,8 +137,11 @@ bool SwipeArea::filterPointerEvent(QQuickItem *receiver, QPointerEvent *event)
+         return filtered;
+     }
+ 
+-    if (firstPoint.state() == QEventPoint::State::Released || (receiverKeepsGrab && !receiverDisabled)) {
++    if (point->state() == QEventPoint::State::Released || (receiverKeepsGrab && !receiverDisabled)) {
+         // mouse released, or another item has claimed the grab
++        if (point->state() == QEventPoint::State::Released) {
++            m_pointId = -1;
++        }
+         resetSwipe();
+     }
+ 
+@@ -152,6 +161,9 @@ void SwipeArea::mouseMoveEvent(QMouseEvent *event)
+ void SwipeArea::mousePressEvent(QMouseEvent *event)
+ {
+     if (m_interactive) {
++        if (!m_pressed) {
++            m_pointId = event->points().first().id();
++        }
+         handlePressEvent(event, event->points().first().position());
+         event->accept();
+     } else {
+@@ -162,6 +174,7 @@ void SwipeArea::mousePressEvent(QMouseEvent *event)
+ void SwipeArea::mouseReleaseEvent(QMouseEvent *event)
+ {
+     if (m_interactive) {
++        m_pointId = -1;
+         handleReleaseEvent(event, event->points().first().position());
+         event->accept();
+     } else {
+@@ -177,26 +190,28 @@ void SwipeArea::mouseUngrabEvent()
+ void SwipeArea::touchEvent(QTouchEvent *event)
+ {
+     bool unhandled = true;
+-    const auto &firstPoint = event->points().first();
++    const QEventPoint *point = interactionPoint(event);
+ 
+-    switch (firstPoint.state()) {
++    switch (point ? point->state() : QEventPoint::State::Unknown) {
+     case QEventPoint::State::Pressed:
+         if (m_interactive) {
+-            handlePressEvent(event, firstPoint.position());
++            m_pointId = point->id();
++            handlePressEvent(event, point->position());
+             event->accept();
+             unhandled = false;
+         }
+         break;
+     case QEventPoint::State::Updated:
+         if (m_interactive) {
+-            handleMoveEvent(event, firstPoint.position());
++            handleMoveEvent(event, point->position());
+             event->accept();
+             unhandled = false;
+         }
+         break;
+     case QEventPoint::State::Released:
+         if (m_interactive) {
+-            handleReleaseEvent(event, firstPoint.position());
++            m_pointId = -1;
++            handleReleaseEvent(event, point->position());
+             event->accept();
+             unhandled = false;
+         }
+@@ -262,6 +277,24 @@ void SwipeArea::wheelEvent(QWheelEvent *event)
+     event->accept();
+ }
+ 
++const QEventPoint *SwipeArea::interactionPoint(const QPointerEvent *event) const
++{
++    // A new interaction starts with a pressed point while none is in progress.
++    // Afterwards only the point that started it counts: another finger that
++    // touches meanwhile must neither move nor end the swipe, also not after the
++    // first finger lifted (its position is no move of the first one).
++    for (const QEventPoint &point : event->points()) {
++        if (point.state() == QEventPoint::State::Pressed) {
++            if (!m_pressed) {
++                return &point;
++            }
++        } else if (point.id() == m_pointId) {
++            return &point;
++        }
++    }
++    return nullptr;
++}
++
+ void SwipeArea::setMoving(bool moving)
+ {
+     m_moving = moving;
+diff --git a/components/mobileshell/components/swipearea.h b/components/mobileshell/components/swipearea.h
+index a3bf899b7..6fd56bbfa 100644
+--- a/components/mobileshell/components/swipearea.h
++++ b/components/mobileshell/components/swipearea.h
+@@ -79,6 +79,9 @@ private:
+ 
+     bool filterPointerEvent(QQuickItem *receiver, QPointerEvent *event);
+ 
++    // the point of the event that drives the interaction, or nullptr
++    const QEventPoint *interactionPoint(const QPointerEvent *event) const;
++
+     void handlePressEvent(QPointerEvent *event, QPointF point);
+     void handleReleaseEvent(QPointerEvent *event, QPointF point);
+     void handleMoveEvent(QPointerEvent *event, QPointF point);
+@@ -94,6 +97,9 @@ private:
+     // whether on this current flick, we want to steal the mouse/touch event from children
+     bool m_stealMouse = false;
+ 
++    // id of the point that started the interaction; moves and releases of other points are ignored
++    int m_pointId = -1;
++
+     // the point where the user pressed down on at the start of the interaction
+     QPointF m_pressPos;
+ 
