@@ -1,0 +1,18 @@
+--- a/debian/control
++++ b/debian/control
+@@ -10,6 +10,7 @@
+                cmake (>= 3.30~),
+                doxygen,
+                extra-cmake-modules (>= 6.32.0~),
++               libwayland-dev,
+                libxkbcommon-dev,
+                pkgconf,
+                qt6-base-dev (>= 6.10.0~),
+@@ -19,6 +20,7 @@
+                qt6-shadertools-dev (>= 6.10.0~),
+                qt6-svg-dev (>= 6.10.0~),
+                qt6-tools-dev (>= 6.5.0~),
++               wayland-protocols,
+                xauth <!nocheck>,
+                xvfb <!nocheck>,
+ Standards-Version: 4.7.4

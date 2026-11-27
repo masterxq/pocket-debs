@@ -1,0 +1,1335 @@
+Description: platform: add BackNavigation, system-wide back navigation of a window
+ Some environments offer one back control for all applications, e.g. the
+ navigation bar of a phone shell. With the kde_back_navigation_v1 Wayland
+ protocol a client tells the compositor for each xdg_toplevel whether back
+ currently has an effect, and the compositor sends a back event when the
+ user operates that control.
+ .
+ The new attached type BackNavigation lets items take part: an item sets
+ enabled while going back has an effect for it and goes back one step on
+ triggered(). A dispatcher per window collects them and also looks at the
+ popups in the overlay of the window: the topmost open popup is closed as
+ the Escape key would close it (dialogs are rejected), unless an enabled
+ item inside of it handles back first; a modal popup that does not close
+ on Escape blocks back navigation in the window behind it; tool tips and
+ non-modal popups that stay open are ignored. Outside of popups an item
+ inside another enabled item comes first, otherwise the one enabled last.
+ .
+ On Wayland the state is sent to the compositor through
+ kde_back_navigation_v1 when it offers the global. The object is created
+ for the xdg_toplevel of the window and recreated whenever Qt creates a
+ new one (after hiding and showing the window). Without the global, on
+ other platforms and for windows without xdg_toplevel nothing changes.
+ .
+ Wayland support is enabled by default on Linux and BSD (USE_WAYLAND) and
+ needs Qt6WaylandClient, libwayland and wayland-protocols.
+Author: pocket-debs
+Forwarded: no
+License: LGPL-2.0-or-later (new and patched source files); kde-back-navigation-v1.xml: MIT
+Last-Update: 2026-11-27
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -104,6 +104,20 @@ if(USE_DBUS)
+     add_definitions(-DKIRIGAMI_ENABLE_DBUS)
+ endif()
+ 
++# shall we use Wayland?
++# enabled per default on Linux & BSD systems
++set(USE_WAYLAND_DEFAULT OFF)
++if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT HAIKU)
++    set(USE_WAYLAND_DEFAULT ON)
++endif()
++option(USE_WAYLAND "Build the Wayland integration (system-wide back navigation)" ${USE_WAYLAND_DEFAULT})
++if(USE_WAYLAND)
++    find_package(Qt6WaylandClient ${REQUIRED_QT_VERSION} REQUIRED NO_MODULE)
++    find_package(Wayland REQUIRED COMPONENTS Client)
++    find_package(WaylandProtocols REQUIRED)
++    set(WITH_WAYLAND ON)
++endif()
++
+ find_package(OpenMP)
+ set_package_properties(OpenMP
+     PROPERTIES DESCRIPTION "Multi-platform shared-memory parallel programming in C/C++ and Fortran"
+diff --git a/src/platform/CMakeLists.txt b/src/platform/CMakeLists.txt
+--- a/src/platform/CMakeLists.txt
++++ b/src/platform/CMakeLists.txt
+@@ -47,6 +47,10 @@ target_sources(KirigamiPlatform PRIVATE
+     colorutils.h
+     stylehints.cpp
+     stylehints.h
++    backnavigation.cpp
++    backnavigation.h
++    backnavigationdispatcher.cpp
++    backnavigationdispatcher_p.h
+ )
+ 
+ set(libkirigami_extra_sources "")
+@@ -59,6 +63,19 @@ endif()
+ 
+ target_sources(KirigamiPlatform PRIVATE ${libkirigami_extra_sources})
+ 
++if (WITH_WAYLAND)
++    target_sources(KirigamiPlatform PRIVATE
++        waylandbacknavigation.cpp
++        waylandbacknavigation_p.h
++    )
++    qt6_generate_wayland_protocol_client_sources(KirigamiPlatform PRIVATE_CODE FILES
++        ${WaylandProtocols_DATADIR}/stable/xdg-shell/xdg-shell.xml
++        ${CMAKE_CURRENT_SOURCE_DIR}/kde-back-navigation-v1.xml
++    )
++    target_compile_definitions(KirigamiPlatform PRIVATE KIRIGAMI_ENABLE_WAYLAND)
++    set(LIBKIRIGAMKI_EXTRA_LIBS ${LIBKIRIGAMKI_EXTRA_LIBS} Qt6::WaylandClient Wayland::Client)
++endif()
++
+ ecm_qt_declare_logging_category(KirigamiPlatform
+     HEADER kirigamiplatform_logging.h
+     IDENTIFIER KirigamiPlatform
+diff --git a/src/platform/backnavigation.cpp b/src/platform/backnavigation.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/platform/backnavigation.cpp
+@@ -0,0 +1,152 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++ *
++ *  SPDX-License-Identifier: LGPL-2.0-or-later
++ */
++
++#include "backnavigation.h"
++
++#include "backnavigationdispatcher_p.h"
++#include "kirigamiplatform_logging.h"
++
++#include <QQuickItem>
++#include <QQuickWindow>
++
++namespace Kirigami
++{
++namespace Platform
++{
++
++BackNavigationAttached::BackNavigationAttached(QObject *parent)
++    : QObject(parent)
++{
++    if (qobject_cast<QQuickItem *>(parent)) {
++        // nothing to resolve
++    } else if (qobject_cast<QQuickWindow *>(parent)) {
++        // The content item of a window is constant.
++    } else if (parent && parent->inherits("QQuickPopup")) {
++        connect(parent, SIGNAL(contentItemChanged()), this, SLOT(updateItem()));
++    } else {
++        qCWarning(KirigamiPlatform) << "BackNavigation must be attached to an Item, a Window or a Popup, not" << parent;
++    }
++    updateItem();
++}
++
++BackNavigationAttached::~BackNavigationAttached()
++{
++    setDispatcher(nullptr);
++}
++
++BackNavigationAttached *BackNavigationAttached::qmlAttachedProperties(QObject *object)
++{
++    return new BackNavigationAttached(object);
++}
++
++void BackNavigationAttached::updateItem()
++{
++    QQuickItem *item = nullptr;
++    if (auto parentItem = qobject_cast<QQuickItem *>(parent())) {
++        item = parentItem;
++    } else if (auto window = qobject_cast<QQuickWindow *>(parent())) {
++        item = window->contentItem();
++    } else if (parent() && parent()->inherits("QQuickPopup")) {
++        // The item of the popup itself (QQuickPopupItem) holds the content item.
++        item = parent()->property("contentItem").value<QQuickItem *>();
++        while (item && !item->inherits("QQuickPopupItem")) {
++            item = item->parentItem();
++        }
++        if (!item) {
++            item = parent()->property("contentItem").value<QQuickItem *>();
++        }
++    }
++
++    if (item == m_item) {
++        return;
++    }
++    if (m_item) {
++        disconnect(m_item, nullptr, this, nullptr);
++    }
++    m_item = item;
++    if (m_item) {
++        connect(m_item, &QQuickItem::windowChanged, this, &BackNavigationAttached::updateWindow);
++        connect(m_item, &QQuickItem::visibleChanged, this, &BackNavigationAttached::activeChanged);
++        connect(m_item, &QObject::destroyed, this, &BackNavigationAttached::updateItem);
++    }
++    updateWindow();
++    Q_EMIT activeChanged();
++}
++
++void BackNavigationAttached::updateWindow()
++{
++    QQuickWindow *window = m_item ? m_item->window() : nullptr;
++    setDispatcher(BackNavigationDispatcher::forWindow(window));
++}
++
++void BackNavigationAttached::setDispatcher(BackNavigationDispatcher *dispatcher)
++{
++    if (dispatcher == m_dispatcher) {
++        return;
++    }
++    const bool wasAvailable = isWindowAvailable();
++    if (m_dispatcher) {
++        disconnect(m_windowAvailableConnection);
++        m_dispatcher->removeHandler(this);
++    }
++    m_dispatcher = dispatcher;
++    if (m_dispatcher) {
++        m_dispatcher->addHandler(this);
++        m_windowAvailableConnection =
++            connect(m_dispatcher, &BackNavigationDispatcher::availableChanged, this, &BackNavigationAttached::windowAvailableChanged);
++    }
++    if (wasAvailable != isWindowAvailable()) {
++        Q_EMIT windowAvailableChanged();
++    }
++}
++
++bool BackNavigationAttached::isEnabled() const
++{
++    return m_enabled;
++}
++
++void BackNavigationAttached::setEnabled(bool enabled)
++{
++    if (enabled == m_enabled) {
++        return;
++    }
++    m_enabled = enabled;
++    if (m_enabled) {
++        m_enabledSerial = BackNavigationDispatcher::nextSerial();
++    }
++    Q_EMIT enabledChanged();
++    Q_EMIT activeChanged();
++}
++
++bool BackNavigationAttached::isWindowAvailable() const
++{
++    return m_dispatcher && m_dispatcher->available();
++}
++
++bool BackNavigationAttached::__trigger()
++{
++    return m_dispatcher && m_dispatcher->trigger();
++}
++
++QQuickItem *BackNavigationAttached::item() const
++{
++    return m_item;
++}
++
++quint64 BackNavigationAttached::enabledSerial() const
++{
++    return m_enabledSerial;
++}
++
++bool BackNavigationAttached::isActive() const
++{
++    return m_enabled && m_item && m_item->window() && m_item->isVisible();
++}
++
++}
++}
++
++#include "moc_backnavigation.cpp"
+diff --git a/src/platform/backnavigation.h b/src/platform/backnavigation.h
+new file mode 100644
+--- /dev/null
++++ b/src/platform/backnavigation.h
+@@ -0,0 +1,198 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++ *
++ *  SPDX-License-Identifier: LGPL-2.0-or-later
++ */
++
++#ifndef KIRIGAMI_BACKNAVIGATION_H
++#define KIRIGAMI_BACKNAVIGATION_H
++
++#include <QObject>
++#include <QPointer>
++#include <QQmlEngine>
++
++class QQuickItem;
++class QQuickWindow;
++
++namespace Kirigami
++{
++namespace Platform
++{
++class BackNavigationDispatcher;
++
++/*!
++ * \qmltype BackNavigation
++ * \inqmlmodule org.kde.kirigami.platform
++ *
++ * \brief Takes part in the system-wide back navigation of a window.
++ *
++ * Some environments offer one "back" control for all applications, for
++ * example a back button in the navigation bar of a phone shell. On Wayland
++ * compositors that support the \c kde_back_navigation_v1 protocol, Kirigami
++ * tells the compositor for each window whether going back currently has an
++ * effect in it, and goes back one step when the user operates that control.
++ * The shell can then show its back control only when it does something, and
++ * offer its usual controls (for example closing the window) otherwise.
++ *
++ * Applications built from the usual Kirigami components need no code of
++ * their own. Kirigami reports back as available and handles it, in this
++ * order:
++ * \list
++ *   \li the topmost open popup of the window (a drawer, a sheet, a dialog, a
++ *       menu): back closes it exactly as the Escape key would, and a modal
++ *       popup that does not close on Escape blocks back navigation in the
++ *       window behind it;
++ *   \li the submenus of a GlobalDrawer;
++ *   \li the layers of a PageRow, then its columns, as PageRow::goBack()
++ *       does it; the page that would be left receives
++ *       Page::backRequested() first and can accept the event to handle back
++ *       itself.
++ * \endlist
++ *
++ * Back is never reported as available when the only thing it could do is to
++ * close the window or to quit the application.
++ *
++ * An item with its own navigation, for example a StackView that is not a
++ * PageRow, or a page with a selection mode, takes part through this attached
++ * type: it sets \l enabled while going back has an effect for it and goes
++ * back one step when \l triggered is emitted.
++ *
++ * \qml
++ * import QtQuick.Controls as QQC2
++ * import org.kde.kirigami as Kirigami
++ *
++ * QQC2.StackView {
++ *     id: stack
++ *     initialItem: mainView
++ *
++ *     Kirigami.BackNavigation.enabled: stack.depth > 1
++ *     Kirigami.BackNavigation.onTriggered: stack.pop()
++ * }
++ * \endqml
++ *
++ * \qml
++ * Kirigami.ScrollablePage {
++ *     id: page
++ *     property bool selecting: false
++ *
++ *     // A page that the user has scrolled away in a PageRow stays visible,
++ *     // so take part only while it is the current page.
++ *     Kirigami.BackNavigation.enabled: page.selecting && page.isCurrentPage
++ *     Kirigami.BackNavigation.onTriggered: page.selecting = false
++ * }
++ * \endqml
++ *
++ * The attached object takes part only while \l enabled is \c true and the
++ * item it is attached to is visible. When several of them are taking part
++ * in the same window, back goes to the topmost open popup as described above
++ * (to an enabled item inside that popup, if there is one, before the popup
++ * itself), otherwise to an enabled item outside of popups: an item inside
++ * another enabled item comes first, so an inner view goes back before the
++ * PageRow around it; among unrelated items the one enabled most recently
++ * comes first.
++ *
++ * Without a compositor that supports the protocol (another compositor, X11,
++ * other platforms) nothing changes and \l triggered is never emitted. It is
++ * emitted only for the system back control: the back keys and buttons of the
++ * application itself keep their own handling (PageRow::goBack(), the Escape
++ * key for popups).
++ *
++ * It can be attached to an Item, a Window or a Popup. Attached to a Window,
++ * it stands for the content item of the window; attached to a Popup, for the
++ * content of the popup, so that it handles back before the popup is closed.
++ *
++ * \since 6.33
++ */
++class BackNavigationAttached : public QObject
++{
++    Q_OBJECT
++    QML_NAMED_ELEMENT(BackNavigation)
++    QML_UNCREATABLE("Cannot create objects of type BackNavigation, use it as an attached property")
++    QML_ATTACHED(BackNavigationAttached)
++
++    /*!
++     * \qmlattachedproperty bool BackNavigation::enabled
++     *
++     * Whether going back currently has an effect for the item, i.e. whether
++     * the item would handle \l triggered by going back one step.
++     *
++     * Set it to \c false when back would do nothing, and also when the only
++     * thing it could do is to close the window or to quit the application.
++     *
++     * default: \c false
++     */
++    Q_PROPERTY(bool enabled READ isEnabled WRITE setEnabled NOTIFY enabledChanged FINAL)
++
++    /*!
++     * \qmlattachedproperty bool BackNavigation::__available
++     * \internal
++     *
++     * Whether going back has an effect anywhere in the window of the item,
++     * as it is reported to the compositor.
++     */
++    Q_PROPERTY(bool __available READ isWindowAvailable NOTIFY windowAvailableChanged FINAL)
++
++public:
++    explicit BackNavigationAttached(QObject *parent = nullptr);
++    ~BackNavigationAttached() override;
++
++    bool isEnabled() const;
++    void setEnabled(bool enabled);
++
++    bool isWindowAvailable() const;
++
++    /*!
++     * \qmlattachedmethod bool BackNavigation::__trigger()
++     * \internal
++     *
++     * Goes back one step in the window of the item, as the system back control
++     * does. Returns whether something handled it.
++     */
++    Q_INVOKABLE bool __trigger();
++
++    // The item that decides about visibility and nesting.
++    QQuickItem *item() const;
++    // Order among unrelated attached objects: a higher value was enabled later.
++    quint64 enabledSerial() const;
++    // Enabled and visible in a window.
++    bool isActive() const;
++
++    static BackNavigationAttached *qmlAttachedProperties(QObject *object);
++
++Q_SIGNALS:
++    void enabledChanged();
++    void windowAvailableChanged();
++
++    /*!
++     * \qmlattachedsignal BackNavigation::triggered()
++     *
++     * Emitted when the user asked to go back and this item is the one that
++     * handles it. The item goes back one step, as its own back button would.
++     *
++     * Only emitted while \l enabled is \c true.
++     */
++    void triggered();
++
++    // Something that decides about isActive() changed.
++    void activeChanged();
++
++private Q_SLOTS:
++    void updateItem();
++
++private:
++    void updateWindow();
++    void setDispatcher(BackNavigationDispatcher *dispatcher);
++
++    QPointer<QQuickItem> m_item;
++    QPointer<BackNavigationDispatcher> m_dispatcher;
++    QMetaObject::Connection m_windowAvailableConnection;
++    quint64 m_enabledSerial = 0;
++    bool m_enabled = false;
++};
++
++}
++}
++
++QML_DECLARE_TYPEINFO(Kirigami::Platform::BackNavigationAttached, QML_HAS_ATTACHED_PROPERTIES)
++
++#endif
+diff --git a/src/platform/backnavigationdispatcher.cpp b/src/platform/backnavigationdispatcher.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/platform/backnavigationdispatcher.cpp
+@@ -0,0 +1,361 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++ *
++ *  SPDX-License-Identifier: LGPL-2.0-or-later
++ */
++
++#include "backnavigationdispatcher_p.h"
++
++#include "backnavigation.h"
++#include "kirigamiplatform_logging.h"
++
++#ifdef KIRIGAMI_ENABLE_WAYLAND
++#include "waylandbacknavigation_p.h"
++#endif
++
++#include <QGuiApplication>
++#include <QMetaEnum>
++#include <QMetaMethod>
++#include <QMetaProperty>
++#include <QQuickItem>
++#include <QQuickWindow>
++
++#include <algorithm>
++
++namespace Kirigami
++{
++namespace Platform
++{
++
++static bool isPopup(const QObject *object)
++{
++    return object && object->inherits("QQuickPopup");
++}
++
++static int closeOnEscapeFlag(const QObject *popup)
++{
++    const QMetaObject *mo = popup->metaObject();
++    const int index = mo->indexOfEnumerator("ClosePolicy");
++    if (index >= 0) {
++        bool ok = false;
++        const int value = mo->enumerator(index).keyToValue("CloseOnEscape", &ok);
++        if (ok) {
++            return value;
++        }
++    }
++    // QQuickPopup::CloseOnEscape
++    return 0x10;
++}
++
++// Whether the Escape key closes the popup (QQuickPopup::keyPressEvent): its close
++// policy has CloseOnEscape and it is interactive (only drawers can be non-interactive).
++static bool closesOnEscape(const QObject *popup)
++{
++    bool ok = false;
++    const int policy = popup->property("closePolicy").toInt(&ok);
++    if (!ok || !(policy & closeOnEscapeFlag(popup))) {
++        return false;
++    }
++    const QVariant interactive = popup->property("interactive");
++    return !interactive.isValid() || interactive.toBool();
++}
++
++static bool isAncestorOrSelf(const QQuickItem *ancestor, const QQuickItem *item)
++{
++    return ancestor == item || ancestor->isAncestorOf(item);
++}
++
++BackNavigationDispatcher *BackNavigationDispatcher::forWindow(QQuickWindow *window)
++{
++    if (!window) {
++        return nullptr;
++    }
++    auto dispatcher = window->findChild<BackNavigationDispatcher *>(QString(), Qt::FindDirectChildrenOnly);
++    if (!dispatcher) {
++        dispatcher = new BackNavigationDispatcher(window);
++    }
++    return dispatcher;
++}
++
++BackNavigationDispatcher::BackNavigationDispatcher(QQuickWindow *window)
++    : QObject(window)
++    , m_window(window)
++{
++    // The overlay of the window, which holds the popups, is created on demand
++    // as a child of the content item. It is looked for in update(): when the
++    // children change, the new child may still be under construction.
++    connect(window->contentItem(), &QQuickItem::childrenChanged, this, &BackNavigationDispatcher::scheduleUpdate);
++    findOverlay();
++
++#ifdef KIRIGAMI_ENABLE_WAYLAND
++    if (WaylandBackNavigation::isSupported()) {
++        m_wayland = new WaylandBackNavigation(window, this);
++        connect(this, &BackNavigationDispatcher::availableChanged, m_wayland, &WaylandBackNavigation::setAvailable);
++        connect(m_wayland, &WaylandBackNavigation::backRequested, this, [this] {
++            if (!trigger()) {
++                qCDebug(KirigamiPlatform) << "Back requested by the compositor without effect in" << m_window;
++            }
++        });
++    }
++#endif
++}
++
++BackNavigationDispatcher::~BackNavigationDispatcher() = default;
++
++quint64 BackNavigationDispatcher::nextSerial()
++{
++    static quint64 serial = 0;
++    return ++serial;
++}
++
++void BackNavigationDispatcher::addHandler(BackNavigationAttached *handler)
++{
++    if (!m_handlers.contains(handler)) {
++        m_handlers.append(handler);
++        connect(handler, &BackNavigationAttached::activeChanged, this, &BackNavigationDispatcher::scheduleUpdate);
++    }
++    scheduleUpdate();
++}
++
++void BackNavigationDispatcher::removeHandler(BackNavigationAttached *handler)
++{
++    m_handlers.removeAll(handler);
++    m_handlers.removeAll(nullptr);
++    disconnect(handler, nullptr, this, nullptr);
++    scheduleUpdate();
++}
++
++bool BackNavigationDispatcher::available()
++{
++    if (m_updatePending) {
++        update();
++    }
++    return m_available;
++}
++
++void BackNavigationDispatcher::scheduleUpdate()
++{
++    // Coalesce the changes of one event loop pass (a page popped and a popup
++    // closed at once, transitions), so that the compositor sees one state.
++    if (m_updatePending) {
++        return;
++    }
++    m_updatePending = true;
++    QMetaObject::invokeMethod(
++        this,
++        [this] {
++            if (m_updatePending) {
++                update();
++            }
++        },
++        Qt::QueuedConnection);
++}
++
++void BackNavigationDispatcher::update()
++{
++    m_updatePending = false;
++    if (!m_overlay) {
++        findOverlay();
++    }
++    if (m_popupsChanged) {
++        watchPopups();
++    }
++    const Target target = findTarget();
++    const bool available = target.handler || target.popup;
++    if (available != m_available) {
++        m_available = available;
++        Q_EMIT availableChanged(m_available);
++    }
++}
++
++bool BackNavigationDispatcher::trigger()
++{
++    // Act on the state as it is now, not as it was last reported.
++    update();
++    const Target target = findTarget();
++
++    if (target.handler) {
++        Q_EMIT target.handler->triggered();
++        return true;
++    }
++
++    if (target.popup) {
++        // Close the popup as the Escape key does (QQuickPopupPrivate::closeOrReject):
++        // dialogs are rejected, everything else is closed.
++        if (target.popup->inherits("QQuickDialog")) {
++            QMetaObject::invokeMethod(target.popup, "reject");
++        } else {
++            QMetaObject::invokeMethod(target.popup, "close");
++        }
++        return true;
++    }
++
++    return false;
++}
++
++QList<QQuickItem *> BackNavigationDispatcher::stackingOrderPopupItems() const
++{
++    // The popup items in the overlay, topmost first. Same order as
++    // QQuickOverlayPrivate::stackingOrderPopups(): paint order, reversed.
++    QList<QQuickItem *> items;
++    if (!m_overlay) {
++        return items;
++    }
++    const QList<QQuickItem *> children = m_overlay->childItems();
++    for (QQuickItem *child : children) {
++        if (isPopup(child->parent())) {
++            items.append(child);
++        }
++    }
++    std::stable_sort(items.begin(), items.end(), [](const QQuickItem *a, const QQuickItem *b) {
++        return a->z() < b->z();
++    });
++    std::reverse(items.begin(), items.end());
++    return items;
++}
++
++BackNavigationAttached *BackNavigationDispatcher::bestHandler(QQuickItem *scope, const QList<QQuickItem *> &excluded) const
++{
++    // Among the active handlers in scope (all of the window if scope is null,
++    // except those in the excluded popup items), take the one enabled last,
++    // then descend to active handlers inside of it: inner navigation first.
++    QList<BackNavigationAttached *> candidates;
++    for (const auto &handler : m_handlers) {
++        if (!handler || !handler->isActive()) {
++            continue;
++        }
++        QQuickItem *item = handler->item();
++        if (item->window() != m_window) {
++            continue;
++        }
++        if (scope && !isAncestorOrSelf(scope, item)) {
++            continue;
++        }
++        const bool inExcluded = std::any_of(excluded.cbegin(), excluded.cend(), [item](QQuickItem *popupItem) {
++            return isAncestorOrSelf(popupItem, item);
++        });
++        if (inExcluded) {
++            continue;
++        }
++        candidates.append(handler);
++    }
++
++    BackNavigationAttached *best = nullptr;
++    auto later = [](const BackNavigationAttached *a, const BackNavigationAttached *b) {
++        return a->enabledSerial() > b->enabledSerial();
++    };
++    for (BackNavigationAttached *candidate : std::as_const(candidates)) {
++        if (!best || later(candidate, best)) {
++            best = candidate;
++        }
++    }
++    while (best) {
++        BackNavigationAttached *inner = nullptr;
++        for (BackNavigationAttached *candidate : std::as_const(candidates)) {
++            if (candidate != best && best->item() != candidate->item() && best->item()->isAncestorOf(candidate->item())
++                && (!inner || later(candidate, inner))) {
++                inner = candidate;
++            }
++        }
++        if (!inner) {
++            break;
++        }
++        best = inner;
++    }
++    return best;
++}
++
++BackNavigationDispatcher::Target BackNavigationDispatcher::findTarget() const
++{
++    Target target;
++    if (!m_window) {
++        return target;
++    }
++
++    const QList<QQuickItem *> popupItems = stackingOrderPopupItems();
++    for (QQuickItem *popupItem : popupItems) {
++        QObject *popup = popupItem->parent();
++        if (!popup->property("visible").toBool() || popup->inherits("QQuickToolTip")) {
++            continue;
++        }
++        // Navigation inside of the popup goes before closing it.
++        if (BackNavigationAttached *handler = bestHandler(popupItem, {})) {
++            target.handler = handler;
++            return target;
++        }
++        if (closesOnEscape(popup)) {
++            target.popup = popup;
++            return target;
++        }
++        if (popup->property("modal").toBool()) {
++            // A modal popup that does not close on Escape blocks the window behind it.
++            return target;
++        }
++        // Non-modal popups that stay open (such as a sidebar drawer) are not
++        // part of back navigation.
++    }
++
++    target.handler = bestHandler(nullptr, popupItems);
++    return target;
++}
++
++void BackNavigationDispatcher::findOverlay()
++{
++    if (m_overlay || !m_window || !m_window->contentItem()) {
++        return;
++    }
++    const QList<QQuickItem *> children = m_window->contentItem()->childItems();
++    for (QQuickItem *child : children) {
++        if (child->inherits("QQuickOverlay")) {
++            m_overlay = child;
++            connect(child, &QQuickItem::childrenChanged, this, [this] {
++                m_popupsChanged = true;
++                scheduleUpdate();
++            });
++            disconnect(m_window->contentItem(), &QQuickItem::childrenChanged, this, &BackNavigationDispatcher::scheduleUpdate);
++            watchPopups();
++            return;
++        }
++    }
++}
++
++void BackNavigationDispatcher::watchPopups()
++{
++    m_popupsChanged = false;
++    if (m_overlay) {
++        const QList<QQuickItem *> children = m_overlay->childItems();
++        for (QQuickItem *child : children) {
++            if (isPopup(child->parent())) {
++                watchPopup(child->parent(), child);
++            }
++        }
++    }
++}
++
++void BackNavigationDispatcher::watchPopup(QObject *popup, QQuickItem *popupItem)
++{
++    if (m_watchedPopups.contains(popup)) {
++        return;
++    }
++    m_watchedPopups.insert(popup);
++    connect(popup, &QObject::destroyed, this, [this, popup] {
++        m_watchedPopups.remove(popup);
++        scheduleUpdate();
++    });
++
++    static const QMetaMethod update = staticMetaObject.method(staticMetaObject.indexOfSlot("scheduleUpdate()"));
++    const QMetaObject *mo = popup->metaObject();
++    for (const char *name : {"visible", "modal", "closePolicy", "interactive"}) {
++        const int index = mo->indexOfProperty(name);
++        if (index >= 0 && mo->property(index).hasNotifySignal()) {
++            connect(popup, mo->property(index).notifySignal(), this, update);
++        }
++    }
++    // Stacking order
++    connect(popupItem, &QQuickItem::zChanged, this, &BackNavigationDispatcher::scheduleUpdate);
++}
++
++}
++}
++
++#include "moc_backnavigationdispatcher_p.cpp"
+diff --git a/src/platform/backnavigationdispatcher_p.h b/src/platform/backnavigationdispatcher_p.h
+new file mode 100644
+--- /dev/null
++++ b/src/platform/backnavigationdispatcher_p.h
+@@ -0,0 +1,88 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++ *
++ *  SPDX-License-Identifier: LGPL-2.0-or-later
++ */
++
++#ifndef KIRIGAMI_BACKNAVIGATIONDISPATCHER_P_H
++#define KIRIGAMI_BACKNAVIGATIONDISPATCHER_P_H
++
++#include <QList>
++#include <QObject>
++#include <QPointer>
++#include <QSet>
++
++class QQuickItem;
++class QQuickWindow;
++
++namespace Kirigami
++{
++namespace Platform
++{
++class BackNavigationAttached;
++class WaylandBackNavigation;
++
++/*
++ * Back navigation state of one QQuickWindow.
++ *
++ * Collects the BackNavigation attached objects of the window and watches the
++ * popups in its overlay. available() tells whether a back request would have an
++ * effect, trigger() carries one out. On Wayland the state is sent to the
++ * compositor and its back events are passed to trigger().
++ *
++ * Created on demand as a child of the window, so it lives as long as the window.
++ */
++class BackNavigationDispatcher : public QObject
++{
++    Q_OBJECT
++
++public:
++    static BackNavigationDispatcher *forWindow(QQuickWindow *window);
++
++    ~BackNavigationDispatcher() override;
++
++    void addHandler(BackNavigationAttached *handler);
++    void removeHandler(BackNavigationAttached *handler);
++
++    bool available();
++    bool trigger();
++
++    static quint64 nextSerial();
++
++public Q_SLOTS:
++    void scheduleUpdate();
++
++Q_SIGNALS:
++    void availableChanged(bool available);
++
++private:
++    explicit BackNavigationDispatcher(QQuickWindow *window);
++
++    // What a back request would act on: a handler, a popup to close, or nothing.
++    struct Target {
++        BackNavigationAttached *handler = nullptr;
++        QObject *popup = nullptr;
++    };
++    Target findTarget() const;
++    BackNavigationAttached *bestHandler(QQuickItem *scope, const QList<QQuickItem *> &excluded) const;
++    QList<QQuickItem *> stackingOrderPopupItems() const;
++
++    void update();
++    void findOverlay();
++    void watchPopups();
++    void watchPopup(QObject *popup, QQuickItem *popupItem);
++
++    QPointer<QQuickWindow> m_window;
++    QList<QPointer<BackNavigationAttached>> m_handlers;
++    QPointer<QQuickItem> m_overlay;
++    QSet<QObject *> m_watchedPopups;
++    WaylandBackNavigation *m_wayland = nullptr;
++    bool m_available = false;
++    bool m_updatePending = false;
++    bool m_popupsChanged = false;
++};
++
++}
++}
++
++#endif
+diff --git a/src/platform/kde-back-navigation-v1.xml b/src/platform/kde-back-navigation-v1.xml
+new file mode 100644
+--- /dev/null
++++ b/src/platform/kde-back-navigation-v1.xml
+@@ -0,0 +1,170 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="kde_back_navigation_v1">
++  <copyright>
++    Copyright © 2026 masterxq
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <description summary="system-wide back navigation for toplevels">
++    This protocol lets a client tell the compositor whether a "back" action
++    currently has an effect in one of its toplevels, and lets the compositor
++    ask the client to go back in that toplevel.
++
++    It is meant for environments where the system offers one back control for
++    all applications, for example a back button in the navigation bar of a
++    phone shell, a back gesture or a hardware back key. Such a control replaces
++    the per-application back buttons the user would otherwise have to reach in
++    the window content. The compositor decides how and when the control is
++    presented; this protocol only carries the state of the toplevel and the
++    back request.
++
++    A toplevel without a kde_back_navigation_v1 object, and every toplevel of a
++    compositor that does not offer this protocol, behaves as without it: back
++    is never available for it and no back event is ever sent to it.
++
++    Warning! The protocol described in this file is currently in the testing
++    phase. Backward compatible changes may be added together with the
++    corresponding interface version bump. Backward incompatible changes can
++    only be done by creating a new major version of the extension.
++  </description>
++
++  <interface name="kde_back_navigation_manager_v1" version="1">
++    <description summary="create back navigation objects for toplevels">
++      A global that creates kde_back_navigation_v1 objects for xdg_toplevels.
++    </description>
++
++    <enum name="error">
++      <entry name="already_constructed" value="0"
++        summary="the xdg_toplevel already has a kde_back_navigation_v1 object"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the manager">
++        Destroy the manager. Objects created through it are not affected.
++      </description>
++    </request>
++
++    <request name="get_back_navigation">
++      <description summary="create a back navigation object for a toplevel">
++        Create a kde_back_navigation_v1 object for the given xdg_toplevel. Its
++        state is initially unavailable.
++
++        The object may be created at any time in the life of the toplevel,
++        before or after it is mapped. Creating a second object for a toplevel
++        that already has one is a protocol error (already_constructed); after
++        the first object is destroyed a new one may be created.
++      </description>
++      <arg name="id" type="new_id" interface="kde_back_navigation_v1"/>
++      <arg name="toplevel" type="object" interface="xdg_toplevel"/>
++    </request>
++  </interface>
++
++  <interface name="kde_back_navigation_v1" version="1">
++    <description summary="back navigation state and requests of a toplevel">
++      Carries the back navigation state of one xdg_toplevel and the back
++      requests the compositor sends to it.
++
++      The state and the back event refer to this toplevel only. Every
++      xdg_toplevel has its own state, also one with a parent
++      (xdg_toplevel.set_parent) or one that is a dialog (xdg_dialog_v1). The
++      compositor never sends back to a toplevel because of the state of
++      another one, and never forwards a back action of a dialog to its parent
++      or of a parent to its dialog. A dialog that leaves its state unavailable
++      is handled as without this protocol: the compositor may offer to close
++      it (xdg_toplevel.close) instead.
++
++      xdg_popups have no state of their own. A compositor that dismisses open
++      popups when the user operates its back control should not also send
++      back for that interaction.
++
++      The object stays valid while the toplevel is unmapped and mapped again,
++      and keeps its state. If the xdg_toplevel is destroyed first, the object
++      becomes inert: requests have no effect and no events are sent. Destroying
++      this object makes the state of the toplevel unavailable.
++    </description>
++
++    <enum name="state">
++      <entry name="unavailable" value="0"
++        summary="back has no effect in the toplevel"/>
++      <entry name="available" value="1"
++        summary="back goes back one step in the toplevel"/>
++    </enum>
++
++    <enum name="error">
++      <entry name="invalid_state" value="0"
++        summary="the state is not a value of the state enum"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the back navigation object">
++        Destroy the object. The state of the toplevel becomes unavailable
++        immediately.
++      </description>
++    </request>
++
++    <request name="set_state">
++      <description summary="set whether back has an effect">
++        Set whether a back event received now would have an effect in the
++        toplevel. The new state applies as soon as the compositor processes
++        this request; it is not double-buffered and needs no wl_surface.commit,
++        because it does not describe the content of the surface.
++
++        The state must be available exactly when a back event would go back
++        one step within the toplevel, as the back button or the Back key of the
++        application itself would: return to the previous page or view, close an
++        overlay drawn inside the toplevel (a drawer, a sheet, an in-window
++        dialog, a search field), or leave a mode such as a selection or an
++        editing mode. It must be unavailable when back would do nothing, and
++        when the only thing it could do is to close the toplevel or to quit the
++        application: closing is offered by the compositor by other means.
++
++        The client keeps the state up to date at all times, also while the
++        toplevel is not focused, minimized or unmapped, so that the compositor
++        can present the right control as soon as the toplevel becomes active.
++        Setting the state it already has is allowed and has no effect.
++
++        A value that is not part of the state enum is a protocol error
++        (invalid_state).
++      </description>
++      <arg name="state" type="uint" enum="state"/>
++    </request>
++
++    <event name="back">
++      <description summary="go back one step">
++        The user asked to go back in this toplevel. The client goes back one
++        step, as described for set_state, exactly as if its own back control
++        had been used, and updates the state afterwards.
++
++        The compositor sends this event only in response to a user action and
++        only while the state is available as far as it knows. Because the
++        client can change the state at any time, the event may arrive after the
++        client has made the state unavailable. A client that has nothing to go
++        back to when it handles the event must ignore it; in particular it must
++        not close the toplevel or quit the application because of it.
++
++        The compositor does not wait for an answer and sends no further event
++        for the same action. A compositor should not send this event to a
++        toplevel that currently cannot receive user input, for example while it
++        is blocked by a modal dialog or while the session is locked.
++      </description>
++    </event>
++  </interface>
++</protocol>
+diff --git a/src/platform/waylandbacknavigation.cpp b/src/platform/waylandbacknavigation.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/platform/waylandbacknavigation.cpp
+@@ -0,0 +1,177 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++ *
++ *  SPDX-License-Identifier: LGPL-2.0-or-later
++ */
++
++#include "waylandbacknavigation_p.h"
++
++#include "kirigamiplatform_logging.h"
++
++#include "qwayland-kde-back-navigation-v1.h"
++
++#include <QGuiApplication>
++#include <QPlatformSurfaceEvent>
++#include <QQuickWindow>
++#include <QWaylandClientExtensionTemplate>
++#include <QtGui/qpa/qplatformnativeinterface.h>
++#include <QtGui/qpa/qplatformwindow_p.h>
++
++namespace Kirigami
++{
++namespace Platform
++{
++
++class BackNavigationManager : public QWaylandClientExtensionTemplate<BackNavigationManager>, public QtWayland::kde_back_navigation_manager_v1
++{
++public:
++    BackNavigationManager()
++        : QWaylandClientExtensionTemplate<BackNavigationManager>(1)
++    {
++    }
++
++    static BackNavigationManager *instance()
++    {
++        // Owned by the application: the proxy is not destroyed explicitly, it
++        // goes away with the connection to the compositor.
++        static QPointer<BackNavigationManager> manager;
++        if (!manager) {
++            manager = new BackNavigationManager;
++            manager->setParent(qGuiApp);
++        }
++        return manager;
++    }
++};
++
++class BackNavigationObject : public QtWayland::kde_back_navigation_v1
++{
++public:
++    BackNavigationObject(::kde_back_navigation_v1 *object, WaylandBackNavigation *owner)
++        : QtWayland::kde_back_navigation_v1(object)
++        , m_owner(owner)
++    {
++    }
++
++    ~BackNavigationObject() override
++    {
++        destroy();
++    }
++
++protected:
++    void kde_back_navigation_v1_back() override
++    {
++        // Handled from the event loop, not from within the dispatch of the
++        // Wayland event: going back may destroy the window and this object.
++        QMetaObject::invokeMethod(m_owner, &WaylandBackNavigation::backRequested, Qt::QueuedConnection);
++    }
++
++private:
++    QPointer<WaylandBackNavigation> m_owner;
++};
++
++bool WaylandBackNavigation::isSupported()
++{
++    return qGuiApp && qGuiApp->nativeInterface<QNativeInterface::QWaylandApplication>();
++}
++
++WaylandBackNavigation::WaylandBackNavigation(QQuickWindow *window, QObject *parent)
++    : QObject(parent)
++    , m_window(window)
++{
++    BackNavigationManager *manager = BackNavigationManager::instance();
++    connect(manager, &QWaylandClientExtension::activeChanged, this, [this, manager] {
++        if (manager->isActive()) {
++            createObject();
++        } else {
++            m_object.reset();
++        }
++    });
++
++    window->installEventFilter(this);
++    if (window->handle()) {
++        attachPlatformWindow();
++    }
++}
++
++WaylandBackNavigation::~WaylandBackNavigation()
++{
++    destroyObject();
++}
++
++bool WaylandBackNavigation::eventFilter(QObject *watched, QEvent *event)
++{
++    if (watched == m_window && event->type() == QEvent::PlatformSurface) {
++        switch (static_cast<QPlatformSurfaceEvent *>(event)->surfaceEventType()) {
++        case QPlatformSurfaceEvent::SurfaceCreated:
++            attachPlatformWindow();
++            break;
++        case QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed:
++            detachPlatformWindow();
++            break;
++        }
++    }
++    return QObject::eventFilter(watched, event);
++}
++
++void WaylandBackNavigation::attachPlatformWindow()
++{
++    auto waylandWindow = m_window ? m_window->nativeInterface<QNativeInterface::Private::QWaylandWindow>() : nullptr;
++    if (!waylandWindow || waylandWindow == m_waylandWindow) {
++        return;
++    }
++    detachPlatformWindow();
++    m_waylandWindow = waylandWindow;
++    connect(waylandWindow, &QNativeInterface::Private::QWaylandWindow::surfaceRoleCreated, this, &WaylandBackNavigation::createObject);
++    connect(waylandWindow, &QNativeInterface::Private::QWaylandWindow::surfaceRoleDestroyed, this, &WaylandBackNavigation::destroyObject);
++    createObject();
++}
++
++void WaylandBackNavigation::detachPlatformWindow()
++{
++    destroyObject();
++    if (m_waylandWindow) {
++        disconnect(m_waylandWindow, nullptr, this, nullptr);
++    }
++    m_waylandWindow = nullptr;
++}
++
++void WaylandBackNavigation::createObject()
++{
++    BackNavigationManager *manager = BackNavigationManager::instance();
++    if (m_object || !m_waylandWindow || !manager->isActive()) {
++        return;
++    }
++    // Only toplevels have a back navigation state: no popups, no subsurfaces.
++    auto toplevel = static_cast<::xdg_toplevel *>(
++        QGuiApplication::platformNativeInterface()->nativeResourceForWindow(QByteArrayLiteral("xdg_toplevel"), m_window));
++    if (!toplevel) {
++        return;
++    }
++    m_object = std::make_unique<BackNavigationObject>(manager->get_back_navigation(toplevel), this);
++    if (m_available) {
++        m_object->set_state(QtWayland::kde_back_navigation_v1::state_available);
++    }
++}
++
++void WaylandBackNavigation::destroyObject()
++{
++    // After surfaceRoleDestroyed the xdg_toplevel is already gone and the
++    // object is inert; destroying it is still required.
++    m_object.reset();
++}
++
++void WaylandBackNavigation::setAvailable(bool available)
++{
++    if (available == m_available) {
++        return;
++    }
++    m_available = available;
++    if (m_object) {
++        m_object->set_state(available ? QtWayland::kde_back_navigation_v1::state_available : QtWayland::kde_back_navigation_v1::state_unavailable);
++    }
++}
++
++}
++}
++
++#include "moc_waylandbacknavigation_p.cpp"
+diff --git a/src/platform/waylandbacknavigation_p.h b/src/platform/waylandbacknavigation_p.h
+new file mode 100644
+--- /dev/null
++++ b/src/platform/waylandbacknavigation_p.h
+@@ -0,0 +1,66 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++ *
++ *  SPDX-License-Identifier: LGPL-2.0-or-later
++ */
++
++#ifndef KIRIGAMI_WAYLANDBACKNAVIGATION_P_H
++#define KIRIGAMI_WAYLANDBACKNAVIGATION_P_H
++
++#include <QObject>
++#include <QPointer>
++
++#include <memory>
++
++class QQuickWindow;
++
++namespace Kirigami
++{
++namespace Platform
++{
++class BackNavigationObject;
++
++/*
++ * kde_back_navigation_v1 for one window: reports the back navigation state of
++ * the window to the compositor and passes its back events on.
++ *
++ * The protocol object belongs to the xdg_toplevel of the window. Qt creates a
++ * new xdg_toplevel each time the window is shown and destroys it when the
++ * window is hidden, so the object is created and destroyed along with it.
++ */
++class WaylandBackNavigation : public QObject
++{
++    Q_OBJECT
++
++public:
++    // Whether the application runs on Wayland.
++    static bool isSupported();
++
++    WaylandBackNavigation(QQuickWindow *window, QObject *parent);
++    ~WaylandBackNavigation() override;
++
++public Q_SLOTS:
++    void setAvailable(bool available);
++
++Q_SIGNALS:
++    void backRequested();
++
++protected:
++    bool eventFilter(QObject *watched, QEvent *event) override;
++
++private:
++    void attachPlatformWindow();
++    void detachPlatformWindow();
++    void createObject();
++    void destroyObject();
++
++    QPointer<QQuickWindow> m_window;
++    QPointer<QObject> m_waylandWindow;
++    std::unique_ptr<BackNavigationObject> m_object;
++    bool m_available = false;
++};
++
++}
++}
++
++#endif
