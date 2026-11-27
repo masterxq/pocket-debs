@@ -12,15 +12,16 @@ Description:
  .
  Forget the request in that case and hide the panel; it is shown again
  when text input asks for it. A panel hidden in response to a
- deactivation, or one of an earlier activation (the input method may
- close it only after the next activation), does not count.
+ deactivation, one of an earlier activation (the input method may close
+ it only after the next activation), and one that was never shown (an
+ input method replacing its surface while starting up) do not count.
 Author: masterxq <masterxq@users.noreply.github.com>
 Forwarded: no
 License: GPL-2.0-or-later (as the patched files)
 Last-Update: 2026-11-27
 ---
 diff --git a/autotests/integration/inputmethod_test.cpp b/autotests/integration/inputmethod_test.cpp
-index 9c2218f..b297f76 100644
+index 9c2218f..6980046 100644
 --- a/autotests/integration/inputmethod_test.cpp
 +++ b/autotests/integration/inputmethod_test.cpp
 @@ -72,6 +72,7 @@ private Q_SLOTS:
@@ -31,7 +32,7 @@ index 9c2218f..b297f76 100644
      void testModifierForwarding();
      void testFakeEventFallback();
      void testOverlayPositioning_data();
-@@ -777,6 +778,48 @@ void InputMethodTest::testSwitchTextFieldV2()
+@@ -777,6 +778,65 @@ void InputMethodTest::testSwitchTextFieldV2()
      QVERIFY(Test::waitForWindowClosed(window));
  }
  
@@ -73,6 +74,23 @@ index 9c2218f..b297f76 100644
 +    textInput->showInputPanel();
 +    QTRY_VERIFY(kwinApp()->inputMethod()->isVisible());
 +
++    // A panel that goes away before it was ever shown does not count: the input method replaces
++    // its panel with one it destroys before mapping it, then maps another one.
++    InputPanelV1Window *shownPanel = kwinApp()->inputMethod()->panel();
++    auto unmappedSurface = Test::createSurface();
++    auto unmappedRole = Test::createInputPanelSurfaceV1(unmappedSurface.get(), Test::waylandOutputs().first(), Test::MockInputMethod::Mode::TopLevel);
++    QTRY_VERIFY(kwinApp()->inputMethod()->panel() && kwinApp()->inputMethod()->panel() != shownPanel);
++    QVERIFY(!kwinApp()->inputMethod()->isVisible());
++    unmappedRole.reset();
++    unmappedSurface.reset();
++    QVERIFY(Test::waylandSync());
++    auto nextSurface = Test::createSurface();
++    auto nextRole = Test::createInputPanelSurfaceV1(nextSurface.get(), Test::waylandOutputs().first(), Test::MockInputMethod::Mode::TopLevel);
++    Test::render(nextSurface.get(), QSize(1280, 400), Qt::blue);
++    QTRY_VERIFY(kwinApp()->inputMethod()->isVisible());
++
++    nextRole.reset();
++    nextSurface.reset();
 +    shellSurface.reset();
 +    QVERIFY(Test::waitForWindowClosed(window));
 +}
@@ -81,7 +99,7 @@ index 9c2218f..b297f76 100644
  {
      QVERIFY(Test::waitForWaylandKeyboard());
 diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
-index 5c52f71..375201e 100644
+index 5c52f71..5a44a56 100644
 --- a/src/inputmethod.cpp
 +++ b/src/inputmethod.cpp
 @@ -267,6 +267,7 @@ void InputMethod::setActive(bool active)
@@ -113,7 +131,7 @@ index 5c52f71..375201e 100644
      connect(m_panel, &Window::frameGeometryChanged, this, &InputMethod::updateInputPanelState);
      connect(m_panel, &Window::hiddenChanged, this, &InputMethod::updateInputPanelState);
      connect(m_panel, &Window::hiddenChanged, this, &InputMethod::visibleChanged);
-@@ -310,6 +316,25 @@ void InputMethod::setPanel(InputPanelV1Window *panel)
+@@ -310,6 +316,29 @@ void InputMethod::setPanel(InputPanelV1Window *panel)
      }
  }
  
@@ -124,6 +142,10 @@ index 5c52f71..375201e 100644
 +    // method may map the panel again by itself (plasma-keyboard does when the surrounding text
 +    // changes), it is shown again once text input asks for it.
 +    if (!m_panel || m_panel->mode() != InputPanelV1Window::Mode::VirtualKeyboard) {
++        return;
++    }
++    if (!m_panel->readyForPainting()) {
++        // never shown, e.g. the input method replaced the surface while starting up
 +        return;
 +    }
 +    if (!isActive() || m_panelActivation != m_activation) {
