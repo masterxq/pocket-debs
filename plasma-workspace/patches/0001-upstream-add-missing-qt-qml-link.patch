@@ -1,0 +1,43 @@
+From: Nicolas Fella <nicolas.fella@gmx.de>
+Date: Mon, 7 Sep 2026 13:44:16 +0200
+Subject: [PATCH] Add missing Qt::Qml link
+Description:
+ kcm_feedback, kcm_lookandfeel and kcm_nightlight include Qt Qml headers
+ but got Qt::Qml only through the link interface of KF6::KCMUtilsQuick;
+ with current KDE Frameworks the build fails ("qqml.h: No such file or
+ directory"). Upstream fix on Plasma/6.7 (in 6.7.5), cherry-picked from
+ master 012c409d.
+Origin: upstream, https://invent.kde.org/plasma/plasma-workspace/-/commit/aa326ad917ab59a84f47ca60d3a319acb07b0019
+Applied-Upstream: 6.7.5
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-27
+---
+--- a/kcms/feedback/CMakeLists.txt
++++ b/kcms/feedback/CMakeLists.txt
+@@ -10,6 +10,7 @@ kcmutils_generate_module_data(kcm_feedback
+ )
+ kconfig_add_kcfg_files(kcm_feedback feedbacksettings.kcfgc GENERATE_MOC)
+ target_link_libraries(kcm_feedback PRIVATE
++    Qt::Qml
+     KF6::I18n
+     KF6::KCMUtils
+     KF6::KCMUtilsQuick
+--- a/kcms/lookandfeel/CMakeLists.txt
++++ b/kcms/lookandfeel/CMakeLists.txt
+@@ -12,6 +12,7 @@ target_sources(kcm_lookandfeel PRIVATE
+ )
+ target_link_libraries(kcm_lookandfeel PRIVATE
+     Qt6::DBus
++    Qt6::Qml
+     KF6::ConfigGui
+     KF6::I18n
+     KF6::KCMUtils
+--- a/kcms/nightlight/CMakeLists.txt
++++ b/kcms/nightlight/CMakeLists.txt
+@@ -20,5 +20,6 @@ target_link_libraries(kcm_nightlight PRIVATE
+     KF6::I18n
+     KF6::KCMUtils
+     Qt::DBus
++    Qt::Qml
+     KNightTime
+ )
