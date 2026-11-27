@@ -1,13 +1,14 @@
 From: pocket-debs <masterxq@users.noreply.github.com>
-Date: Fri, 27 Nov 2026 16:00:00 +0100
-Subject: [PATCH] taskpanel: hide keyboard and back icons drawn like the close icon
+Date: Fri, 27 Nov 2026 17:00:00 +0100
+Subject: [PATCH] taskpanel: one icon style for hide keyboard, back and close
 Description:
  The right button of the navigation panel showed the thin go-down-symbolic
  and go-previous-symbolic icons from breeze-icons next to the bold
- mobile-close-app and mobile-task-switcher icons. Add mobile-hide-keyboard
- and mobile-go-back in the 12px grid with the stroke width of
- mobile-close-app as resources of the applet and use them, with the same
- shrink size as the close icon.
+ mobile-close-app and mobile-task-switcher icons. Draw mobile-hide-keyboard,
+ mobile-go-back and mobile-close-app in one style (12px grid, open strokes
+ with round caps, stroke width 1.4, slightly heavier than the task switcher
+ outline because diagonal strokes look lighter), carried as resources of the
+ applet, and use them for the three states of the button.
  .
  The icons belong to breeze-icons next to the other mobile-* icons; until
  then the applet carries them.
@@ -15,25 +16,28 @@ Forwarded: no
 License: GPL-2.0-or-later (as the patched files; new icons LGPL-2.1-or-later)
 Last-Update: 2026-11-27
 ---
- containments/taskpanel/CMakeLists.txt                 |  7 +++++++
+ containments/taskpanel/CMakeLists.txt                 |  8 ++++++++
+ containments/taskpanel/icons/mobile-close-app.svg     | 11 +++++++++++
  containments/taskpanel/icons/mobile-go-back.svg       | 11 +++++++++++
  containments/taskpanel/icons/mobile-hide-keyboard.svg | 11 +++++++++++
- .../taskpanel/qml/NavigationPanelComponent.qml        |  8 +++++---
- 4 files changed, 34 insertions(+), 3 deletions(-)
+ .../taskpanel/qml/NavigationPanelComponent.qml        |  9 ++++++---
+ 5 files changed, 47 insertions(+), 3 deletions(-)
+ create mode 100644 containments/taskpanel/icons/mobile-close-app.svg
  create mode 100644 containments/taskpanel/icons/mobile-go-back.svg
  create mode 100644 containments/taskpanel/icons/mobile-hide-keyboard.svg
 
 diff --git a/containments/taskpanel/CMakeLists.txt b/containments/taskpanel/CMakeLists.txt
-index b00404f4d..7d838ef56 100644
+index b00404f4d..b971ae980 100644
 --- a/containments/taskpanel/CMakeLists.txt
 +++ b/containments/taskpanel/CMakeLists.txt
-@@ -12,6 +12,13 @@ plasma_add_applet(org.kde.plasma.mobile.taskpanel
+@@ -12,6 +12,14 @@ plasma_add_applet(org.kde.plasma.mobile.taskpanel
          taskpanel.cpp
  )
  
 +qt_add_resources(org.kde.plasma.mobile.taskpanel "taskpanel_icons"
 +    PREFIX "/org/kde/plasma/mobile/taskpanel"
 +    FILES
++        icons/mobile-close-app.svg
 +        icons/mobile-go-back.svg
 +        icons/mobile-hide-keyboard.svg
 +)
@@ -41,9 +45,26 @@ index b00404f4d..7d838ef56 100644
  target_link_libraries(org.kde.plasma.mobile.taskpanel PRIVATE
                        Qt::Gui
                        Qt::DBus
+diff --git a/containments/taskpanel/icons/mobile-close-app.svg b/containments/taskpanel/icons/mobile-close-app.svg
+new file mode 100644
+index 000000000..ab22985b0
+--- /dev/null
++++ b/containments/taskpanel/icons/mobile-close-app.svg
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!--
++    SPDX-FileCopyrightText: 2026 masterxq
++    SPDX-License-Identifier: LGPL-2.1-or-later
++-->
++<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12">
++  <style type="text/css" id="current-color-scheme">.ColorScheme-Text {
++            color:#232629;
++        }</style>
++  <path class="ColorScheme-Text" d="M 1.1,1.1 10.9,10.9 M 1.1,10.9 10.9,1.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
++</svg>
 diff --git a/containments/taskpanel/icons/mobile-go-back.svg b/containments/taskpanel/icons/mobile-go-back.svg
 new file mode 100644
-index 000000000..c845a492a
+index 000000000..989656fa1
 --- /dev/null
 +++ b/containments/taskpanel/icons/mobile-go-back.svg
 @@ -0,0 +1,11 @@
@@ -56,11 +77,11 @@ index 000000000..c845a492a
 +  <style type="text/css" id="current-color-scheme">.ColorScheme-Text {
 +            color:#232629;
 +        }</style>
-+  <path class="ColorScheme-Text" d="M 8.7,0.6 3.3,6 8.7,11.4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
++  <path class="ColorScheme-Text" d="M 8.4,0.9 3.3,6 8.4,11.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
 +</svg>
 diff --git a/containments/taskpanel/icons/mobile-hide-keyboard.svg b/containments/taskpanel/icons/mobile-hide-keyboard.svg
 new file mode 100644
-index 000000000..2fe051d18
+index 000000000..a936f0058
 --- /dev/null
 +++ b/containments/taskpanel/icons/mobile-hide-keyboard.svg
 @@ -0,0 +1,11 @@
@@ -73,22 +94,23 @@ index 000000000..2fe051d18
 +  <style type="text/css" id="current-color-scheme">.ColorScheme-Text {
 +            color:#232629;
 +        }</style>
-+  <path class="ColorScheme-Text" d="M 0.6,3.3 6,8.7 11.4,3.3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
++  <path class="ColorScheme-Text" d="M 0.9,3.45 6,8.55 11.1,3.45" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
 +</svg>
 diff --git a/containments/taskpanel/qml/NavigationPanelComponent.qml b/containments/taskpanel/qml/NavigationPanelComponent.qml
-index a044cb64a..6b244e8ea 100644
+index a044cb64a..25c10e7fc 100644
 --- a/containments/taskpanel/qml/NavigationPanelComponent.qml
 +++ b/containments/taskpanel/qml/NavigationPanelComponent.qml
-@@ -101,9 +101,11 @@ MobileShell.NavigationPanel {
+@@ -101,9 +101,12 @@ MobileShell.NavigationPanel {
          readonly property bool showBack: !Keyboards.KWinVirtualKeyboard.visible && WindowPlugin.WindowUtil.activeWindowCanGoBack
  
          enabled: Keyboards.KWinVirtualKeyboard.visible || showBack || WindowPlugin.WindowUtil.hasCloseableActiveWindow
 -        iconSource: Keyboards.KWinVirtualKeyboard.visible ? "go-down-symbolic" : (showBack ? "go-previous-symbolic" : "mobile-close-app")
 -        // mobile-close-app (from plasma-frameworks) seems to have fewer margins than icons from breeze-icons
 -        shrinkSize: (Keyboards.KWinVirtualKeyboard.visible || showBack) ? 0 : 4
-+        // hide keyboard and back are drawn like mobile-close-app (12px grid, same stroke width)
-+        iconSource: Keyboards.KWinVirtualKeyboard.visible ? "qrc:/org/kde/plasma/mobile/taskpanel/icons/mobile-hide-keyboard.svg"
-+                  : (showBack ? "qrc:/org/kde/plasma/mobile/taskpanel/icons/mobile-go-back.svg" : "mobile-close-app")
++        // hide keyboard, back and close share one style: 12px grid, open strokes, stroke width 1.4 (slightly heavier than
++        // the task switcher outline, as diagonal strokes look lighter)
++        iconSource: "qrc:/org/kde/plasma/mobile/taskpanel/icons/"
++                    + (Keyboards.KWinVirtualKeyboard.visible ? "mobile-hide-keyboard" : (showBack ? "mobile-go-back" : "mobile-close-app")) + ".svg"
 +        // icons in the 12px grid have fewer margins than the larger icons from breeze-icons
 +        shrinkSize: 4
  
