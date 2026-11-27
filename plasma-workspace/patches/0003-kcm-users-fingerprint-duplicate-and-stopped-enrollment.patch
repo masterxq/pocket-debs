@@ -1,0 +1,72 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 01:00:00 +0100
+Subject: [PATCH] kcms/users: duplicate fingerprints and stopped enrollments
+Description:
+ Before it enrolls a finger, fprintd identifies the first touch against all
+ enrolled prints and ends the enrollment with "enroll-duplicate" when it
+ matches one of them. The KCM ignored that result and kept asking for the
+ finger, although fprintd no longer enrolled. It is now an enrollment
+ failure with its own message.
+ .
+ fprintd also reports an enrollment stopped with EnrollStop as
+ "enroll-failed", and its signals reach every client. After the user
+ cancelled an enrollment, the KCM showed "Fingerprint enrollment has
+ failed." the next time the dialog opened. Failures are only taken into
+ account while the KCM runs an enrollment.
+ .
+ German translation of the new message.
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-27
+---
+--- a/kcms/users/src/fprintdevice.cpp
++++ b/kcms/users/src/fprintdevice.cpp
+@@ -83,7 +83,8 @@
+ 
+     if (result == u"enroll-completed") {
+         Q_EMIT enrollCompleted();
+-    } else if (result == u"enroll-failed" || result == u"enroll-data-full" || result == u"enroll-disconnected" || result == u"enroll-unknown-error") {
++    } else if (result == u"enroll-failed" || result == u"enroll-data-full" || result == u"enroll-disconnected" || result == u"enroll-unknown-error"
++               || result == u"enroll-duplicate") {
+         Q_EMIT enrollFailed(result);
+     } else if (result == u"enroll-stage-passed") {
+         Q_EMIT enrollStagePassed();
+--- a/kcms/users/src/fingerprintmodel.cpp
++++ b/kcms/users/src/fingerprintmodel.cpp
+@@ -311,6 +311,12 @@
+ 
+ void FingerprintModel::handleEnrollFailed(const QString &error)
+ {
++    // fprintd reports the end of an enrollment stopped with EnrollStop as "enroll-failed" too, and its signals reach
++    // every client: only an enrollment this model is running can fail.
++    if (!m_currentlyEnrolling) {
++        return;
++    }
++
+     if (error == u"enroll-failed") {
+         setCurrentError(i18n("Fingerprint enrollment has failed."));
+         stopEnrolling();
+@@ -325,6 +331,9 @@
+     } else if (error == u"enroll-unknown-error") {
+         setCurrentError(i18n("An unknown error has occurred."));
+         stopEnrolling();
++    } else if (error == u"enroll-duplicate") {
++        setCurrentError(i18n("This fingerprint is already enrolled."));
++        stopEnrolling();
+     }
+ }
+ 
+--- a/po/de/kcm_users.po
++++ b/po/de/kcm_users.po
+@@ -71,6 +71,11 @@
+ msgid "An unknown error has occurred."
+ msgstr "Es ist ein unbekannter Fehler aufgetreten."
+ 
++#: src/fingerprintmodel.cpp:335
++#, kde-format
++msgid "This fingerprint is already enrolled."
++msgstr "Dieser Fingerabdruck ist bereits registriert."
++
+ #: src/ui/ChangePassword.qml:29 src/ui/UserDetailsPage.qml:228
+ #, kde-format
+ msgid "Change Password"
