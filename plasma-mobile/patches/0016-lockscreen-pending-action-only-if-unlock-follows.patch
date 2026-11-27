@@ -1,0 +1,304 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 18:00:00 +0100
+Subject: [PATCH] lockscreen: run a tapped notification action only if the unlock directly follows
+Description:
+ A notification action tapped on the lock screen, or in the action drawer
+ over it, waits for the unlock. It was dropped only after a failed or
+ successful attempt, so closing the keypad again or the display turning
+ off kept it: a much later unlock, independent of the tap, ran it.
+ .
+ The lock screen now reports leaving the keypad without unlocking (keypad
+ back at its closed position, display off) as unlockCancelled() and
+ drops its own pending action then. It also tells the shell through the
+ new D-Bus method cancelLockScreenUnlock() of org.kde.plasmashell (signal
+ lockScreenUnlockCancelled), which drops the action held by the action
+ drawer. A wrong PIN keeps the action while the keypad stays open. An
+ unlock with the fingerprint is the same as with the PIN.
+ .
+ Without authentication (the session can be unlocked at once) the lock
+ screen quit when the keypad was opened without running the pending
+ action; it goes through the same path as an authenticated unlock now.
+Forwarded: no
+License: GPL-2.0-or-later, LGPL-2.0-or-later, GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL (as the patched files)
+Last-Update: 2026-11-27
+---
+diff --git a/components/mobileshell/qml/actiondrawer/ActionDrawer.qml b/components/mobileshell/qml/actiondrawer/ActionDrawer.qml
+index cbe4228a1..937d92c0c 100644
+--- a/components/mobileshell/qml/actiondrawer/ActionDrawer.qml
++++ b/components/mobileshell/qml/actiondrawer/ActionDrawer.qml
+@@ -134,6 +134,13 @@ Item {
+      */
+     signal runPendingNotificationAction()
+ 
++    /**
++     * Drops the held notification action that was pending for authentication.
++     *
++     * Should be called by users if the authentication requested with permissionsRequested() was abandoned.
++     */
++    signal cancelPendingNotificationAction()
++
+     property real oldOffset
+     onOffsetChanged: {
+         if (offset < 0) {
+diff --git a/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml b/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml
+index a14c5cebc..974ef5380 100644
+--- a/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml
++++ b/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml
+@@ -68,6 +68,10 @@ Item {
+             function onRunPendingNotificationAction() {
+                 notificationWidget.runPendingAction();
+             }
++
++            function onCancelPendingNotificationAction() {
++                notificationWidget.cancelPendingAction();
++            }
+         }
+ 
+         // the first swipe when at the top of the notification list is handled using a MouseArea, not the flickable
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+index 6caa9e4ce..114236261 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+@@ -122,6 +122,13 @@ Item {
+         }
+     }
+ 
++    /**
++     * Drop the pending action, the authentication requested with unlockRequested() was abandoned.
++     */
++    function cancelPendingAction() {
++        list.pendingNotificationWithAction = null;
++    }
++
+     /**
+      * Clears the history of the notification model.
+      */
+diff --git a/components/mobileshellstate/shelldbusclient.cpp b/components/mobileshellstate/shelldbusclient.cpp
+index 8884666f3..eb0017273 100644
+--- a/components/mobileshellstate/shelldbusclient.cpp
++++ b/components/mobileshellstate/shelldbusclient.cpp
+@@ -51,6 +51,7 @@ void ShellDBusClient::connectSignals()
+     connect(m_interface, &OrgKdePlasmashellInterface::resetHomeScreenPositionRequested, this, &ShellDBusClient::resetHomeScreenPositionRequested);
+     connect(m_interface, &OrgKdePlasmashellInterface::showVolumeOSDRequested, this, &ShellDBusClient::showVolumeOSDRequested);
+     connect(m_interface, &OrgKdePlasmashellInterface::openLockScreenKeypadRequested, this, &ShellDBusClient::openLockScreenKeypadRequested);
++    connect(m_interface, &OrgKdePlasmashellInterface::lockScreenUnlockCancelled, this, &ShellDBusClient::lockScreenUnlockCancelled);
+ 
+     // Initial state fetch
+     updatePanelState();
+@@ -162,6 +163,11 @@ void ShellDBusClient::openLockScreenKeypad()
+     m_interface->openLockScreenKeypad();
+ }
+ 
++void ShellDBusClient::cancelLockScreenUnlock()
++{
++    m_interface->cancelLockScreenUnlock();
++}
++
+ void ShellDBusClient::updatePanelState()
+ {
+     auto reply = m_interface->panelState();
+diff --git a/components/mobileshellstate/shelldbusclient.h b/components/mobileshellstate/shelldbusclient.h
+index 4f36a174a..79abbe8f3 100644
+--- a/components/mobileshellstate/shelldbusclient.h
++++ b/components/mobileshellstate/shelldbusclient.h
+@@ -55,6 +55,7 @@ public:
+     Q_INVOKABLE void resetHomeScreenPosition();
+     Q_INVOKABLE void showVolumeOSD();
+     Q_INVOKABLE void openLockScreenKeypad();
++    Q_INVOKABLE void cancelLockScreenUnlock();
+ 
+ Q_SIGNALS:
+     void panelStateChanged();
+@@ -70,6 +71,7 @@ Q_SIGNALS:
+     void resetHomeScreenPositionRequested();
+     void showVolumeOSDRequested();
+     void openLockScreenKeypadRequested();
++    void lockScreenUnlockCancelled();
+ 
+ private Q_SLOTS:
+     void updateDoNotDisturb();
+diff --git a/components/mobileshellstate/shelldbusobject.cpp b/components/mobileshellstate/shelldbusobject.cpp
+index 1a2799682..2b43abe2d 100644
+--- a/components/mobileshellstate/shelldbusobject.cpp
++++ b/components/mobileshellstate/shelldbusobject.cpp
+@@ -155,3 +155,8 @@ void ShellDBusObject::openLockScreenKeypad()
+ {
+     Q_EMIT openLockScreenKeypadRequested();
+ }
++
++void ShellDBusObject::cancelLockScreenUnlock()
++{
++    Q_EMIT lockScreenUnlockCancelled();
++}
+diff --git a/components/mobileshellstate/shelldbusobject.h b/components/mobileshellstate/shelldbusobject.h
+index b39f1cbf8..1543e78bc 100644
+--- a/components/mobileshellstate/shelldbusobject.h
++++ b/components/mobileshellstate/shelldbusobject.h
+@@ -39,6 +39,7 @@ Q_SIGNALS:
+     Q_SCRIPTABLE void resetHomeScreenPositionRequested();
+     Q_SCRIPTABLE void showVolumeOSDRequested();
+     Q_SCRIPTABLE void openLockScreenKeypadRequested();
++    Q_SCRIPTABLE void lockScreenUnlockCancelled();
+ 
+ public Q_SLOTS:
+     Q_SCRIPTABLE bool doNotDisturb();
+@@ -73,6 +74,10 @@ public Q_SLOTS:
+     Q_SCRIPTABLE void showVolumeOSD();
+     Q_SCRIPTABLE void openLockScreenKeypad();
+ 
++    // Called by the lock screen when the user leaves the keypad without unlocking (keypad closed, display off),
++    // so that actions waiting for an unlock (see openLockScreenKeypad()) are dropped.
++    Q_SCRIPTABLE void cancelLockScreenUnlock();
++
+ private:
+     bool m_initialized{false};
+ 
+diff --git a/containments/panel/qml/StatusPanel.qml b/containments/panel/qml/StatusPanel.qml
+index b1565e676..fc0655b99 100644
+--- a/containments/panel/qml/StatusPanel.qml
++++ b/containments/panel/qml/StatusPanel.qml
+@@ -181,6 +181,15 @@ Item {
+             }
+         }
+ 
++        Connections {
++            target: MobileShellState.ShellDBusClient
++
++            function onLockScreenUnlockCancelled() {
++                // A pending action only runs if the unlock directly follows it
++                drawer.actionDrawer.cancelPendingNotificationAction();
++            }
++        }
++
+         Connections {
+             target: MobileShellState.LockscreenDBusClient
+ 
+diff --git a/shell/contents/lockscreen/LockScreen.qml b/shell/contents/lockscreen/LockScreen.qml
+index 6c07687ae..493c382cd 100644
+--- a/shell/contents/lockscreen/LockScreen.qml
++++ b/shell/contents/lockscreen/LockScreen.qml
+@@ -55,6 +55,15 @@ Item {
+         }
+     }
+ 
++    // Actions of the shell waiting for the unlock (tapped in the action drawer) only run if it directly follows
++    Connections {
++        target: root.lockScreenState
++
++        function onUnlockCancelled() {
++            MobileShellState.ShellDBusClient.cancelLockScreenUnlock();
++        }
++    }
++
+     // Wallpaper blur
+     Loader {
+         id: wallpaperLoader
+@@ -94,6 +103,7 @@ Item {
+             if (screen.name === Screen.name) {
+                 flickable.goToClosePosition();
+                 lockScreenState.resetPassword();
++                lockScreenState.unlockCancelled();
+             }
+         }
+     }
+@@ -123,7 +133,7 @@ Item {
+             // Unlock lockscreen if it's already unlocked and keypad is opened
+             onOpened: {
+                 if (root.lockScreenState.canBeUnlocked) {
+-                    Qt.quit();
++                    root.lockScreenState.finishUnlock();
+                 }
+             }
+ 
+@@ -132,7 +142,7 @@ Item {
+                 target: root.lockScreenState
+                 function onCanBeUnlockedChanged() {
+                     if (root.lockScreenState.canBeUnlocked && flickable.openFactor > 0.8) {
+-                        Qt.quit();
++                        root.lockScreenState.finishUnlock();
+                     }
+                 }
+             }
+@@ -144,6 +154,13 @@ Item {
+                 }
+             }
+ 
++            // Back at the closed position (the keypad starts there): an unlock that was started is abandoned
++            onPositionChanged: {
++                if (flickable.position === 0) {
++                    root.lockScreenState.unlockCancelled();
++                }
++            }
++
+             // hint or error of the fingerprint reader, above the indicator icon
+             PC3.Label {
+                 id: fingerprintMessage
+diff --git a/shell/contents/lockscreen/LockScreenState.qml b/shell/contents/lockscreen/LockScreenState.qml
+index 228740177..3de474e4d 100644
+--- a/shell/contents/lockscreen/LockScreenState.qml
++++ b/shell/contents/lockscreen/LockScreenState.qml
+@@ -54,6 +54,9 @@ QtObject {
+     signal reset()
+     signal unlockSucceeded()
+     signal unlockFailed()
++
++    // the user left the keypad without unlocking (keypad closed, display turned off)
++    signal unlockCancelled()
+     signal fingerprintFailed()
+ 
+     Component.onCompleted: {
+@@ -111,6 +114,12 @@ QtObject {
+         root.reset();
+     }
+ 
++    // Called once the lockscreen may go away: unlocked by authentication, or no authentication needed
++    function finishUnlock(): void {
++        root.unlockSucceeded();
++        Qt.quit();
++    }
++
+     function resetPinLabel(): void {
+         pinLabel = enterPinLabel;
+     }
+@@ -166,8 +175,7 @@ QtObject {
+             if (authenticator.hadPrompt) {
+                 console.log('login succeeded');
+                 root.waitingForAuth = false;
+-                root.unlockSucceeded();
+-                Qt.quit();
++                root.finishUnlock();
+             }
+         }
+ 
+diff --git a/shell/contents/lockscreen/NotificationsComponent.qml b/shell/contents/lockscreen/NotificationsComponent.qml
+index 151884e59..5ae6898a6 100644
+--- a/shell/contents/lockscreen/NotificationsComponent.qml
++++ b/shell/contents/lockscreen/NotificationsComponent.qml
+@@ -40,19 +40,24 @@ Loader {
+         onTriggered: root.active = true
+     }
+ 
++    // A tapped action runs only if the unlock directly follows it: a wrong PIN keeps it while the keypad stays
++    // open, leaving the keypad (or the display turning off) drops it.
+     Connections {
+         target: lockScreenState
+ 
+         function onUnlockSucceeded() {
+             // run pending action if successfully unlocked
+-            if (notificationsList.requestNotificationAction) {
++            if (notificationsList && notificationsList.requestNotificationAction) {
+                 notificationsList.runPendingAction();
+                 notificationsList.requestNotificationAction = false;
+             }
+         }
+ 
+-        function onUnlockFailed() {
+-            notificationsList.requestNotificationAction = false;
++        function onUnlockCancelled() {
++            if (notificationsList) {
++                notificationsList.cancelPendingAction();
++                notificationsList.requestNotificationAction = false;
++            }
+         }
+     }
+ 
