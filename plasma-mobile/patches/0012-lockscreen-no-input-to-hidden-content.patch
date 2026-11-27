@@ -1,0 +1,29 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 14:00:00 +0100
+Subject: [PATCH] lockscreen: no input to the hidden content while the keypad is open
+Description:
+ With the keypad open the lock screen content (clock, media controls,
+ notifications, quick action buttons) is faded out and placed below the
+ keypad, and the notification list stops scrolling (scrollLock), but the
+ content still took touches. With notifications behind the keypad, the swipe
+ to dismiss of a notification card took over taps on the keys that moved a
+ little sideways and cancelled them.
+ .
+ Disable the content while scrollLock is set, as the scrolling already is.
+Forwarded: no
+License: GPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-27
+---
+diff --git a/shell/contents/lockscreen/LockScreen.qml b/shell/contents/lockscreen/LockScreen.qml
+index a60707a25..6c07687ae 100644
+--- a/shell/contents/lockscreen/LockScreen.qml
++++ b/shell/contents/lockscreen/LockScreen.qml
+@@ -239,6 +239,8 @@ Item {
+             onPasswordRequested: flickable.goToOpenPosition()
+ 
+             scrollLock: flickable.openFactor > 0.2
++            // with the keypad open the hidden content must not take touches from the keys
++            enabled: !scrollLock
+             z: scrollLock ? -1 : 0
+ 
+             anchors.fill: parent
