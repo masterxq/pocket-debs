@@ -1,0 +1,32 @@
+From: Nicolas Fella <nicolas.fella@gmx.de>
+Date: Mon, 7 Sep 2026 14:10:48 +0200
+Subject: [PATCH] Add missing Qt::Qml link
+Description:
+ kcm_virtualkeyboard and kcm_kwinxwayland include qqml.h but got the Qt Qml
+ include path only through other libraries. With the KDE Frameworks of the
+ suite the build fails with "qqml.h: No such file or directory".
+Origin: upstream, https://invent.kde.org/plasma/kwin/-/commit/1bef92a60e5fde1d89d0c704a02a7b78c28f10ef
+Applied-Upstream: Plasma/6.7 (cherry-pick of eff53c21b29dbedc02597a3cd487af7b3e1b2d0d)
+Last-Update: 2026-11-27
+---
+diff --git a/src/kcms/virtualkeyboard/CMakeLists.txt b/src/kcms/virtualkeyboard/CMakeLists.txt
+index ef12ec1..76dd977 100644
+--- a/src/kcms/virtualkeyboard/CMakeLists.txt
++++ b/src/kcms/virtualkeyboard/CMakeLists.txt
+@@ -21,4 +21,5 @@ target_link_libraries(kcm_virtualkeyboard PRIVATE
+     KF6::Service
+     KF6::KCMUtilsQuick
+     Qt::DBus
++    Qt::Qml
+ )
+diff --git a/src/kcms/xwayland/CMakeLists.txt b/src/kcms/xwayland/CMakeLists.txt
+index 69aa3ae..8624c06 100644
+--- a/src/kcms/xwayland/CMakeLists.txt
++++ b/src/kcms/xwayland/CMakeLists.txt
+@@ -19,5 +19,6 @@ target_link_libraries(kcm_kwinxwayland PRIVATE
+     KF6::KCMUtils
+     KF6::KCMUtilsQuick
+     Qt::DBus
++    Qt::Qml
+     Wayland::Client
+ )
