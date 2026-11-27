@@ -11,8 +11,10 @@ Description:
  panel, so the on-screen keyboard went away while the user moved into the
  next field.
  .
- Handle the enabled state after the batch, and send the panel state to
- the client again, since the disable request reported it as hidden.
+ Look at a disable only after the batch, and send the panel state to the
+ client again when text input is enabled, since a preceding disable
+ request reported it as hidden. Enabling still activates the input method
+ right away.
 Author: masterxq <masterxq@users.noreply.github.com>
 Forwarded: no
 License: GPL-2.0-or-later (as the patched files)
@@ -81,27 +83,29 @@ index 25cfbda..9c2218f 100644
  {
      QVERIFY(Test::waitForWaylandKeyboard());
 diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
-index 4412dee..5c52f71 100644
+index 4412dee..4d47145 100644
 --- a/src/inputmethod.cpp
 +++ b/src/inputmethod.cpp
-@@ -110,7 +110,10 @@ void InputMethod::init()
-     connect(textInputV2, &TextInputV2Interface::surroundingTextChanged, this, &InputMethod::surroundingTextChanged);
-     connect(textInputV2, &TextInputV2Interface::contentTypeChanged, this, &InputMethod::contentTypeChanged);
-     connect(textInputV2, &TextInputV2Interface::stateUpdated, this, &InputMethod::textInputInterfaceV2StateUpdated);
--    connect(textInputV2, &TextInputV2Interface::enabledChanged, this, &InputMethod::textInputInterfaceV2EnabledChanged);
-+    // text-input-v2 has no commit: a client moving focus from one text field to another disables and
-+    // enables text input in one batch of requests. Look at the result after the batch, otherwise the
-+    // input method would be deactivated and the panel hidden in between.
-+    connect(textInputV2, &TextInputV2Interface::enabledChanged, this, &InputMethod::textInputInterfaceV2EnabledChanged, Qt::QueuedConnection);
-     connect(textInputV2, &TextInputV2Interface::cursorRectangleChanged, this, &InputMethod::cursorRectangleChanged);
+@@ -418,7 +418,21 @@ void InputMethod::textInputInterfaceV2StateUpdated(quint32 serial, TextInputV2In
  
-     TextInputV3Interface *textInputV3 = waylandServer()->seat()->textInputV3();
-@@ -419,6 +422,8 @@ void InputMethod::textInputInterfaceV2StateUpdated(quint32 serial, TextInputV2In
  void InputMethod::textInputInterfaceV2EnabledChanged()
  {
-     refreshActive();
-+    // disabling text input reported the panel as hidden to the client
-+    updateInputPanelState();
+-    refreshActive();
++    if (waylandServer()->seat()->textInputV2()->isEnabled()) {
++        refreshActive();
++        // a preceding disable request reported the panel as hidden to the client
++        updateInputPanelState();
++        return;
++    }
++    // text-input-v2 has no commit: a client moving focus from one text field to another disables and
++    // enables text input in one batch of requests. Look at a disable after the batch, otherwise the
++    // input method would be deactivated and the panel hidden in between.
++    QMetaObject::invokeMethod(
++        this, [this]() {
++            refreshActive();
++            updateInputPanelState();
++        },
++        Qt::QueuedConnection);
  }
  
  void InputMethod::textInputInterfaceV3EnabledChanged()

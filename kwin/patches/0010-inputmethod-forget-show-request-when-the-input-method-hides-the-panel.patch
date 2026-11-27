@@ -99,10 +99,10 @@ index 9c2218f..6980046 100644
  {
      QVERIFY(Test::waitForWaylandKeyboard());
 diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
-index 5c52f71..5a44a56 100644
+index 4d47145..f516aa9 100644
 --- a/src/inputmethod.cpp
 +++ b/src/inputmethod.cpp
-@@ -267,6 +267,7 @@ void InputMethod::setActive(bool active)
+@@ -264,6 +264,7 @@ void InputMethod::setActive(bool active)
      if (active) {
          if (!wasActive) {
              waylandServer()->inputMethod()->sendActivate();
@@ -110,7 +110,7 @@ index 5c52f71..5a44a56 100644
          }
          adoptInputMethodContext();
      } else {
-@@ -288,15 +289,20 @@ void InputMethod::setPanel(InputPanelV1Window *panel)
+@@ -285,15 +286,20 @@ void InputMethod::setPanel(InputPanelV1Window *panel)
      Q_ASSERT(panel->isInputMethod());
      if (m_panel) {
          qCDebug(KWIN_VIRTUALKEYBOARD) << "Replacing input panel" << m_panel << "with" << panel;
@@ -131,7 +131,7 @@ index 5c52f71..5a44a56 100644
      connect(m_panel, &Window::frameGeometryChanged, this, &InputMethod::updateInputPanelState);
      connect(m_panel, &Window::hiddenChanged, this, &InputMethod::updateInputPanelState);
      connect(m_panel, &Window::hiddenChanged, this, &InputMethod::visibleChanged);
-@@ -310,6 +316,29 @@ void InputMethod::setPanel(InputPanelV1Window *panel)
+@@ -307,6 +313,29 @@ void InputMethod::setPanel(InputPanelV1Window *panel)
      }
  }
  
