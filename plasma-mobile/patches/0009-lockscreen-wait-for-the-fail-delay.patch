@@ -1,0 +1,90 @@
+Description: lockscreen: wait for the fail delay before the next attempt
+ After a wrong PIN, PAM (pam_unix) asks for a fail delay of about two
+ seconds; kscreenlocker announces it (loginFailedDelayStarted) and fails
+ every attempt started within it at once ("Authentication attempt too
+ soon"). The lock screen started the next attempt right after the failure
+ and again after each of these failures: some thousand failures and log
+ lines within the delay, and a PIN entered in that time was rejected
+ without being checked. Start the next attempt when the delay is over; a
+ PIN entered meanwhile is answered then.
+Author: pocket-debs
+Forwarded: no
+License: GPL-2.0-or-later
+---
+diff -ruN a/shell/contents/lockscreen/LockScreenState.qml b/shell/contents/lockscreen/LockScreenState.qml
+--- a/shell/contents/lockscreen/LockScreenState.qml	2026-11-27 08:09:31.878747388 +0100
++++ b/shell/contents/lockscreen/LockScreenState.qml	2026-11-27 08:13:25.830031192 +0100
+@@ -21,6 +21,12 @@
+     // whether the user submitted a response that is queued until a PAM prompt is ready
+     property bool responsePending: false
+ 
++    // whether kscreenlocker still refuses a new attempt after a failed one (PAM fail delay)
++    property bool failDelayActive: false
++
++    // fail delay announced for the failed attempt, in milliseconds
++    property int failDelayMs: 0
++
+     // the info message given
+     property string info: ""
+ 
+@@ -110,7 +116,7 @@
+     }
+ 
+     function retryAuthentication(): void {
+-        if (!canBeUnlocked && !promptReady && (!waitingForAuth || responsePending)) {
++        if (!failDelayActive && !canBeUnlocked && !promptReady && (!waitingForAuth || responsePending)) {
+             authenticator.startAuthenticating();
+         }
+     }
+@@ -119,11 +125,19 @@
+     property var authenticationRetryTimer: Timer {
+         interval: 1000
+         repeat: true
+-        running: !root.canBeUnlocked && !root.promptReady
++        running: !root.failDelayActive && !root.canBeUnlocked && !root.promptReady
+             && (!root.waitingForAuth || root.responsePending)
+         onTriggered: root.retryAuthentication()
+     }
+ 
++    // An attempt within the fail delay fails at once ("Authentication attempt too soon"); start the next one after it
++    property var failDelayTimer: Timer {
++        onTriggered: {
++            root.failDelayActive = false;
++            root.retryAuthentication();
++        }
++    }
++
+     property var fingerprintErrorTimer: Timer {
+         interval: 3000
+         onTriggered: root.fingerprintError = ""
+@@ -157,6 +171,12 @@
+             }
+         }
+ 
++        function onLoginFailedDelayStarted(kind: int, authenticator: var, uSecDelay: int): void {
++            if (kind == 0) {
++                root.failDelayMs = Math.ceil(uSecDelay / 1000);
++            }
++        }
++
+         function onFailed(kind: int): void {
+             if (kind != 0) { // if this is coming from the noninteractive authenticators
+                 return;
+@@ -169,8 +189,15 @@
+             root.pinLabel = root.wrongPinLabel;
+             root.unlockFailed();
+ 
+-            // Let the backend finish handling failure before starting the next
+-            Qt.callLater(root.retryAuthentication);
++            if (root.failDelayMs > 0) {
++                root.failDelayActive = true;
++                root.failDelayTimer.interval = root.failDelayMs;
++                root.failDelayMs = 0;
++                root.failDelayTimer.restart();
++            } else {
++                // Let the backend finish handling failure before starting the next
++                Qt.callLater(root.retryAuthentication);
++            }
+         }
+ 
+         function onInfoMessageChanged() {
