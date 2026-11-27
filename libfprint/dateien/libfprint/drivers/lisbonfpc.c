@@ -366,6 +366,13 @@ lisbonfpc_readable (gint fd, GIOCondition condition, gpointer user_data)
 }
 
 static void
+lisbonfpc_watch (FpiDeviceLisbonFpc *self)
+{
+  if (self->fd >= 0 && !self->watch)
+    self->watch = g_unix_fd_add (self->fd, G_IO_IN | G_IO_HUP | G_IO_ERR, lisbonfpc_readable, self);
+}
+
+static void
 lisbonfpc_request (FpDevice *device, const gchar *msg)
 {
   FpiDeviceLisbonFpc *self = FPI_DEVICE_LISBONFPC (device);
@@ -373,8 +380,8 @@ lisbonfpc_request (FpDevice *device, const gchar *msg)
 
   if (self->fd < 0)
     error = fpi_device_error_new (FP_DEVICE_ERROR_NOT_OPEN);
-  else
-    lisbonfpc_send (self->fd, msg, &error);
+  else if (lisbonfpc_send (self->fd, msg, &error))
+    lisbonfpc_watch (self);
   if (error)
     lisbonfpc_complete_error (device, error);
 }
@@ -415,7 +422,7 @@ lisbonfpc_open (FpDevice *device)
     {
       self->stages = stages;
       fpi_device_set_nr_enroll_stages (device, stages);
-      self->watch = g_unix_fd_add (self->fd, G_IO_IN | G_IO_HUP | G_IO_ERR, lisbonfpc_readable, self);
+      lisbonfpc_watch (self);
     }
   fpi_device_open_complete (device, error);
 }
@@ -510,10 +517,17 @@ lisbonfpc_cancel (FpDevice *device)
  * System sleep does not interrupt a running operation: the secure world keeps waiting for a finger and the kernel
  * driver of the sensor wakes the system on a touch while an identification runs. The operation continues after
  * resume, so a lock screen that waits for a finger can be woken and unlocked with one touch.
+ *
+ * The bridge runs on as soon as the kernel resumes, earlier than the resume of the device. Its answers stay in the
+ * socket until then: an operation that ended while the device still counts as suspended would leave it busy for
+ * the close that follows (the device stayed open after its client had gone).
  */
 static void
 lisbonfpc_suspend (FpDevice *device)
 {
+  FpiDeviceLisbonFpc *self = FPI_DEVICE_LISBONFPC (device);
+
+  g_clear_handle_id (&self->watch, g_source_remove);
   fpi_device_suspend_complete (device, NULL);
 }
 
@@ -521,6 +535,7 @@ static void
 lisbonfpc_resume (FpDevice *device)
 {
   fpi_device_resume_complete (device, NULL);
+  lisbonfpc_watch (FPI_DEVICE_LISBONFPC (device));
 }
 
 static void
