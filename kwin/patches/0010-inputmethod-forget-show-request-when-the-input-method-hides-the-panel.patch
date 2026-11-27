@@ -1,0 +1,185 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 17:44:32 +0100
+Subject: [PATCH] inputmethod: forget the request to show the panel when the input method hides it
+Description:
+ When the input method takes its keyboard panel away by itself while its
+ context is still current, e.g. the user closed the on-screen keyboard
+ with the key on it, KWin kept the request to show the panel. An input
+ method that maps a panel again on its own got it shown right away:
+ plasma-keyboard does so whenever the surrounding text changes, so the
+ keyboard came back as soon as the application changed the text of the
+ focused field.
+ .
+ Forget the request in that case and hide the panel; it is shown again
+ when text input asks for it. A panel hidden in response to a
+ deactivation, one of an earlier activation (the input method may close
+ it only after the next activation), and one that was never shown (an
+ input method replacing its surface while starting up) do not count.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-27
+---
+diff --git a/autotests/integration/inputmethod_test.cpp b/autotests/integration/inputmethod_test.cpp
+index 9c2218f..6980046 100644
+--- a/autotests/integration/inputmethod_test.cpp
++++ b/autotests/integration/inputmethod_test.cpp
+@@ -72,6 +72,7 @@ private Q_SLOTS:
+     void testDisableShowInputPanel();
+     void testPanelRequestsFromUnfocusedClient();
+     void testSwitchTextFieldV2();
++    void testPanelHiddenByInputMethod();
+     void testModifierForwarding();
+     void testFakeEventFallback();
+     void testOverlayPositioning_data();
+@@ -777,6 +778,65 @@ void InputMethodTest::testSwitchTextFieldV2()
+     QVERIFY(Test::waitForWindowClosed(window));
+ }
+ 
++void InputMethodTest::testPanelHiddenByInputMethod()
++{
++    // This test verifies that a panel the input method took away by itself is not shown again when
++    // the input method maps it again on its own, only when text input asks for it.
++    touchNow();
++    QVERIFY(!kwinApp()->inputMethod()->isActive());
++
++    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
++    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(1280, 1024), Qt::red);
++    QVERIFY(window);
++    QVERIFY(window->isActive());
++
++    std::unique_ptr<KWayland::Client::TextInput> textInput(Test::waylandTextInputManager()->createTextInput(Test::waylandSeat()));
++    QSignalSpy panelChangedSpy(kwinApp()->inputMethod(), &InputMethod::panelChanged);
++    textInput->showInputPanel();
++    textInput->enable(surface.get());
++    QVERIFY(panelChangedSpy.wait());
++    QTRY_VERIFY(kwinApp()->inputMethod()->isVisible());
++
++    // The input method unmaps its panel, the text input stays enabled.
++    auto panelSurface = Test::inputPanelSurface();
++    QVERIFY(panelSurface);
++    panelSurface->attachBuffer((wl_buffer *)nullptr);
++    panelSurface->commit();
++    QTRY_VERIFY(!kwinApp()->inputMethod()->isVisible());
++    QVERIFY(kwinApp()->inputMethod()->isActive());
++
++    // It maps the panel again by itself.
++    Test::render(panelSurface, QSize(1280, 400), Qt::blue);
++    QVERIFY(Test::waylandSync());
++    QTest::qWait(100);
++    QVERIFY(!kwinApp()->inputMethod()->isVisible());
++
++    // Text input asks for the panel.
++    textInput->showInputPanel();
++    QTRY_VERIFY(kwinApp()->inputMethod()->isVisible());
++
++    // A panel that goes away before it was ever shown does not count: the input method replaces
++    // its panel with one it destroys before mapping it, then maps another one.
++    InputPanelV1Window *shownPanel = kwinApp()->inputMethod()->panel();
++    auto unmappedSurface = Test::createSurface();
++    auto unmappedRole = Test::createInputPanelSurfaceV1(unmappedSurface.get(), Test::waylandOutputs().first(), Test::MockInputMethod::Mode::TopLevel);
++    QTRY_VERIFY(kwinApp()->inputMethod()->panel() && kwinApp()->inputMethod()->panel() != shownPanel);
++    QVERIFY(!kwinApp()->inputMethod()->isVisible());
++    unmappedRole.reset();
++    unmappedSurface.reset();
++    QVERIFY(Test::waylandSync());
++    auto nextSurface = Test::createSurface();
++    auto nextRole = Test::createInputPanelSurfaceV1(nextSurface.get(), Test::waylandOutputs().first(), Test::MockInputMethod::Mode::TopLevel);
++    Test::render(nextSurface.get(), QSize(1280, 400), Qt::blue);
++    QTRY_VERIFY(kwinApp()->inputMethod()->isVisible());
++
++    nextRole.reset();
++    nextSurface.reset();
++    shellSurface.reset();
++    QVERIFY(Test::waitForWindowClosed(window));
++}
++
+ void InputMethodTest::testModifierForwarding()
+ {
+     QVERIFY(Test::waitForWaylandKeyboard());
+diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
+index 4d47145..f516aa9 100644
+--- a/src/inputmethod.cpp
++++ b/src/inputmethod.cpp
+@@ -264,6 +264,7 @@ void InputMethod::setActive(bool active)
+     if (active) {
+         if (!wasActive) {
+             waylandServer()->inputMethod()->sendActivate();
++            ++m_activation;
+         }
+         adoptInputMethodContext();
+     } else {
+@@ -285,15 +286,20 @@ void InputMethod::setPanel(InputPanelV1Window *panel)
+     Q_ASSERT(panel->isInputMethod());
+     if (m_panel) {
+         qCDebug(KWIN_VIRTUALKEYBOARD) << "Replacing input panel" << m_panel << "with" << panel;
++        disconnect(m_panel, nullptr, this, nullptr);
++        disconnect(m_panel->surface(), nullptr, this, nullptr);
+         m_panel->destroyWindow();
+     }
+ 
+     m_panel = panel;
++    m_panelActivation = m_activation;
+     connect(m_panel, &Window::closed, this, [this]() {
++        handlePanelHiddenByInputMethod();
+         m_panel.clear();
+         updateInputPanelState();
+         Q_EMIT visibleChanged();
+     });
++    connect(m_panel->surface(), &SurfaceInterface::unmapped, this, &InputMethod::handlePanelHiddenByInputMethod);
+     connect(m_panel, &Window::frameGeometryChanged, this, &InputMethod::updateInputPanelState);
+     connect(m_panel, &Window::hiddenChanged, this, &InputMethod::updateInputPanelState);
+     connect(m_panel, &Window::hiddenChanged, this, &InputMethod::visibleChanged);
+@@ -307,6 +313,29 @@ void InputMethod::setPanel(InputPanelV1Window *panel)
+     }
+ }
+ 
++void InputMethod::handlePanelHiddenByInputMethod()
++{
++    // The input method took its keyboard away while its text input context is still current, for
++    // example the user closed it with a key on the keyboard. Forget the request to show it: an input
++    // method may map the panel again by itself (plasma-keyboard does when the surrounding text
++    // changes), it is shown again once text input asks for it.
++    if (!m_panel || m_panel->mode() != InputPanelV1Window::Mode::VirtualKeyboard) {
++        return;
++    }
++    if (!m_panel->readyForPainting()) {
++        // never shown, e.g. the input method replaced the surface while starting up
++        return;
++    }
++    if (!isActive() || m_panelActivation != m_activation) {
++        // hidden in response to a deactivation, or a panel of an earlier activation
++        return;
++    }
++    m_shouldShowPanel = false;
++    if (!m_panel->isDeleted()) {
++        m_panel->hide();
++    }
++}
++
+ void InputMethod::setTrackedWindow(Window *trackedWindow)
+ {
+     // Reset the old window virtual keyboard geom if necessary
+diff --git a/src/inputmethod.h b/src/inputmethod.h
+index fa6806b..5c9d165 100644
+--- a/src/inputmethod.h
++++ b/src/inputmethod.h
+@@ -131,6 +131,7 @@ private:
+     void startInputMethod();
+     void stopInputMethod();
+     void setTrackedWindow(Window *trackedWindow);
++    void handlePanelHiddenByInputMethod();
+     void installKeyboardGrab(InputMethodGrabV1 *keyboardGrab);
+     void updateModifiersMap(const QByteArray &modifiers);
+ 
+@@ -166,6 +167,9 @@ private:
+     bool m_hasPendingModifiers = false;
+     bool m_activeClientSupportsTextInput = false;
+     bool m_shouldShowPanel = false;
++    // counts activations of the input method; the panel remembers the activation it was created in
++    quint32 m_activation = 0;
++    quint32 m_panelActivation = 0;
+ };
+ 
+ }

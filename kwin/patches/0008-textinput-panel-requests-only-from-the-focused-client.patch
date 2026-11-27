@@ -1,0 +1,174 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 17:23:22 +0100
+Subject: [PATCH] wayland: text-input: show and hide the input panel only for the focused client
+Description:
+ show_input_panel and hide_input_panel were honoured from any client.
+ A client without text input focus, e.g. an application in the
+ background that moves focus to one of its text fields, could open the
+ on-screen keyboard over the active window or close it while the user
+ was typing there.
+ .
+ Ignore these requests unless the client owns the surface that has text
+ input focus, for text-input-v2 and text-input-v3.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL and GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-27
+---
+diff --git a/autotests/integration/inputmethod_test.cpp b/autotests/integration/inputmethod_test.cpp
+index e9876ba..25cfbda 100644
+--- a/autotests/integration/inputmethod_test.cpp
++++ b/autotests/integration/inputmethod_test.cpp
+@@ -70,6 +70,7 @@ private Q_SLOTS:
+     void testV2V3SameClient();
+     void testV3Styling();
+     void testDisableShowInputPanel();
++    void testPanelRequestsFromUnfocusedClient();
+     void testModifierForwarding();
+     void testFakeEventFallback();
+     void testOverlayPositioning_data();
+@@ -683,6 +684,55 @@ void InputMethodTest::testDisableShowInputPanel()
+     QVERIFY(Test::waitForWindowClosed(window));
+ }
+ 
++void InputMethodTest::testPanelRequestsFromUnfocusedClient()
++{
++    // This test verifies that only the client with text input focus can show or hide the input panel.
++    touchNow();
++    QVERIFY(!kwinApp()->inputMethod()->isActive());
++
++    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
++    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(1280, 1024), Qt::red);
++    QVERIFY(window);
++    QVERIFY(window->isActive());
++
++    std::unique_ptr<KWayland::Client::TextInput> textInput(Test::waylandTextInputManager()->createTextInput(Test::waylandSeat()));
++    QSignalSpy panelChangedSpy(kwinApp()->inputMethod(), &InputMethod::panelChanged);
++    textInput->enable(surface.get());
++    QVERIFY(panelChangedSpy.wait());
++    QVERIFY(kwinApp()->inputMethod()->isActive());
++    QVERIFY(!kwinApp()->inputMethod()->isVisible());
++
++    // A second client without focus asks to show the panel.
++    std::unique_ptr<Test::Connection> other = Test::Connection::setup(Test::AdditionalWaylandInterface::Seat | Test::AdditionalWaylandInterface::TextInputManagerV2);
++    QVERIFY(other);
++    std::unique_ptr<KWayland::Client::TextInput> otherTextInput(other->textInputManager->createTextInput(other->seat));
++    QVERIFY(otherTextInput);
++    QSignalSpy showSpy(waylandServer()->seat()->textInputV2(), &TextInputV2Interface::requestShowInputPanel);
++    QSignalSpy hideSpy(waylandServer()->seat()->textInputV2(), &TextInputV2Interface::requestHideInputPanel);
++    otherTextInput->showInputPanel();
++    QVERIFY(other->sync());
++    QCOMPARE(showSpy.count(), 0);
++    QVERIFY(!kwinApp()->inputMethod()->isVisible());
++
++    // The focused client can show it.
++    textInput->showInputPanel();
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(showSpy.count(), 1);
++    QTRY_VERIFY(kwinApp()->inputMethod()->isVisible());
++
++    // The other client cannot hide it.
++    otherTextInput->hideInputPanel();
++    QVERIFY(other->sync());
++    QCOMPARE(hideSpy.count(), 0);
++    QVERIFY(kwinApp()->inputMethod()->isVisible());
++
++    otherTextInput.reset();
++    other.reset();
++    shellSurface.reset();
++    QVERIFY(Test::waitForWindowClosed(window));
++}
++
+ void InputMethodTest::testModifierForwarding()
+ {
+     QVERIFY(Test::waitForWaylandKeyboard());
+diff --git a/src/wayland/textinput_v2.cpp b/src/wayland/textinput_v2.cpp
+index e413955..61c610f 100644
+--- a/src/wayland/textinput_v2.cpp
++++ b/src/wayland/textinput_v2.cpp
+@@ -367,6 +367,9 @@ void TextInputV2InterfacePrivate::zwp_text_input_v2_update_state(Resource *resou
+ 
+ void TextInputV2InterfacePrivate::zwp_text_input_v2_hide_input_panel(Resource *resource)
+ {
++    if (!hasTextInputFocus(resource)) {
++        return;
++    }
+     Q_EMIT q->requestHideInputPanel();
+ }
+ 
+@@ -411,9 +414,19 @@ void TextInputV2InterfacePrivate::zwp_text_input_v2_set_preferred_language(Resou
+ 
+ void TextInputV2InterfacePrivate::zwp_text_input_v2_show_input_panel(Resource *resource)
+ {
++    if (!hasTextInputFocus(resource)) {
++        return;
++    }
+     Q_EMIT q->requestShowInputPanel();
+ }
+ 
++bool TextInputV2InterfacePrivate::hasTextInputFocus(Resource *resource) const
++{
++    // The input panel serves the surface with text input focus. Requests of other clients
++    // would show or hide it over a window that did not ask for it.
++    return focusedSurface && focusedSurface->client()->client() == resource->client();
++}
++
+ QList<TextInputV2InterfacePrivate::Resource *> TextInputV2InterfacePrivate::textInputsForClient(ClientConnection *client) const
+ {
+     return resourceMap().values(client->client());
+diff --git a/src/wayland/textinput_v2_p.h b/src/wayland/textinput_v2_p.h
+index c6b580a..2c2496b 100644
+--- a/src/wayland/textinput_v2_p.h
++++ b/src/wayland/textinput_v2_p.h
+@@ -50,6 +50,7 @@ public:
+     void sendModifiersMap();
+ 
+     QList<Resource *> textInputsForClient(ClientConnection *client) const;
++    bool hasTextInputFocus(Resource *resource) const;
+     static TextInputV2InterfacePrivate *get(TextInputV2Interface *inputInterface)
+     {
+         return inputInterface->d.get();
+diff --git a/src/wayland/textinput_v3.cpp b/src/wayland/textinput_v3.cpp
+index 69892d7..c3092da 100644
+--- a/src/wayland/textinput_v3.cpp
++++ b/src/wayland/textinput_v3.cpp
+@@ -707,13 +707,26 @@ void TextInputV3InterfacePrivate::zwp_text_input_v3_set_available_actions(Resour
+ 
+ void TextInputV3InterfacePrivate::zwp_text_input_v3_show_input_panel(Resource *resource)
+ {
++    if (!hasTextInputFocus(resource)) {
++        return;
++    }
+     Q_EMIT q->requestShowInputPanel();
+ }
+ 
+ void TextInputV3InterfacePrivate::zwp_text_input_v3_hide_input_panel(Resource *resource)
+ {
++    if (!hasTextInputFocus(resource)) {
++        return;
++    }
+     Q_EMIT q->requestHideInputPanel();
+ }
++
++bool TextInputV3InterfacePrivate::hasTextInputFocus(Resource *resource) const
++{
++    // The input panel serves the surface with text input focus. Requests of other clients
++    // would show or hide it over a window that did not ask for it.
++    return surface && surface->client()->client() == resource->client();
++}
+ }
+ 
+ #include "moc_textinput_v3.cpp"
+diff --git a/src/wayland/textinput_v3_p.h b/src/wayland/textinput_v3_p.h
+index 130fe25..2c323bb 100644
+--- a/src/wayland/textinput_v3_p.h
++++ b/src/wayland/textinput_v3_p.h
+@@ -92,6 +92,7 @@ public:
+ 
+     QList<TextInputV3InterfacePrivate::Resource *> textInputsForClient(ClientConnection *client) const;
+     QList<TextInputV3InterfacePrivate::Resource *> enabledTextInputsForClient(ClientConnection *client) const;
++    bool hasTextInputFocus(Resource *resource) const;
+ 
+     TextInputV3State *stateForResource(Resource *resource)
+     {

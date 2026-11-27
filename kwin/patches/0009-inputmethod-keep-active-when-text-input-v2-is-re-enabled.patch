@@ -1,0 +1,111 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 17:23:50 +0100
+Subject: [PATCH] inputmethod: keep the input method active when text-input-v2 is re-enabled
+Description:
+ text-input-v2 has no commit request. A client that moves focus from one
+ text field to another (Qt does so since it enables text input per focus
+ object) sends show_input_panel for the new field and then disables and
+ enables text input in one batch. Each request was handled on its own:
+ the disable deactivated the input method and hid the panel, the
+ following enable activated a new context without a request to show the
+ panel, so the on-screen keyboard went away while the user moved into the
+ next field.
+ .
+ Look at a disable only after the batch, and send the panel state to the
+ client again when text input is enabled, since a preceding disable
+ request reported it as hidden. Enabling still activates the input method
+ right away.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-27
+---
+diff --git a/autotests/integration/inputmethod_test.cpp b/autotests/integration/inputmethod_test.cpp
+index 25cfbda..9c2218f 100644
+--- a/autotests/integration/inputmethod_test.cpp
++++ b/autotests/integration/inputmethod_test.cpp
+@@ -71,6 +71,7 @@ private Q_SLOTS:
+     void testV3Styling();
+     void testDisableShowInputPanel();
+     void testPanelRequestsFromUnfocusedClient();
++    void testSwitchTextFieldV2();
+     void testModifierForwarding();
+     void testFakeEventFallback();
+     void testOverlayPositioning_data();
+@@ -733,6 +734,49 @@ void InputMethodTest::testPanelRequestsFromUnfocusedClient()
+     QVERIFY(Test::waitForWindowClosed(window));
+ }
+ 
++void InputMethodTest::testSwitchTextFieldV2()
++{
++    // This test verifies that the panel stays when a text-input-v2 client moves focus from one text
++    // field to another: it asks for the panel, then disables and enables text input in one batch.
++    touchNow();
++    QVERIFY(!kwinApp()->inputMethod()->isActive());
++
++    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
++    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(1280, 1024), Qt::red);
++    QVERIFY(window);
++    QVERIFY(window->isActive());
++
++    std::unique_ptr<KWayland::Client::TextInput> textInput(Test::waylandTextInputManager()->createTextInput(Test::waylandSeat()));
++    QSignalSpy panelChangedSpy(kwinApp()->inputMethod(), &InputMethod::panelChanged);
++    textInput->showInputPanel();
++    textInput->enable(surface.get());
++    QVERIFY(panelChangedSpy.wait());
++    QTRY_VERIFY(kwinApp()->inputMethod()->isVisible());
++
++    QSignalSpy activeSpy(kwinApp()->inputMethod(), &InputMethod::activeChanged);
++    QSignalSpy activateSpy(Test::inputMethod(), &Test::MockInputMethod::activate);
++    textInput->showInputPanel();
++    textInput->disable(surface.get());
++    textInput->enable(surface.get());
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(activeSpy.count(), 0);
++    QCOMPARE(activateSpy.count(), 0);
++    QVERIFY(kwinApp()->inputMethod()->isActive());
++    QVERIFY(kwinApp()->inputMethod()->isVisible());
++    // the disable request reported the panel as hidden, the client learns that it is still shown
++    QTRY_VERIFY(textInput->isInputPanelVisible());
++
++    // Focus moves to an item without text input.
++    textInput->disable(surface.get());
++    QVERIFY(activeSpy.wait());
++    QVERIFY(!kwinApp()->inputMethod()->isActive());
++    QVERIFY(!kwinApp()->inputMethod()->isVisible());
++
++    shellSurface.reset();
++    QVERIFY(Test::waitForWindowClosed(window));
++}
++
+ void InputMethodTest::testModifierForwarding()
+ {
+     QVERIFY(Test::waitForWaylandKeyboard());
+diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
+index 4412dee..4d47145 100644
+--- a/src/inputmethod.cpp
++++ b/src/inputmethod.cpp
+@@ -418,7 +418,21 @@ void InputMethod::textInputInterfaceV2StateUpdated(quint32 serial, TextInputV2In
+ 
+ void InputMethod::textInputInterfaceV2EnabledChanged()
+ {
+-    refreshActive();
++    if (waylandServer()->seat()->textInputV2()->isEnabled()) {
++        refreshActive();
++        // a preceding disable request reported the panel as hidden to the client
++        updateInputPanelState();
++        return;
++    }
++    // text-input-v2 has no commit: a client moving focus from one text field to another disables and
++    // enables text input in one batch of requests. Look at a disable after the batch, otherwise the
++    // input method would be deactivated and the panel hidden in between.
++    QMetaObject::invokeMethod(
++        this, [this]() {
++            refreshActive();
++            updateInputPanelState();
++        },
++        Qt::QueuedConnection);
+ }
+ 
+ void InputMethod::textInputInterfaceV3EnabledChanged()

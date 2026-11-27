@@ -1,0 +1,108 @@
+From: Aleix Pol i Gonzalez <aleixpol@kde.org>
+Date: Tue, 13 Oct 2026 23:40:34 +0200
+Subject: [PATCH] inputmethod: Do not try to show the input method without context
+Description:
+ It does confusing things and none are good.
+ .
+ Fixes https://invent.kde.org/plasma/plasma-keyboard/-/work_items/93
+ .
+ BUG: 524506
+Origin: upstream, https://invent.kde.org/plasma/kwin/-/commit/2ba43b48090d291ed3ed773e8bddaf06aab974ba
+Applied-Upstream: Plasma/6.8 (cherry-pick 63b938086d68a2c5c395b22866839cbd3942adaf)
+Bug: https://bugs.kde.org/show_bug.cgi?id=524506
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-27
+---
+diff --git a/autotests/integration/inputmethod_test.cpp b/autotests/integration/inputmethod_test.cpp
+index 4135ad0..e9876ba 100644
+--- a/autotests/integration/inputmethod_test.cpp
++++ b/autotests/integration/inputmethod_test.cpp
+@@ -62,6 +62,7 @@ private Q_SLOTS:
+     void testOpenClose();
+     void testEnableDisableV3();
+     void testEnableActive();
++    void testShowPanelWithoutInputContext();
+     void testHidePanel();
+     void testUnmapPanel();
+     void testReactivateFocus();
+@@ -274,6 +275,45 @@ void InputMethodTest::testEnableActive()
+     QVERIFY(Test::waitForWindowClosed(window));
+ }
+ 
++/*!
++ * Verifies that we don't show the OSK if there is no context.
++ */
++void InputMethodTest::testShowPanelWithoutInputContext()
++{
++    auto *inputMethod = kwinApp()->inputMethod();
++    inputMethod->hide();
++    QVERIFY(!inputMethod->isActive());
++    QSignalSpy activateSpy(Test::inputMethod(), &Test::MockInputMethod::activate);
++
++    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
++    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(1280, 1024), Qt::red);
++    QVERIFY(window);
++    QVERIFY(window->isActive());
++
++    auto panelSurface = Test::createSurface();
++    auto panelRole = Test::createInputPanelSurfaceV1(panelSurface.get(), Test::waylandOutputs().first(), Test::MockInputMethod::Mode::TopLevel);
++    QVERIFY(panelRole);
++    Test::render(panelSurface.get(), QSize(1280, 400), Qt::blue);
++    QTRY_VERIFY(inputMethod->panel());
++    QTRY_VERIFY(inputMethod->panel()->surface()->isMapped());
++    QVERIFY(!inputMethod->isVisible());
++    QVERIFY(!inputMethod->isActive());
++
++    std::unique_ptr<KWayland::Client::TextInput> textInput(Test::waylandTextInputManager()->createTextInput(Test::waylandSeat()));
++    QVERIFY(textInput);
++    touchNow();
++    // Ask to show the panel when there is no context created
++    textInput->showInputPanel();
++    QVERIFY(Test::waylandSync());
++    QCOMPARE(activateSpy.count(), 0);
++    QVERIFY(!inputMethod->isActive());
++    QVERIFY(!inputMethod->isVisible());
++
++    shellSurface.reset();
++    QVERIFY(Test::waitForWindowClosed(window));
++}
++
+ void InputMethodTest::testHidePanel()
+ {
+     QVERIFY(!kwinApp()->inputMethod()->isActive());
+diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
+index a4e0fc4..4412dee 100644
+--- a/src/inputmethod.cpp
++++ b/src/inputmethod.cpp
+@@ -138,6 +138,14 @@ void InputMethod::show()
+ {
+     m_shouldShowPanel = true;
+ 
++    if (!isActive()) {
++        refreshActive();
++        if (!isActive()) {
++            qCWarning(KWIN_VIRTUALKEYBOARD) << "Input method is trying to show itself but without a context. Aborting.";
++            return;
++        }
++    }
++
+     // If the panel has something to display, show it (e.g. if we hid it from kwin rather than the IM hiding itself)
+     // Otherwise, ensure the input context is current and the IM will see to having itself shown if there's something to show.
+     // If there's no context available, then nothing will be shown
+@@ -147,14 +155,7 @@ void InputMethod::show()
+     } else {
+         // making the input context current will trigger the IM
+         // to show the panel (if there is something to show)
+-        if (!isActive()) {
+-            refreshActive();
+-        }
+-
+-        // refreshActive affects the result of isActive
+-        if (isActive()) {
+-            adoptInputMethodContext();
+-        }
++        adoptInputMethodContext();
+     }
+ }
+ 
