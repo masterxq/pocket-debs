@@ -1,0 +1,143 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 18:49:33 +0100
+Subject: [PATCH] inputmethod: show a panel requested before the input method was activated
+Description:
+ Since "Do not try to show the input method without context", show()
+ without a context only remembers the request. Qt asks for the panel
+ before it enables text input, so a tap into a text field always takes
+ this path. An input method that maps its panel again on activation gets
+ it shown through setPanel(), but one that keeps the panel mapped while
+ inactive never got it shown: plasma-keyboard does so after its start,
+ and the first tap into a text field after it started showed no
+ keyboard.
+ .
+ When the input method becomes active with a pending request and a mapped
+ panel, show the panel.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-27
+---
+diff --git a/autotests/integration/inputmethod_test.cpp b/autotests/integration/inputmethod_test.cpp
+index 6980046..95433e2 100644
+--- a/autotests/integration/inputmethod_test.cpp
++++ b/autotests/integration/inputmethod_test.cpp
+@@ -73,6 +73,7 @@ private Q_SLOTS:
+     void testPanelRequestsFromUnfocusedClient();
+     void testSwitchTextFieldV2();
+     void testPanelHiddenByInputMethod();
++    void testShowBeforeEnableWithMappedPanel();
+     void testModifierForwarding();
+     void testFakeEventFallback();
+     void testOverlayPositioning_data();
+@@ -837,6 +838,47 @@ void InputMethodTest::testPanelHiddenByInputMethod()
+     QVERIFY(Test::waitForWindowClosed(window));
+ }
+ 
++void InputMethodTest::testShowBeforeEnableWithMappedPanel()
++{
++    // This test verifies that a panel request that comes before text input is enabled (the order of
++    // Qt) shows a panel the input method keeps mapped while it is inactive, as plasma-keyboard does
++    // after its start.
++    touchNow();
++    QVERIFY(!kwinApp()->inputMethod()->isActive());
++    Test::inputMethod()->setKeepPanelOnDeactivate(true);
++
++    std::unique_ptr<KWayland::Client::Surface> surface(Test::createSurface());
++    std::unique_ptr<Test::XdgToplevel> shellSurface(Test::createXdgToplevelSurface(surface.get()));
++    Window *window = Test::renderAndWaitForShown(surface.get(), QSize(1280, 1024), Qt::red);
++    QVERIFY(window);
++    QVERIFY(window->isActive());
++
++    // The input method maps its panel once and keeps it mapped when deactivated.
++    std::unique_ptr<KWayland::Client::TextInput> textInput(Test::waylandTextInputManager()->createTextInput(Test::waylandSeat()));
++    QSignalSpy activeSpy(kwinApp()->inputMethod(), &InputMethod::activeChanged);
++    QSignalSpy panelChangedSpy(kwinApp()->inputMethod(), &InputMethod::panelChanged);
++    textInput->enable(surface.get());
++    QVERIFY(panelChangedSpy.wait());
++    QTRY_VERIFY(kwinApp()->inputMethod()->panel() && kwinApp()->inputMethod()->panel()->surface()->isMapped());
++    textInput->disable(surface.get());
++    QVERIFY(activeSpy.wait());
++    QVERIFY(!kwinApp()->inputMethod()->isActive());
++    QVERIFY(Test::waylandSync());
++    QVERIFY(kwinApp()->inputMethod()->panel());
++    QVERIFY(kwinApp()->inputMethod()->panel()->surface()->isMapped());
++    QVERIFY(!kwinApp()->inputMethod()->isVisible());
++
++    // Tap into a text field: the panel request comes before text input is enabled.
++    textInput->showInputPanel();
++    textInput->enable(surface.get());
++    QVERIFY(activeSpy.wait());
++    QTRY_VERIFY(kwinApp()->inputMethod()->isVisible());
++
++    Test::inputMethod()->setKeepPanelOnDeactivate(false);
++    shellSurface.reset();
++    QVERIFY(Test::waitForWindowClosed(window));
++}
++
+ void InputMethodTest::testModifierForwarding()
+ {
+     QVERIFY(Test::waitForWaylandKeyboard());
+diff --git a/autotests/integration/kwin_wayland_test.h b/autotests/integration/kwin_wayland_test.h
+index c6a59a1..5424965 100644
+--- a/autotests/integration/kwin_wayland_test.h
++++ b/autotests/integration/kwin_wayland_test.h
+@@ -541,6 +541,8 @@ public:
+     }
+ 
+     void setMode(Mode mode);
++    // keep the panel surface mapped when deactivated, as plasma-keyboard does after its start
++    void setKeepPanelOnDeactivate(bool keep);
+ 
+ Q_SIGNALS:
+     void activate();
+@@ -554,6 +556,7 @@ private:
+     std::unique_ptr<QtWayland::zwp_input_panel_surface_v1> m_inputMethodSurface;
+     struct ::zwp_input_method_context_v1 *m_context = nullptr;
+     Mode m_mode = Mode::TopLevel;
++    bool m_keepPanelOnDeactivate = false;
+ };
+ 
+ class FractionalScaleManagerV1 : public QObject, public QtWayland::wp_fractional_scale_manager_v1
+diff --git a/autotests/integration/test_helpers.cpp b/autotests/integration/test_helpers.cpp
+index 92c9da0..e45db04 100644
+--- a/autotests/integration/test_helpers.cpp
++++ b/autotests/integration/test_helpers.cpp
+@@ -392,13 +392,18 @@ void MockInputMethod::setMode(MockInputMethod::Mode mode)
+     m_mode = mode;
+ }
+ 
++void MockInputMethod::setKeepPanelOnDeactivate(bool keep)
++{
++    m_keepPanelOnDeactivate = keep;
++}
++
+ void MockInputMethod::zwp_input_method_v1_deactivate(struct ::zwp_input_method_context_v1 *context)
+ {
+     QCOMPARE(context, m_context);
+     zwp_input_method_context_v1_destroy(context);
+     m_context = nullptr;
+ 
+-    if (m_inputSurface) {
++    if (m_inputSurface && !m_keepPanelOnDeactivate) {
+         m_inputSurface->release();
+         m_inputSurface->destroy();
+         m_inputSurface.reset();
+diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
+index f516aa9..c7419d1 100644
+--- a/src/inputmethod.cpp
++++ b/src/inputmethod.cpp
+@@ -267,6 +267,13 @@ void InputMethod::setActive(bool active)
+             ++m_activation;
+         }
+         adoptInputMethodContext();
++        if (!wasActive && m_shouldShowPanel && m_panel && !m_panel->wasUnmapped()) {
++            // The panel was asked for before there was a context (clients may ask for it before
++            // they enable text input). An input method that keeps its panel mapped does not map it
++            // again for the new context, so show it now.
++            m_panel->show();
++            updateInputPanelState();
++        }
+     } else {
+         updateInputPanelState();
+     }
