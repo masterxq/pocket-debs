@@ -1,6 +1,6 @@
 From: pocket-debs <masterxq@users.noreply.github.com>
-Date: Sat, 28 Nov 2026 18:26:56 +0100
-Subject: [PATCH] plugins: sliding effects: do not animate windows that are not painted
+Date: Sat, 28 Nov 2026 19:00:00 +0100
+Subject: [PATCH] plugins: sliding effects: do not keep closed windows that are not painted
 Description:
  The slidingnotifications and slidingpopups effects advance their
  animations in prePaintWindow(), which is only called for windows that
@@ -20,17 +20,17 @@ Description:
  plasmashell on Plasma Mobile hung this way after four notifications on
  the lock screen.
  .
- Skip the open, close and move animations of windows that are not
- visible and drop a running animation when such a window is closed.
- slidingnotifications also stops its animations when the screen locking
- state changes, as slidingpopups already does.
+ Do not start a close animation for a window that is not visible and
+ drop the animation it may still have. slidingnotifications also stops
+ its animations when the screen locking state changes, as slidingpopups
+ already does.
 Author: masterxq <masterxq@users.noreply.github.com>
 Forwarded: no
 License: GPL-2.0-or-later (as the patched files)
 Last-Update: 2026-11-28
 ---
 diff --git a/src/plugins/slidingnotifications/slidingnotifications.cpp b/src/plugins/slidingnotifications/slidingnotifications.cpp
-index fc5cfdca..96f7afa3 100644
+index fc5cfdca..2e948889 100644
 --- a/src/plugins/slidingnotifications/slidingnotifications.cpp
 +++ b/src/plugins/slidingnotifications/slidingnotifications.cpp
 @@ -381,6 +381,9 @@ SlidingNotificationsEffect::SlidingNotificationsEffect()
@@ -43,15 +43,6 @@ index fc5cfdca..96f7afa3 100644
  }
  
  bool SlidingNotificationsEffect::isActive() const
-@@ -459,7 +462,7 @@ void SlidingNotificationsEffect::onWindowAdded(EffectWindow *window)
- 
-     connect(window, &EffectWindow::windowFrameGeometryChanged, this, &SlidingNotificationsEffect::onWindowFrameGeometryChanged);
- 
--    if (effects->hasActiveFullScreenEffect()) {
-+    if (effects->hasActiveFullScreenEffect() || !window->windowItem()->isVisible()) {
-         return;
-     }
- 
 @@ -484,6 +487,13 @@ void SlidingNotificationsEffect::onWindowClosed(EffectWindow *window)
          return;
      }
@@ -66,28 +57,10 @@ index fc5cfdca..96f7afa3 100644
      window->setData(WindowClosedGrabRole, QVariant::fromValue(static_cast<void *>(this)));
  
      auto &animation = m_animations[window];
-@@ -503,7 +513,7 @@ void SlidingNotificationsEffect::onWindowClosed(EffectWindow *window)
- 
- void SlidingNotificationsEffect::onWindowFrameGeometryChanged(EffectWindow *window, const RectF &oldGeometry)
- {
--    if (effects->hasActiveFullScreenEffect()) {
-+    if (effects->hasActiveFullScreenEffect() || !window->windowItem()->isVisible()) {
-         return;
-     }
- 
 diff --git a/src/plugins/slidingpopups/slidingpopups.cpp b/src/plugins/slidingpopups/slidingpopups.cpp
-index fc931f24..8932e969 100644
+index fc931f24..e8e36d2a 100644
 --- a/src/plugins/slidingpopups/slidingpopups.cpp
 +++ b/src/plugins/slidingpopups/slidingpopups.cpp
-@@ -434,7 +434,7 @@ void SlidingPopupsEffect::slideIn(EffectWindow *w)
-         return;
-     }
- 
--    if (!w->isOnCurrentDesktop() || !w->isOnCurrentActivity()) {
-+    if (!w->isOnCurrentDesktop() || !w->isOnCurrentActivity() || !w->windowItem()->isVisible()) {
-         return;
-     }
- 
 @@ -474,6 +474,13 @@ void SlidingPopupsEffect::slideOut(EffectWindow *w)
          return;
      }
