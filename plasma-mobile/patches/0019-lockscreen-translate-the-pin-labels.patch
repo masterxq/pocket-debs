@@ -1,0 +1,30 @@
+From: masterxq <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 11:00:00 +0100
+Subject: [PATCH] lockscreen: translate the PIN labels in the greeter
+Description:
+ The lock screen is loaded by the greeter of kscreenlocker, whose QML
+ context translates i18n() calls in its own domain kscreenlocker_greet.
+ The labels of the keypad ("Enter PIN", "Wrong PIN") are translated
+ in the domain of this shell package and stayed untranslated. Name the
+ domain, as the lock screen of the desktop shell does.
+Author: masterxq
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/shell/contents/lockscreen/LockScreenState.qml b/shell/contents/lockscreen/LockScreenState.qml
+index 88d6f945a..f5fa84435 100644
+--- a/shell/contents/lockscreen/LockScreenState.qml
++++ b/shell/contents/lockscreen/LockScreenState.qml
+@@ -82,8 +82,9 @@ QtObject {
+     property bool isKeyboardMode: false
+ 
+     property string pinLabel: enterPinLabel
+-    readonly property string enterPinLabel: i18n("Enter PIN")
+-    readonly property string wrongPinLabel: i18n("Wrong PIN")
++    // the lock screen runs in the greeter of kscreenlocker, whose default translation domain is its own
++    readonly property string enterPinLabel: i18nd("plasma_shell_org.kde.plasma.phone", "Enter PIN")
++    readonly property string wrongPinLabel: i18nd("plasma_shell_org.kde.plasma.phone", "Wrong PIN")
+ 
+     signal reset()
+     signal unlockSucceeded()
