@@ -8,8 +8,9 @@ Description:
  .
  The lists of the privacy section were empty: the model of their entries
  had become part of the expression of notificationsAvailable.
- They showed no value either: the binding of the current index was
- evaluated before the entries were there and depends on their count now.
+ They and the lists of an application showed no value either: the
+ binding of the current index was evaluated before the entries were there
+ and depends on their count now.
 Author: masterxq <masterxq@users.noreply.github.com>
 Forwarded: no
 License: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL (as the patched files)
@@ -42,9 +43,18 @@ index 41c63aee90..7ffa3b9aa3 100644
  
  QUrl KCMNotifications::soundsLocation()
 diff --git a/kcms/notifications/ui/ApplicationConfiguration.qml b/kcms/notifications/ui/ApplicationConfiguration.qml
-index 440e40dacf..54d64b6402 100644
+index 440e40dacf..dbb8f675c1 100644
 --- a/kcms/notifications/ui/ApplicationConfiguration.qml
 +++ b/kcms/notifications/ui/ApplicationConfiguration.qml
+@@ -140,7 +140,7 @@ ColumnLayout {
+                             { value: 3, text: i18nc("@item:inlistbox lock screen", "At most the application") },
+                             { value: 4, text: i18nc("@item:inlistbox lock screen", "Not on the lock screen") },
+                         ]
+-                        currentIndex: !!behaviorSettings ? indexOfValue(behaviorSettings.lockScreenVisibility) : 0
++                        currentIndex: !!behaviorSettings && count > 0 ? indexOfValue(behaviorSettings.lockScreenVisibility) : 0
+                         onActivated: behaviorSettings.lockScreenVisibility = currentValue
+ 
+                         KCM.SettingStateBinding {
 @@ -149,6 +149,26 @@ ColumnLayout {
                          }
                      }
@@ -60,7 +70,7 @@ index 440e40dacf..54d64b6402 100644
 +                            { value: 3, text: i18nc("@item:inlistbox feedback of new notifications", "Only light (muted)") },
 +                            { value: 4, text: i18nc("@item:inlistbox feedback of new notifications", "None") },
 +                        ]
-+                        currentIndex: !!behaviorSettings ? indexOfValue(behaviorSettings.feedback) : 0
++                        currentIndex: !!behaviorSettings && count > 0 ? indexOfValue(behaviorSettings.feedback) : 0
 +                        onActivated: behaviorSettings.feedback = currentValue
 +
 +                        KCM.SettingStateBinding {
