@@ -1,0 +1,97 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 09:41:37 +0100
+Subject: [PATCH] layershellqt: commit state changes of a shown layer surface
+Description:
+ Layer, anchors, exclusive zone and edge, margins, size and keyboard
+ interactivity of a layer surface are double-buffered and only take
+ effect with the next wl_surface.commit. Changes made after the surface
+ was created were sent without a commit, so they waited for the window
+ to repaint for some other reason. A window that only switched its
+ keyboard interactivity from none to on-demand (to get keyboard focus
+ for a text field) was not given keyboard focus until something in it
+ was redrawn.
+ .
+ Request an update of the window after each such change, so the next
+ frame commits the new state.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/src/qwaylandlayersurface.cpp b/src/qwaylandlayersurface.cpp
+index 1d12b05..952af94 100644
+--- a/src/qwaylandlayersurface.cpp
++++ b/src/qwaylandlayersurface.cpp
+@@ -45,6 +45,7 @@ QWaylandLayerSurface::QWaylandLayerSurface(QWaylandLayerShellIntegration *shell,
+     init(shell->get_layer_surface(window->waylandSurface()->object(), output, m_interface->layer(), m_interface->scope()));
+     connect(m_interface, &Window::layerChanged, this, [this]() {
+         setLayer(m_interface->layer());
++        requestCommit();
+     });
+ 
+     setAnchor(m_interface->anchors());
+@@ -55,31 +56,37 @@ QWaylandLayerSurface::QWaylandLayerSurface(QWaylandLayerShellIntegration *shell,
+         } else {
+             setDesiredSize(m_interface->desiredSize());
+         }
++        requestCommit();
+     });
+ 
+     setExclusiveZone(m_interface->exclusionZone());
+     connect(m_interface, &Window::exclusionZoneChanged, this, [this]() {
+         setExclusiveZone(m_interface->exclusionZone());
++        requestCommit();
+     });
+     setExclusiveEdge(m_interface->exclusiveEdge());
+     connect(m_interface, &Window::exclusiveEdgeChanged, this, [this]() {
+         setExclusiveEdge(m_interface->exclusiveEdge());
++        requestCommit();
+     });
+ 
+     setMargins(m_interface->margins());
+     connect(m_interface, &Window::marginsChanged, this, [this]() {
+         setMargins(m_interface->margins());
++        requestCommit();
+     });
+ 
+     connect(m_interface, &Window::desiredSizeChanged, this, [this]() {
+         if (!m_interface->desiredSize().isNull()) {
+             setDesiredSize(m_interface->desiredSize());
++            requestCommit();
+         }
+     });
+ 
+     setKeyboardInteractivity(m_interface->keyboardInteractivity());
+     connect(m_interface, &Window::keyboardInteractivityChanged, this, [this]() {
+         setKeyboardInteractivity(m_interface->keyboardInteractivity());
++        requestCommit();
+     });
+ 
+     if (m_interface->desiredSize().isNull()) {
+@@ -165,6 +172,14 @@ void QWaylandLayerSurface::setExclusiveEdge(uint32_t edge)
+     }
+ }
+ 
++// The state of a layer surface is double-buffered and applied with the next wl_surface.commit. A change
++// that does not repaint the window (e.g. keyboard interactivity) would otherwise wait for an unrelated
++// repaint, so ask for a new frame.
++void QWaylandLayerSurface::requestCommit()
++{
++    window()->window()->requestUpdate();
++}
++
+ void QWaylandLayerSurface::setMargins(const QMargins &margins)
+ {
+     set_margin(margins.top(), margins.right(), margins.bottom(), margins.left());
+diff --git a/src/qwaylandlayersurface_p.h b/src/qwaylandlayersurface_p.h
+index a48e522..dd6753b 100644
+--- a/src/qwaylandlayersurface_p.h
++++ b/src/qwaylandlayersurface_p.h
+@@ -52,6 +52,7 @@ public:
+ 
+ private:
+     void sendExpose();
++    void requestCommit();
+     void zwlr_layer_surface_v1_configure(uint32_t serial, uint32_t width, uint32_t height) override;
+     void zwlr_layer_surface_v1_closed() override;
+ 

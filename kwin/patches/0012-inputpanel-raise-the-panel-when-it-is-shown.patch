@@ -1,0 +1,32 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 09:25:21 +0100
+Subject: [PATCH] inputpanel: raise the panel when it is shown
+Description:
+ The input panel is in the overlay layer, together with layer-shell
+ surfaces of the overlay layer. A newly mapped panel is restacked below
+ the active window and a panel shown again keeps its position in the
+ stacking order. When the focused text input belongs to an overlay
+ surface, for example a shell drawer that covers the screen, the panel
+ stayed below that surface: it was not visible and touches meant for
+ the panel went to that surface.
+ .
+ Raise the panel whenever it is shown.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/src/inputpanelv1window.cpp b/src/inputpanelv1window.cpp
+index 0ac008dd..2041bb16 100644
+--- a/src/inputpanelv1window.cpp
++++ b/src/inputpanelv1window.cpp
+@@ -250,6 +250,9 @@ void InputPanelV1Window::maybeShow()
+         resetPosition();
+         markAsMapped();
+         setHidden(false);
++        // The panel shares the overlay layer with layer-shell overlay surfaces. Put it on top, otherwise
++        // the panel for a text input in such a surface (e.g. a drawer covering the screen) stays below it.
++        workspace()->raiseWindow(this);
+     }
+ }
+ 
