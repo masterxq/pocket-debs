@@ -1,0 +1,107 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 13:03:44 +0100
+Subject: [PATCH] kcms/notifications: feedback per application
+Description:
+ A setting per application for the feedback of new notifications, with
+ German translation. Changing the lock screen visibility or the feedback
+ of an application marks the module as changed, so it can be applied.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/kcms/notifications/kcm.cpp b/kcms/notifications/kcm.cpp
+index 41c63aee90..7ffa3b9aa3 100644
+--- a/kcms/notifications/kcm.cpp
++++ b/kcms/notifications/kcm.cpp
+@@ -271,6 +271,8 @@ void KCMNotifications::createConnections(NotificationManager::BehaviorSettings *
+     connect(settings, &NotificationManager::BehaviorSettings::ShowPopupsInDndModeChanged, this, &KCMNotifications::settingsChanged);
+     connect(settings, &NotificationManager::BehaviorSettings::ShowInHistoryChanged, this, &KCMNotifications::settingsChanged);
+     connect(settings, &NotificationManager::BehaviorSettings::ShowBadgesChanged, this, &KCMNotifications::settingsChanged);
++    connect(settings, &NotificationManager::BehaviorSettings::LockScreenVisibilityChanged, this, &KCMNotifications::settingsChanged);
++    connect(settings, &NotificationManager::BehaviorSettings::FeedbackChanged, this, &KCMNotifications::settingsChanged);
+ 
+     connect(settings, &NotificationManager::BehaviorSettings::ShowPopupsChanged, this, [this, index] {
+         updateModelIsDefaultStatus(index);
+@@ -284,6 +286,12 @@ void KCMNotifications::createConnections(NotificationManager::BehaviorSettings *
+     connect(settings, &NotificationManager::BehaviorSettings::ShowBadgesChanged, this, [this, index] {
+         updateModelIsDefaultStatus(index);
+     });
++    connect(settings, &NotificationManager::BehaviorSettings::LockScreenVisibilityChanged, this, [this, index] {
++        updateModelIsDefaultStatus(index);
++    });
++    connect(settings, &NotificationManager::BehaviorSettings::FeedbackChanged, this, [this, index] {
++        updateModelIsDefaultStatus(index);
++    });
+ }
+ 
+ QUrl KCMNotifications::soundsLocation()
+diff --git a/kcms/notifications/ui/ApplicationConfiguration.qml b/kcms/notifications/ui/ApplicationConfiguration.qml
+index 440e40dacf..54d64b6402 100644
+--- a/kcms/notifications/ui/ApplicationConfiguration.qml
++++ b/kcms/notifications/ui/ApplicationConfiguration.qml
+@@ -149,6 +149,26 @@ ColumnLayout {
+                         }
+                     }
+ 
++                    QQC2.ComboBox {
++                        Kirigami.FormData.label: i18nc("@label:listbox", "New notifications:")
++                        textRole: "text"
++                        valueRole: "value"
++                        // values of NotificationManager.Settings.Feedback
++                        model: [
++                            { value: 1, text: i18nc("@item:inlistbox feedback of new notifications", "Sound, vibration and light") },
++                            { value: 2, text: i18nc("@item:inlistbox feedback of new notifications", "Vibration and light") },
++                            { value: 3, text: i18nc("@item:inlistbox feedback of new notifications", "Only light (muted)") },
++                            { value: 4, text: i18nc("@item:inlistbox feedback of new notifications", "None") },
++                        ]
++                        currentIndex: !!behaviorSettings ? indexOfValue(behaviorSettings.feedback) : 0
++                        onActivated: behaviorSettings.feedback = currentValue
++
++                        KCM.SettingStateBinding {
++                            configObject: behaviorSettings
++                            settingName: "Feedback"
++                        }
++                    }
++
+                     QQC2.CheckBox {
+                         text: i18n("Show in history")
+                         checked: !!behaviorSettings && behaviorSettings.showInHistory
+diff --git a/po/de/kcm_notifications.po b/po/de/kcm_notifications.po
+index 1b3fe3d7fa..539bba0cac 100644
+--- a/po/de/kcm_notifications.po
++++ b/po/de/kcm_notifications.po
+@@ -449,3 +449,33 @@ msgstr "Höchstens die Anwendung"
+ msgctxt "@item:inlistbox lock screen"
+ msgid "Not on the lock screen"
+ msgstr "Nicht auf dem Sperrbildschirm"
++
++#: ui/ApplicationConfiguration.qml
++#, kde-format
++msgctxt "@label:listbox"
++msgid "New notifications:"
++msgstr "Neue Benachrichtigungen:"
++
++#: ui/ApplicationConfiguration.qml
++#, kde-format
++msgctxt "@item:inlistbox feedback of new notifications"
++msgid "Sound, vibration and light"
++msgstr "Ton, Vibration und Licht"
++
++#: ui/ApplicationConfiguration.qml
++#, kde-format
++msgctxt "@item:inlistbox feedback of new notifications"
++msgid "Vibration and light"
++msgstr "Vibration und Licht"
++
++#: ui/ApplicationConfiguration.qml
++#, kde-format
++msgctxt "@item:inlistbox feedback of new notifications"
++msgid "Only light (muted)"
++msgstr "Nur Licht (stumm)"
++
++#: ui/ApplicationConfiguration.qml
++#, kde-format
++msgctxt "@item:inlistbox feedback of new notifications"
++msgid "None"
++msgstr "Keine"

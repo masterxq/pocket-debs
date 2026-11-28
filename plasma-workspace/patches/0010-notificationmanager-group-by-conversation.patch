@@ -1,0 +1,629 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 13:03:44 +0100
+Subject: [PATCH] notificationmanager: group notifications by conversation
+Description:
+ A chat with many messages filled every view, since notifications could
+ only be grouped by application.
+ .
+ New hint x-kde-conversation-id (ConversationRole) and group mode
+ GroupConversationsFlat: notifications of the same application and
+ conversation form a group; without the hint the summary (the sender of
+ a message) stands for the conversation. When a view may only show the
+ application, summary and conversation are empty and the notifications
+ group by application.
+ .
+ The grouping model now follows its source when a notification is
+ replaced with one that belongs to another group, and when the rows of
+ the source change within a layout change; it kept stale rows before.
+ The visibility model reports a changed visibility as a filter change and
+ a change of the content instead of a layout change. Switching between
+ the grouping modes and back from no grouping keeps the proxy chain
+ connected.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/libnotificationmanager/abstractnotificationsmodel.cpp b/libnotificationmanager/abstractnotificationsmodel.cpp
+index 116ca9a79b..43cfd042bb 100644
+--- a/libnotificationmanager/abstractnotificationsmodel.cpp
++++ b/libnotificationmanager/abstractnotificationsmodel.cpp
+@@ -457,6 +457,8 @@ QVariant AbstractNotificationsModel::data(const QModelIndex &index, int role) co
+         return notification.lockScreenVisibility();
+     case Notifications::PublicSummaryRole:
+         return notification.publicSummary();
++    case Notifications::ConversationRole:
++        return notification.conversationId();
+     }
+ 
+     return {};
+diff --git a/libnotificationmanager/autotests/CMakeLists.txt b/libnotificationmanager/autotests/CMakeLists.txt
+index 32578fed18..b9270f8f0c 100644
+--- a/libnotificationmanager/autotests/CMakeLists.txt
++++ b/libnotificationmanager/autotests/CMakeLists.txt
+@@ -7,3 +7,10 @@ add_executable(notification_test  ${notifications_test_SRCS})
+ target_link_libraries(notification_test Qt::Test Qt::Core PW::LibNotificationManager)
+ add_test(NAME libnotificationmanager-test COMMAND notification_test)
+ ecm_mark_as_test(notification_test)
++
++# the proxy model is private to the library, built into the test
++add_executable(groupingproxymodel_test groupingproxymodel_test.cpp ../notificationgroupingproxymodel.cpp)
++target_include_directories(groupingproxymodel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
++target_link_libraries(groupingproxymodel_test Qt::Test Qt::Gui PW::LibNotificationManager)
++add_test(NAME libnotificationmanager-groupingproxymodel-test COMMAND groupingproxymodel_test)
++ecm_mark_as_test(groupingproxymodel_test)
+diff --git a/libnotificationmanager/autotests/groupingproxymodel_test.cpp b/libnotificationmanager/autotests/groupingproxymodel_test.cpp
+new file mode 100644
+index 0000000000..603d1313d7
+--- /dev/null
++++ b/libnotificationmanager/autotests/groupingproxymodel_test.cpp
+@@ -0,0 +1,203 @@
++/*
++    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#include <QSignalSpy>
++#include <QSortFilterProxyModel>
++#include <QStandardItemModel>
++#include <QTest>
++
++#include <algorithm>
++#include <memory>
++
++#include "notificationgroupingproxymodel_p.h"
++#include "notifications.h"
++
++using namespace NotificationManager;
++
++class GroupingProxyModelTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void init();
++    void groupsByApplication();
++    void groupsByConversation();
++    void conversationOverridesSummary();
++    void hiddenContentGroupsByApplication();
++    void switchesMode();
++    void regroupsChangedNotification();
++    void followsSourceLayoutChange();
++
++private:
++    void add(const QString &app, const QString &summary, const QString &conversation = QString());
++    QList<int> groupSizes() const;
++
++    QStandardItemModel m_source;
++    std::unique_ptr<NotificationGroupingProxyModel> m_proxy;
++};
++
++void GroupingProxyModelTest::init()
++{
++    m_source.clear();
++    m_proxy = std::make_unique<NotificationGroupingProxyModel>();
++    m_proxy->setSourceModel(&m_source);
++}
++
++void GroupingProxyModelTest::add(const QString &app, const QString &summary, const QString &conversation)
++{
++    auto *item = new QStandardItem;
++    item->setData(app, Notifications::ApplicationNameRole);
++    item->setData(QString(QStringLiteral("org.example.") + app), Notifications::DesktopEntryRole);
++    item->setData(summary, Notifications::SummaryRole);
++    item->setData(conversation, Notifications::ConversationRole);
++    m_source.appendRow(item);
++}
++
++// sizes of the top level rows, 1 for a single notification
++QList<int> GroupingProxyModelTest::groupSizes() const
++{
++    QList<int> sizes;
++    for (int i = 0; i < m_proxy->rowCount(); ++i) {
++        sizes.append(std::max(1, m_proxy->rowCount(m_proxy->index(i, 0))));
++    }
++    std::sort(sizes.begin(), sizes.end());
++    return sizes;
++}
++
++void GroupingProxyModelTest::groupsByApplication()
++{
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++    add(QStringLiteral("chat"), QStringLiteral("Erika"));
++    add(QStringLiteral("mail"), QStringLiteral("Max"));
++
++    QCOMPARE(groupSizes(), (QList<int>{1, 2}));
++}
++
++void GroupingProxyModelTest::groupsByConversation()
++{
++    m_proxy->setGroupConversations(true);
++
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++    add(QStringLiteral("chat"), QStringLiteral("Erika"));
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++    add(QStringLiteral("mail"), QStringLiteral("Max"));
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++
++    QCOMPARE(groupSizes(), (QList<int>{1, 1, 3}));
++
++    const QModelIndex group = m_proxy->index(0, 0);
++    QVERIFY(group.data(Notifications::IsGroupRole).toBool());
++    QCOMPARE(group.data(Notifications::GroupChildrenCountRole).toInt(), 3);
++    QCOMPARE(m_proxy->index(0, 0, group).data(Notifications::SummaryRole).toString(), QStringLiteral("Max"));
++}
++
++void GroupingProxyModelTest::conversationOverridesSummary()
++{
++    m_proxy->setGroupConversations(true);
++
++    add(QStringLiteral("chat"), QStringLiteral("Max in Family"), QStringLiteral("family"));
++    add(QStringLiteral("chat"), QStringLiteral("Erika in Family"), QStringLiteral("family"));
++    add(QStringLiteral("chat"), QStringLiteral("family"));
++
++    QCOMPARE(groupSizes(), (QList<int>{1, 2}));
++}
++
++void GroupingProxyModelTest::hiddenContentGroupsByApplication()
++{
++    m_proxy->setGroupConversations(true);
++
++    // the visibility proxy empties summary and conversation when only the application may be shown
++    add(QStringLiteral("chat"), QString());
++    add(QStringLiteral("chat"), QString());
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++
++    QCOMPARE(groupSizes(), (QList<int>{1, 2}));
++}
++
++void GroupingProxyModelTest::switchesMode()
++{
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++    add(QStringLiteral("chat"), QStringLiteral("Erika"));
++    QCOMPARE(groupSizes(), (QList<int>{2}));
++
++    QSignalSpy resetSpy(m_proxy.get(), &QAbstractItemModel::modelReset);
++    m_proxy->setGroupConversations(true);
++    QCOMPARE(resetSpy.count(), 1);
++    QCOMPARE(groupSizes(), (QList<int>{1, 1}));
++
++    m_proxy->setGroupConversations(false);
++    QCOMPARE(groupSizes(), (QList<int>{2}));
++}
++
++void GroupingProxyModelTest::regroupsChangedNotification()
++{
++    m_proxy->setGroupConversations(true);
++
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++    add(QStringLiteral("chat"), QStringLiteral("Erika"));
++    QCOMPARE(groupSizes(), (QList<int>{1, 2}));
++
++    // a notification replaced with another summary moves to the group of that summary
++    m_source.item(1)->setData(QStringLiteral("Erika"), Notifications::SummaryRole);
++    QCOMPARE(groupSizes(), (QList<int>{1, 2}));
++    for (int i = 0; i < m_proxy->rowCount(); ++i) {
++        const QModelIndex idx = m_proxy->index(i, 0);
++        if (m_proxy->rowCount(idx) == 2) {
++            QCOMPARE(m_proxy->index(0, 0, idx).data(Notifications::SummaryRole).toString(), QStringLiteral("Erika"));
++            QCOMPARE(m_proxy->index(1, 0, idx).data(Notifications::SummaryRole).toString(), QStringLiteral("Erika"));
++        } else {
++            QCOMPARE(idx.data(Notifications::SummaryRole).toString(), QStringLiteral("Max"));
++        }
++    }
++
++    // a change that keeps the grouping does not reset the model
++    QSignalSpy resetSpy(m_proxy.get(), &QAbstractItemModel::modelReset);
++    m_source.item(0)->setData(QStringLiteral("body"), Notifications::BodyRole);
++    QCOMPARE(resetSpy.count(), 0);
++}
++
++class LayoutChangingModel : public QSortFilterProxyModel
++{
++public:
++    bool hideMax = false;
++
++    void hide()
++    {
++        hideMax = true;
++        // like a proxy that invalidates: the rows change within a layout change
++        invalidate();
++    }
++
++protected:
++    bool filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const override
++    {
++        return !hideMax || sourceModel()->index(sourceRow, 0, sourceParent).data(Notifications::SummaryRole).toString() != QLatin1String("Max");
++    }
++};
++
++void GroupingProxyModelTest::followsSourceLayoutChange()
++{
++    LayoutChangingModel filter;
++    filter.setSourceModel(&m_source);
++    m_proxy->setGroupConversations(true);
++    m_proxy->setSourceModel(&filter);
++
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++    add(QStringLiteral("chat"), QStringLiteral("Erika"));
++    QCOMPARE(groupSizes(), (QList<int>{1, 2}));
++
++    filter.hide();
++    QCOMPARE(groupSizes(), (QList<int>{1}));
++    QCOMPARE(m_proxy->index(0, 0).data(Notifications::SummaryRole).toString(), QStringLiteral("Erika"));
++
++    m_proxy->setSourceModel(nullptr);
++}
++
++QTEST_GUILESS_MAIN(GroupingProxyModelTest)
++
++#include "groupingproxymodel_test.moc"
+diff --git a/libnotificationmanager/notification.cpp b/libnotificationmanager/notification.cpp
+index ea4d223773..58c45118e6 100644
+--- a/libnotificationmanager/notification.cpp
++++ b/libnotificationmanager/notification.cpp
+@@ -449,6 +449,7 @@ void Notification::Private::processFdoHints(const QVariantMap &hints)
+         lockScreenVisibility = Notifications::VisibilityHidden;
+     }
+     publicSummary = hints.value(QStringLiteral("x-kde-public-summary")).toString();
++    conversationId = hints.value(QStringLiteral("x-kde-conversation-id")).toString();
+ 
+     // Underscored hints was in use in version 1.1 of the spec but has been
+     // replaced by dashed hints in version 1.2. We need to support it for
+@@ -914,6 +915,11 @@ QString Notification::publicSummary() const
+     return d->publicSummary;
+ }
+ 
++QString Notification::conversationId() const
++{
++    return d->conversationId;
++}
++
+ bool Notification::expired() const
+ {
+     return d->expired;
+diff --git a/libnotificationmanager/notification.h b/libnotificationmanager/notification.h
+index b7d28cceb8..cf769eecf0 100644
+--- a/libnotificationmanager/notification.h
++++ b/libnotificationmanager/notification.h
+@@ -115,6 +115,7 @@ public:
+ 
+     Notifications::Visibility lockScreenVisibility() const;
+     QString publicSummary() const;
++    QString conversationId() const;
+ 
+     bool expired() const;
+     void setExpired(bool expired);
+diff --git a/libnotificationmanager/notification_p.h b/libnotificationmanager/notification_p.h
+index 4d2bbd90f7..203a1e38c2 100644
+--- a/libnotificationmanager/notification_p.h
++++ b/libnotificationmanager/notification_p.h
+@@ -94,6 +94,8 @@ public:
+     // set by the application, the view decides with its own settings
+     Notifications::Visibility lockScreenVisibility = Notifications::VisibilityFull;
+     QString publicSummary;
++    // groups the notifications of one conversation (chat, mail thread) of an application
++    QString conversationId;
+ 
+     // the arguments of org.kde.NotificationWatcher.Notify for this notification
+     QVariantList watcherArguments;
+diff --git a/libnotificationmanager/notificationgroupingproxymodel.cpp b/libnotificationmanager/notificationgroupingproxymodel.cpp
+index 6f30074980..3968ba5012 100644
+--- a/libnotificationmanager/notificationgroupingproxymodel.cpp
++++ b/libnotificationmanager/notificationgroupingproxymodel.cpp
+@@ -34,6 +34,78 @@ bool NotificationGroupingProxyModel::appsMatch(const QModelIndex &a, const QMode
+     return !aName.isEmpty() && aName == bName && aDesktopEntry == bDesktopEntry && aOriginName == bOriginName;
+ }
+ 
++bool NotificationGroupingProxyModel::groupsMatch(const QModelIndex &a, const QModelIndex &b) const
++{
++    if (!appsMatch(a, b)) {
++        return false;
++    }
++
++    if (!m_groupConversations) {
++        return true;
++    }
++
++    // The conversation the application names, otherwise the summary (e.g. the sender of a message).
++    // Both are empty when only the application may be shown, the notifications then group by application.
++    const auto conversationKey = [](const QModelIndex &idx) -> QString {
++        const QString conversation = idx.data(Notifications::ConversationRole).toString();
++        if (!conversation.isEmpty()) {
++            return QStringLiteral("c:") + conversation;
++        }
++        return QStringLiteral("s:") + idx.data(Notifications::SummaryRole).toString();
++    };
++
++    return conversationKey(a) == conversationKey(b);
++}
++
++bool NotificationGroupingProxyModel::groupConversations() const
++{
++    return m_groupConversations;
++}
++
++void NotificationGroupingProxyModel::setGroupConversations(bool groupConversations)
++{
++    if (m_groupConversations == groupConversations) {
++        return;
++    }
++
++    m_groupConversations = groupConversations;
++
++    if (sourceModel()) {
++        regroup();
++    }
++}
++
++void NotificationGroupingProxyModel::regroup()
++{
++    beginResetModel();
++    rebuildMap();
++    endResetModel();
++}
++
++bool NotificationGroupingProxyModel::isGroupedCorrectly(int sourceRow) const
++{
++    const QModelIndex sourceIndex = sourceModel()->index(sourceRow, 0);
++
++    for (int i = 0; i < rowMap.count(); ++i) {
++        const QList<int> *sourceRows = rowMap.at(i);
++        if (sourceRows->contains(sourceRow)) {
++            if (sourceRows->count() > 1) {
++                // still belongs to the other members of its group
++                const int other = sourceRows->constFirst() != sourceRow ? sourceRows->constFirst() : sourceRows->at(1);
++                return groupsMatch(sourceIndex, sourceModel()->index(other, 0));
++            }
++            continue;
++        }
++
++        // a single notification that now belongs to another group
++        if (groupsMatch(sourceIndex, sourceModel()->index(sourceRows->constFirst(), 0))) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
+ bool NotificationGroupingProxyModel::isGroup(int row) const
+ {
+     if (row < 0 || row >= rowMap.count()) {
+@@ -55,7 +127,7 @@ bool NotificationGroupingProxyModel::tryToGroup(const QModelIndex &sourceIndex,
+             continue;
+         }
+ 
+-        if (appsMatch(sourceIndex, groupRep)) {
++        if (groupsMatch(sourceIndex, groupRep)) {
+             const QModelIndex parent = index(i, 0);
+ 
+             if (!silent) {
+@@ -143,7 +215,7 @@ void NotificationGroupingProxyModel::formGroupFor(const QModelIndex &index)
+     for (int i = (rowMap.count() - 1); i >= 0; --i) {
+         const QModelIndex &sourceIndex = sourceModel()->index(rowMap.at(i)->constFirst(), 0);
+ 
+-        if (!appsMatch(sourceTarget, sourceIndex)) {
++        if (!groupsMatch(sourceTarget, sourceIndex)) {
+             continue;
+         }
+ 
+@@ -254,10 +326,27 @@ void NotificationGroupingProxyModel::setSourceModel(QAbstractItemModel *sourceMo
+             endResetModel();
+         });
+ 
++        // The rows of the source were rearranged (e.g. a filter of a proxy model was invalidated)
++        connect(sourceModel, &QAbstractItemModel::layoutAboutToBeChanged, this, [this] {
++            beginResetModel();
++        });
++        connect(sourceModel, &QAbstractItemModel::layoutChanged, this, [this] {
++            rebuildMap();
++            endResetModel();
++        });
++
+         connect(sourceModel,
+                 &QAbstractItemModel::dataChanged,
+                 this,
+                 [this](const QModelIndex &topLeft, const QModelIndex &bottomRight, const QList<int> &roles) {
++                    // A notification that got replaced may belong to another group now
++                    for (int i = topLeft.row(); i <= bottomRight.row(); ++i) {
++                        if (!isGroupedCorrectly(i)) {
++                            regroup();
++                            return;
++                        }
++                    }
++
+                     for (int i = topLeft.row(); i <= bottomRight.row(); ++i) {
+                         const QModelIndex &sourceIndex = this->sourceModel()->index(i, 0);
+                         QModelIndex proxyIndex = mapFromSource(sourceIndex);
+diff --git a/libnotificationmanager/notificationgroupingproxymodel_p.h b/libnotificationmanager/notificationgroupingproxymodel_p.h
+index a651e3611c..8fd7861742 100644
+--- a/libnotificationmanager/notificationgroupingproxymodel_p.h
++++ b/libnotificationmanager/notificationgroupingproxymodel_p.h
+@@ -21,6 +21,13 @@ public:
+ 
+     void setSourceModel(QAbstractItemModel *sourceModel) override;
+ 
++    /**
++     * Whether notifications of an application are grouped by their conversation
++     * (@c Notifications::ConversationRole, otherwise the summary) instead of all together.
++     */
++    bool groupConversations() const;
++    void setGroupConversations(bool groupConversations);
++
+     QModelIndex index(int row, int column, const QModelIndex &parent = QModelIndex()) const override;
+     QModelIndex parent(const QModelIndex &child) const override;
+ 
+@@ -35,6 +42,9 @@ public:
+ 
+ private:
+     bool appsMatch(const QModelIndex &a, const QModelIndex &b) const;
++    bool groupsMatch(const QModelIndex &a, const QModelIndex &b) const;
++    bool isGroupedCorrectly(int sourceRow) const;
++    void regroup();
+     bool isGroup(int row) const;
+     bool tryToGroup(const QModelIndex &sourceIndex, bool silent = false);
+     void adjustMap(int anchor, int delta);
+@@ -43,6 +53,7 @@ private:
+     void formGroupFor(const QModelIndex &index);
+ 
+     QList<QList<int> *> rowMap;
++    bool m_groupConversations = false;
+ };
+ 
+ } // namespace NotificationManager
+diff --git a/libnotificationmanager/notifications.cpp b/libnotificationmanager/notifications.cpp
+index 05b8bf468d..f75830770b 100644
+--- a/libnotificationmanager/notifications.cpp
++++ b/libnotificationmanager/notifications.cpp
+@@ -210,7 +210,7 @@ void Notifications::Private::initProxyModels()
+      * --- BEGIN: Only when grouping is enabled ---
+      *                |
+      *    NotificationGroupingProxyModel
+-     *    (turns list into tree grouped by app)
++     *    (turns list into tree grouped by app, or by app and conversation)
+      *               //\\
+      *               //\\
+      *   NotificationGroupCollapsingProxyModel
+@@ -286,10 +286,13 @@ void Notifications::Private::initProxyModels()
+         connect(limiterModel, &LimitedRowCountProxyModel::limitChanged, q, &Notifications::limitChanged);
+     }
+ 
+-    if (groupMode == GroupApplicationsFlat) {
++    if (groupMode == GroupApplicationsFlat || groupMode == GroupConversationsFlat) {
+         if (!groupingModel) {
+             groupingModel = new NotificationGroupingProxyModel(q);
++            groupingModel->setGroupConversations(groupMode == GroupConversationsFlat);
+             groupingModel->setSourceModel(filterModel);
++        } else {
++            groupingModel->setGroupConversations(groupMode == GroupConversationsFlat);
+         }
+ 
+         if (!groupCollapsingModel) {
+@@ -297,12 +300,15 @@ void Notifications::Private::initProxyModels()
+             groupCollapsingModel->setLimit(groupLimit);
+             groupCollapsingModel->setExpandUnread(expandUnread);
+             groupCollapsingModel->setLastRead(q->lastRead());
+-            groupCollapsingModel->setSourceModel(groupingModel);
+         }
++        // the grouping model is created again after grouping was disabled
++        groupCollapsingModel->setSourceModel(groupingModel);
+ 
+         sortModel->setSourceModel(groupCollapsingModel);
+ 
+-        flattenModel = new KDescendantsProxyModel(q);
++        if (!flattenModel) {
++            flattenModel = new KDescendantsProxyModel(q);
++        }
+         flattenModel->setSourceModel(sortModel);
+ 
+         limiterModel->setSourceModel(flattenModel);
+diff --git a/libnotificationmanager/notifications.h b/libnotificationmanager/notifications.h
+index 91f3915367..041b56b488 100644
+--- a/libnotificationmanager/notifications.h
++++ b/libnotificationmanager/notifications.h
+@@ -367,6 +367,8 @@ public:
+         VisibilityRole, ///< How much of the notification is shown, see @c Visibility. The roles with content are empty when hidden. @since 6.7
+         LockScreenVisibilityRole, ///< The visibility on the lock screen the application asked for. @since 6.7
+         PublicSummaryRole, ///< The summary the application allows to show instead of the summary when only the sender is shown. @since 6.7
++        ConversationRole, ///< The conversation (e.g. chat or mail thread) of the application the notification belongs to, empty when the content is hidden.
++                          ///< @since 6.7
+     };
+     Q_ENUM(Roles)
+ 
+@@ -461,6 +463,8 @@ public:
+         GroupDisabled = 0,
+         // GroupApplicationsTree, // TODO make actual tree
+         GroupApplicationsFlat,
++        GroupConversationsFlat, ///< Notifications of the same application and conversation (@c x-kde-conversation-id hint, otherwise the summary), only by
++                                ///< application when the conversation cannot be shown. @since 6.7
+     };
+     Q_ENUM(GroupMode)
+ 
+diff --git a/libnotificationmanager/notificationvisibilityproxymodel.cpp b/libnotificationmanager/notificationvisibilityproxymodel.cpp
+index 23485c149b..fb61412d4b 100644
+--- a/libnotificationmanager/notificationvisibilityproxymodel.cpp
++++ b/libnotificationmanager/notificationvisibilityproxymodel.cpp
+@@ -28,8 +28,10 @@ Notifications::Visibility NotificationVisibilityProxyModel::visibility() const
+ void NotificationVisibilityProxyModel::setVisibility(Notifications::Visibility visibility)
+ {
+     if (m_visibility != visibility) {
++        beginFilterChange();
+         m_visibility = visibility;
+-        invalidate();
++        endFilterChange();
++        contentChanged();
+         Q_EMIT visibilityChanged();
+     }
+ }
+@@ -42,8 +44,10 @@ bool NotificationVisibilityProxyModel::lockScreen() const
+ void NotificationVisibilityProxyModel::setLockScreen(bool lockScreen)
+ {
+     if (m_lockScreen != lockScreen) {
++        beginFilterChange();
+         m_lockScreen = lockScreen;
+-        invalidate();
++        endFilterChange();
++        contentChanged();
+         Q_EMIT lockScreenChanged();
+     }
+ }
+@@ -56,8 +60,10 @@ QVariantMap NotificationVisibilityProxyModel::applications() const
+ void NotificationVisibilityProxyModel::setApplications(const QVariantMap &visibilities)
+ {
+     if (m_applications != visibilities) {
++        beginFilterChange();
+         m_applications = visibilities;
+-        invalidate();
++        endFilterChange();
++        contentChanged();
+         Q_EMIT applicationsChanged();
+     }
+ }
+@@ -70,12 +76,22 @@ QVariantMap NotificationVisibilityProxyModel::services() const
+ void NotificationVisibilityProxyModel::setServices(const QVariantMap &visibilities)
+ {
+     if (m_services != visibilities) {
++        beginFilterChange();
+         m_services = visibilities;
+-        invalidate();
++        endFilterChange();
++        contentChanged();
+         Q_EMIT servicesChanged();
+     }
+ }
+ 
++void NotificationVisibilityProxyModel::contentChanged()
++{
++    // the notifications that stay show more or less of their content
++    if (rowCount() > 0) {
++        Q_EMIT dataChanged(index(0, 0), index(rowCount() - 1, 0));
++    }
++}
++
+ bool NotificationVisibilityProxyModel::isMessageCategory(const QString &category)
+ {
+     // freedesktop categories im, im.received, email.arrived, portal call.incoming, ...
+@@ -150,6 +166,7 @@ QVariant NotificationVisibilityProxyModel::data(const QModelIndex &index, int ro
+         }
+         return role == Notifications::ImageRole ? QVariant() : QVariant(QString());
+     case Notifications::OriginNameRole:
++    case Notifications::ConversationRole:
+         return sender ? sourceIdx.data(role) : QVariant(QString());
+     case Notifications::BodyRole:
+     case Notifications::DefaultActionLabelRole:
+diff --git a/libnotificationmanager/notificationvisibilityproxymodel_p.h b/libnotificationmanager/notificationvisibilityproxymodel_p.h
+index e757b6ffa0..f3d6a8a499 100644
+--- a/libnotificationmanager/notificationvisibilityproxymodel_p.h
++++ b/libnotificationmanager/notificationvisibilityproxymodel_p.h
+@@ -52,6 +52,7 @@ protected:
+ 
+ private:
+     Notifications::Visibility visibilityOf(const QModelIndex &sourceIdx) const;
++    void contentChanged();
+ 
+     Notifications::Visibility m_visibility = Notifications::VisibilityFull;
+     bool m_lockScreen = false;

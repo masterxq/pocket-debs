@@ -1,0 +1,255 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 13:03:44 +0100
+Subject: [PATCH] notificationmanager: feedback per application, settings of an application
+Description:
+ New setting per application and service, Feedback: sound, vibration and
+ light of new notifications, only vibration and light, only light, or
+ nothing (Settings::Feedback, feedbackApplications, feedbackServices).
+ .
+ Settings can read and change the lock screen visibility and the feedback
+ of a single application or service, so that a view can offer them for a
+ notification, and lists the services that should not show badges.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/libnotificationmanager/kcfg/behaviorsettings.kcfg b/libnotificationmanager/kcfg/behaviorsettings.kcfg
+index 31fa7aeaf7..85968431d8 100644
+--- a/libnotificationmanager/kcfg/behaviorsettings.kcfg
++++ b/libnotificationmanager/kcfg/behaviorsettings.kcfg
+@@ -27,5 +27,12 @@
+             <min>1</min>
+             <max>4</max>
+         </entry>
++        <!-- Sound, vibration and light of new notifications (NotificationManager::Settings::Feedback):
++             1 everything, 2 vibration and light, 3 only light, 4 nothing -->
++        <entry name="Feedback" type="Int">
++            <default>1</default>
++            <min>1</min>
++            <max>4</max>
++        </entry>
+     </group>
+ </kcfg>
+diff --git a/libnotificationmanager/settings.cpp b/libnotificationmanager/settings.cpp
+index 0899422209..3279c4adb5 100644
+--- a/libnotificationmanager/settings.cpp
++++ b/libnotificationmanager/settings.cpp
+@@ -43,7 +43,9 @@ public:
+     KConfigGroup applicationsGroup() const;
+ 
+     QStringList behaviorMatchesList(const KConfigGroup &group, Settings::NotificationBehavior behavior, bool on) const;
+-    QVariantMap lockScreenVisibilities(const KConfigGroup &group) const;
++    QVariantMap levels(const KConfigGroup &group, const char *key, int max) const;
++    int level(const KConfigGroup &group, const char *key) const;
++    void setLevel(KConfigGroup group, const char *key, int value, int max);
+ 
+     Settings *const q;
+ 
+@@ -151,19 +153,41 @@ QStringList Settings::Private::behaviorMatchesList(const KConfigGroup &group, Se
+     return matches;
+ }
+ 
+-QVariantMap Settings::Private::lockScreenVisibilities(const KConfigGroup &group) const
++// Per application settings with levels from 1 (the default, no restriction) to max
++QVariantMap Settings::Private::levels(const KConfigGroup &group, const char *key, int max) const
+ {
+-    QVariantMap visibilities;
++    QVariantMap result;
+ 
+     const QStringList apps = group.groupList();
+     for (const QString &app : apps) {
+-        const int visibility = group.group(app).readEntry("LockScreenVisibility", int(Notifications::VisibilityFull));
+-        if (visibility > Notifications::VisibilityFull) {
+-            visibilities.insert(app, std::min(visibility, int(Notifications::VisibilityHidden)));
++        const int value = group.group(app).readEntry(key, 1);
++        if (value > 1) {
++            result.insert(app, std::min(value, max));
+         }
+     }
+ 
+-    return visibilities;
++    return result;
++}
++
++int Settings::Private::level(const KConfigGroup &group, const char *key) const
++{
++    return std::max(group.readEntry(key, 1), 1);
++}
++
++void Settings::Private::setLevel(KConfigGroup group, const char *key, int value, int max)
++{
++    value = std::clamp(value, 1, max);
++    if (level(group, key) == value) {
++        return;
++    }
++
++    if (value == 1 && !group.hasDefault(key)) {
++        group.revertToDefault(key, KConfigBase::Notify);
++    } else {
++        group.writeEntry(key, value, KConfigBase::Notify);
++    }
++
++    setDirty(true);
+ }
+ 
+ Settings::Settings(QObject *parent)
+@@ -550,12 +574,62 @@ QStringList Settings::knownApplications() const
+ 
+ QVariantMap Settings::lockScreenVisibilityApplications() const
+ {
+-    return d->lockScreenVisibilities(d->applicationsGroup());
++    return d->levels(d->applicationsGroup(), "LockScreenVisibility", Notifications::VisibilityHidden);
+ }
+ 
+ QVariantMap Settings::lockScreenVisibilityServices() const
+ {
+-    return d->lockScreenVisibilities(d->servicesGroup());
++    return d->levels(d->servicesGroup(), "LockScreenVisibility", Notifications::VisibilityHidden);
++}
++
++QVariantMap Settings::feedbackApplications() const
++{
++    return d->levels(d->applicationsGroup(), "Feedback", FeedbackNone);
++}
++
++QVariantMap Settings::feedbackServices() const
++{
++    return d->levels(d->servicesGroup(), "Feedback", FeedbackNone);
++}
++
++int Settings::applicationLockScreenVisibility(const QString &desktopEntry) const
++{
++    return d->level(d->applicationsGroup().group(desktopEntry), "LockScreenVisibility");
++}
++
++void Settings::setApplicationLockScreenVisibility(const QString &desktopEntry, int visibility)
++{
++    d->setLevel(d->applicationsGroup().group(desktopEntry), "LockScreenVisibility", visibility, Notifications::VisibilityHidden);
++}
++
++int Settings::serviceLockScreenVisibility(const QString &notifyRcName) const
++{
++    return d->level(d->servicesGroup().group(notifyRcName), "LockScreenVisibility");
++}
++
++void Settings::setServiceLockScreenVisibility(const QString &notifyRcName, int visibility)
++{
++    d->setLevel(d->servicesGroup().group(notifyRcName), "LockScreenVisibility", visibility, Notifications::VisibilityHidden);
++}
++
++int Settings::applicationFeedback(const QString &desktopEntry) const
++{
++    return d->level(d->applicationsGroup().group(desktopEntry), "Feedback");
++}
++
++void Settings::setApplicationFeedback(const QString &desktopEntry, int feedback)
++{
++    d->setLevel(d->applicationsGroup().group(desktopEntry), "Feedback", feedback, FeedbackNone);
++}
++
++int Settings::serviceFeedback(const QString &notifyRcName) const
++{
++    return d->level(d->servicesGroup().group(notifyRcName), "Feedback");
++}
++
++void Settings::setServiceFeedback(const QString &notifyRcName, int feedback)
++{
++    d->setLevel(d->servicesGroup().group(notifyRcName), "Feedback", feedback, FeedbackNone);
+ }
+ 
+ QStringList Settings::popupBlacklistedApplications() const
+@@ -593,6 +667,11 @@ QStringList Settings::badgeBlacklistedApplications() const
+     return d->behaviorMatchesList(d->applicationsGroup(), ShowBadges, false);
+ }
+ 
++QStringList Settings::badgeBlacklistedServices() const
++{
++    return d->behaviorMatchesList(d->servicesGroup(), ShowBadges, false);
++}
++
+ QDateTime Settings::notificationsInhibitedUntil() const
+ {
+     return d->dndSettings.until();
+diff --git a/libnotificationmanager/settings.h b/libnotificationmanager/settings.h
+index 5885df62ba..3e5dcb2939 100644
+--- a/libnotificationmanager/settings.h
++++ b/libnotificationmanager/settings.h
+@@ -133,11 +133,27 @@ class NOTIFICATIONMANAGER_EXPORT Settings : public QObject
+     Q_PROPERTY(QVariantMap lockScreenVisibilityApplications READ lockScreenVisibilityApplications NOTIFY settingsChanged)
+     Q_PROPERTY(QVariantMap lockScreenVisibilityServices READ lockScreenVisibilityServices NOTIFY settingsChanged)
+ 
++    /**
++     * Feedback of applications and services that is reduced from sound, vibration
++     * and light, desktop entry or notifyrc name to @c Feedback.
++     *
++     * @since 6.7
++     */
++    Q_PROPERTY(QVariantMap feedbackApplications READ feedbackApplications NOTIFY settingsChanged)
++    Q_PROPERTY(QVariantMap feedbackServices READ feedbackServices NOTIFY settingsChanged)
++
+     /**
+      * A list of desktop entries of applications which shouldn't show badges in task manager.
+      */
+     Q_PROPERTY(QStringList badgeBlacklistedApplications READ badgeBlacklistedApplications NOTIFY settingsChanged)
+ 
++    /**
++     * A list of notifyrc names of services which shouldn't show badges.
++     *
++     * @since 6.7
++     */
++    Q_PROPERTY(QStringList badgeBlacklistedServices READ badgeBlacklistedServices NOTIFY settingsChanged)
++
+     /**
+      * The date until which do not disturb mode is enabled.
+      *
+@@ -276,6 +292,37 @@ public:
+     Q_INVOKABLE NotificationBehaviors serviceBehavior(const QString &desktopEntry) const;
+     Q_INVOKABLE void setServiceBehavior(const QString &desktopEntry, NotificationBehaviors behaviors);
+ 
++    /**
++     * How a new notification of an application can be noticed besides seeing it.
++     *
++     * @since 6.7
++     */
++    enum Feedback {
++        FeedbackFull = 1, ///< Sound, vibration and light (e.g. a notification LED).
++        FeedbackQuiet, ///< Vibration and light.
++        FeedbackSilent, ///< Only light.
++        FeedbackNone, ///< Nothing.
++    };
++    Q_ENUM(Feedback)
++
++    /**
++     * The lock screen visibility (@c Notifications::Visibility) and the @c Feedback
++     * of an application, identified by its desktop entry, or of a service,
++     * identified by its notifyrc name.
++     *
++     * The setters write the configuration only on @c save.
++     *
++     * @since 6.7
++     */
++    Q_INVOKABLE int applicationLockScreenVisibility(const QString &desktopEntry) const;
++    Q_INVOKABLE void setApplicationLockScreenVisibility(const QString &desktopEntry, int visibility);
++    Q_INVOKABLE int serviceLockScreenVisibility(const QString &notifyRcName) const;
++    Q_INVOKABLE void setServiceLockScreenVisibility(const QString &notifyRcName, int visibility);
++    Q_INVOKABLE int applicationFeedback(const QString &desktopEntry) const;
++    Q_INVOKABLE void setApplicationFeedback(const QString &desktopEntry, int feedback);
++    Q_INVOKABLE int serviceFeedback(const QString &notifyRcName) const;
++    Q_INVOKABLE void setServiceFeedback(const QString &notifyRcName, int feedback);
++
+     Q_INVOKABLE void registerKnownApplication(const QString &desktopEntry);
+     Q_INVOKABLE void forgetKnownApplication(const QString &desktopEntry);
+ 
+@@ -337,7 +384,11 @@ public:
+     QVariantMap lockScreenVisibilityApplications() const;
+     QVariantMap lockScreenVisibilityServices() const;
+ 
++    QVariantMap feedbackApplications() const;
++    QVariantMap feedbackServices() const;
++
+     QStringList badgeBlacklistedApplications() const;
++    QStringList badgeBlacklistedServices() const;
+ 
+     QDateTime notificationsInhibitedUntil() const;
+     void setNotificationsInhibitedUntil(const QDateTime &time);
