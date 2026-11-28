@@ -1,0 +1,104 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 18:26:56 +0100
+Subject: [PATCH] plugins: sliding effects: do not animate windows that are not painted
+Description:
+ The slidingnotifications and slidingpopups effects advance their
+ animations in prePaintWindow(), which is only called for windows that
+ are painted. A window that is not visible, e.g. any window other than
+ the lock screen while the session is locked, is never painted, so an
+ animation started for it never finishes. For a closed window the effect
+ holds an EffectWindowDeletedRef until the animation ends: the closed
+ window stays alive and its surface item keeps a reference to the last
+ buffer the client attached.
+ .
+ A client that hides and shows the same wl_surface (Qt keeps the surface
+ and its EGL swapchain across hide/show) commits a new buffer on every
+ show. Notification popups that come and go while the screen is locked
+ thus pile up closed windows, each holding one buffer of the swapchain.
+ Once all of them are held, Mesa's EGL waits for a buffer release that
+ never comes and the client hangs in eglMakeCurrent()/eglSwapBuffers().
+ plasmashell on Plasma Mobile hung this way after four notifications on
+ the lock screen.
+ .
+ Skip the open, close and move animations of windows that are not
+ visible and drop a running animation when such a window is closed.
+ slidingnotifications also stops its animations when the screen locking
+ state changes, as slidingpopups already does.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/src/plugins/slidingnotifications/slidingnotifications.cpp b/src/plugins/slidingnotifications/slidingnotifications.cpp
+index fc5cfdca..96f7afa3 100644
+--- a/src/plugins/slidingnotifications/slidingnotifications.cpp
++++ b/src/plugins/slidingnotifications/slidingnotifications.cpp
+@@ -381,6 +381,9 @@ SlidingNotificationsEffect::SlidingNotificationsEffect()
+ {
+     connect(effects, &EffectsHandler::windowAdded, this, &SlidingNotificationsEffect::onWindowAdded);
+     connect(effects, &EffectsHandler::windowClosed, this, &SlidingNotificationsEffect::onWindowClosed);
++    connect(effects, &EffectsHandler::screenLockingChanged, this, [this]() {
++        m_animations.clear();
++    });
+ }
+ 
+ bool SlidingNotificationsEffect::isActive() const
+@@ -459,7 +462,7 @@ void SlidingNotificationsEffect::onWindowAdded(EffectWindow *window)
+ 
+     connect(window, &EffectWindow::windowFrameGeometryChanged, this, &SlidingNotificationsEffect::onWindowFrameGeometryChanged);
+ 
+-    if (effects->hasActiveFullScreenEffect()) {
++    if (effects->hasActiveFullScreenEffect() || !window->windowItem()->isVisible()) {
+         return;
+     }
+ 
+@@ -484,6 +487,13 @@ void SlidingNotificationsEffect::onWindowClosed(EffectWindow *window)
+         return;
+     }
+ 
++    // Animations advance only while the window is painted, which a window that is not visible (e.g. on
++    // a locked screen) is not. The animation would keep the closed window and its last buffer forever.
++    if (!window->windowItem()->isVisible()) {
++        m_animations.erase(window);
++        return;
++    }
++
+     window->setData(WindowClosedGrabRole, QVariant::fromValue(static_cast<void *>(this)));
+ 
+     auto &animation = m_animations[window];
+@@ -503,7 +513,7 @@ void SlidingNotificationsEffect::onWindowClosed(EffectWindow *window)
+ 
+ void SlidingNotificationsEffect::onWindowFrameGeometryChanged(EffectWindow *window, const RectF &oldGeometry)
+ {
+-    if (effects->hasActiveFullScreenEffect()) {
++    if (effects->hasActiveFullScreenEffect() || !window->windowItem()->isVisible()) {
+         return;
+     }
+ 
+diff --git a/src/plugins/slidingpopups/slidingpopups.cpp b/src/plugins/slidingpopups/slidingpopups.cpp
+index fc931f24..8932e969 100644
+--- a/src/plugins/slidingpopups/slidingpopups.cpp
++++ b/src/plugins/slidingpopups/slidingpopups.cpp
+@@ -434,7 +434,7 @@ void SlidingPopupsEffect::slideIn(EffectWindow *w)
+         return;
+     }
+ 
+-    if (!w->isOnCurrentDesktop() || !w->isOnCurrentActivity()) {
++    if (!w->isOnCurrentDesktop() || !w->isOnCurrentActivity() || !w->windowItem()->isVisible()) {
+         return;
+     }
+ 
+@@ -474,6 +474,13 @@ void SlidingPopupsEffect::slideOut(EffectWindow *w)
+         return;
+     }
+ 
++    // The animation advances only while the window is painted, which a window that is not visible
++    // (e.g. on a locked screen) is not. It would keep the closed window and its last buffer forever.
++    if (!w->windowItem()->isVisible()) {
++        m_animations.erase(w);
++        return;
++    }
++
+     auto dataIt = m_animationsData.constFind(w);
+     if (dataIt == m_animationsData.constEnd()) {
+         return;
