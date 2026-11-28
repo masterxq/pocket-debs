@@ -1,0 +1,51 @@
+Description: controls: PageRow: no anchors on the initial item of the layers stack
+ The column view layout is the initial item of the layers StackView. It
+ filled its parent with anchors and a negative top margin, so every layer
+ push, pop or replace printed "StackView has detected conflicting
+ anchors. Transitions may not execute properly." and the replace
+ transitions could not move it.
+ .
+ Leave position and size of the item to the StackView and put the
+ negative top margin on its children, which keeps the scene geometry of
+ the column view and the sidebar unchanged.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: LGPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-28
+---
+diff --git a/src/controls/PageRow.qml b/src/controls/PageRow.qml
+index 5a5f8578..08ef0606 100644
+--- a/src/controls/PageRow.qml
++++ b/src/controls/PageRow.qml
+@@ -1018,13 +1018,10 @@ QT.Control {
+     }
+ 
+     Item {
++        // Initial item of layersStack: no anchors, the StackView positions and sizes it (anchors.fill conflicts with
++        // its transitions). The children extend upwards over the margin of layersStack.
+         Item {
+             id: columnViewLayout
+-            anchors {
+-                fill: parent
+-                // Use this instead Layout.topMargin in RowLayout seems to be unreliable
+-                topMargin: -layersStack.y
+-            }
+             readonly property alias columnView: columnView
+             // set the pagestack of this and all children to root, otherwise
+             // they would automatically resolve to the layer's stackview
+@@ -1036,6 +1033,7 @@ QT.Control {
+                     left: parent.left
+                     top: parent.top
+                     bottom: parent.bottom
++                    topMargin: -layersStack.y
+                 }
+                 transform: Translate {
+                     x: root.mirrored ? -sidebarControl.Primitives.ScenePosition.x : 0
+@@ -1053,6 +1051,7 @@ QT.Control {
+                     top: parent.top
+                     right: parent.right
+                     bottom: parent.bottom
++                    topMargin: -layersStack.y
+                 }
+ 
+                 topPadding: (globalToolBarUI.item as GlobalToolBar.PageRowGlobalToolBarUI)?.breadcrumbVisible

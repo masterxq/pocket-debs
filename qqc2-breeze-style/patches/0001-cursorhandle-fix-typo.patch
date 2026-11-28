@@ -1,0 +1,25 @@
+From: Carl Schwan <carl@carlschwan.eu>
+Date: Mon, 28 Sep 2026 12:25:47 +0200
+Subject: [PATCH] CursorHandle: Fix typo
+Description:
+ The binding of the inner circle of a selection handle read root.root.target,
+ which is undefined: every time the handles appeared, the console showed
+ "CursorHandle.qml:65: TypeError: Cannot read property 'target' of undefined".
+Origin: upstream, https://invent.kde.org/plasma/qqc2-breeze-style/-/commit/fb4e3fa472442cd89e9e0f0f7e71a371ee89d4b9
+Applied-Upstream: 6.8.0 (Plasma/6.8 9877636a5dff191978b62d636c9f40509ce0adb9)
+License: LGPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-28
+---
+diff --git a/style/impl/CursorHandle.qml b/style/impl/CursorHandle.qml
+index affadfa..8daa50b 100644
+--- a/style/impl/CursorHandle.qml
++++ b/style/impl/CursorHandle.qml
+@@ -62,7 +62,7 @@ Loader {
+ 
+         Kirigami.ShadowedRectangle {
+             id: inner
+-            visible: root.root.target.selectionStart !== target.selectionEnd && (handle.y < selectionStartY || handle.y < selectionEndY)
++            visible: root.target.selectionStart !== root.target.selectionEnd && (handle.y < selectionStartY || handle.y < selectionEndY)
+             anchors.fill: parent
+             anchors.margins: Impl.Units.smallBorder
+             color: root.target.selectedTextColor

@@ -1,0 +1,51 @@
+From: Devin Lin <espidev@gmail.com>
+Date: Mon, 26 Oct 2026 20:31:03 -0400
+Subject: [PATCH] MobileTextActionsToolBar: Fix popup not closing after an action is activated
+Description:
+ After tapping Cut, Copy or Paste the popup stayed open over the text.
+ Close it after the action.
+Origin: upstream, https://invent.kde.org/plasma/qqc2-breeze-style/-/commit/8819e808ea5e2a1be28856f1481250e9c1fa4386
+Applied-Upstream: 6.8.2 (Plasma/6.8 2c8e706b6b37473f8bd9ac557e53ed8b36acea62)
+License: LGPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-28
+---
+diff --git a/style/qtquickcontrols/MobileTextActionsToolBar.qml b/style/qtquickcontrols/MobileTextActionsToolBar.qml
+index deab455..122ba56 100644
+--- a/style/qtquickcontrols/MobileTextActionsToolBar.qml
++++ b/style/qtquickcontrols/MobileTextActionsToolBar.qml
+@@ -63,7 +63,10 @@ Loader {
+                 icon.name: "edit-cut"
+                 text: qsTr("Cut", "@action:inmenu Text editor action")
+                 visible: root.target && root.target.selectedText.length > 0 && (!root.target.hasOwnProperty("echoMode") || root.target.echoMode === TextInput.Normal)
+-                onClicked: root.target.cut();
++                onClicked: {
++                    root.target.cut();
++                    popup.close();
++                }
+             }
+ 
+             ToolButton {
+@@ -71,7 +74,10 @@ Loader {
+                 icon.name: "edit-copy"
+                 text: qsTr("Copy", "@action:inmenu Text editor action")
+                 visible: root.target && root.target.selectedText.length > 0 && (!root.target.hasOwnProperty("echoMode") || root.target.echoMode === TextInput.Normal)
+-                onClicked: root.target.copy();
++                onClicked: {
++                    root.target.copy();
++                    popup.close();
++                }
+             }
+ 
+             ToolButton {
+@@ -79,7 +85,10 @@ Loader {
+                 icon.name: "edit-paste"
+                 text: qsTr("Paste", "@action:inmenu Text editor action")
+                 visible: root.target && root.target.canPaste
+-                onClicked: root.target.paste();
++                onClicked: {
++                    root.target.paste();
++                    popup.close();
++                }
+             }
+         }
+ 
