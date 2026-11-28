@@ -1,0 +1,246 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 09:42:04 +0100
+Subject: [PATCH] actiondrawer: keyboard input for inline replies
+Description:
+ The action drawer window has no keyboard interactivity, so the inline
+ reply field of a notification in the drawer could not get keyboard
+ focus and the reply could not be typed.
+ .
+ When a reply starts (the reply button or a tap on the reply field) the
+ drawer window switches to on-demand keyboard interactivity, as popups
+ already do, and the compositor activates it. The reply field asks for
+ the input panel once it has active focus, which is only after that
+ activation. Closing the drawer hides the input panel right away and
+ drops the keyboard interactivity again; a tap on the field starts the
+ reply again later.
+ .
+ Over the lock screen the drawer cannot get keyboard focus. Starting a
+ reply there asks for the unlock like an action and opens the reply
+ field after it.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: LGPL-2.0-or-later, GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/components/mobileshell/qml/actiondrawer/ActionDrawer.qml b/components/mobileshell/qml/actiondrawer/ActionDrawer.qml
+index 937d92c0c..0754bcad6 100644
+--- a/components/mobileshell/qml/actiondrawer/ActionDrawer.qml
++++ b/components/mobileshell/qml/actiondrawer/ActionDrawer.qml
+@@ -141,6 +141,11 @@ Item {
+      */
+     signal cancelPendingNotificationAction()
+ 
++    /**
++     * Emitted when content of the drawer needs keyboard input (ex. an inline notification reply).
++     */
++    signal keyboardFocusRequested()
++
+     property real oldOffset
+     onOffsetChanged: {
+         if (offset < 0) {
+diff --git a/components/mobileshell/qml/actiondrawer/ActionDrawerWindow.qml b/components/mobileshell/qml/actiondrawer/ActionDrawerWindow.qml
+index 9be9ff0d0..15db5b90a 100644
+--- a/components/mobileshell/qml/actiondrawer/ActionDrawerWindow.qml
++++ b/components/mobileshell/qml/actiondrawer/ActionDrawerWindow.qml
+@@ -27,7 +27,10 @@ Window {
+     LayerShell.Window.anchors: LayerShell.Window.AnchorTop | LayerShell.Window.AnchorLeft | LayerShell.Window.AnchorRight | LayerShell.Window.AnchorBottom
+     LayerShell.Window.layer: LayerShell.Window.LayerOverlay
+     LayerShell.Window.exclusionZone: -1
+-    LayerShell.Window.keyboardInteractivity: LayerShell.Window.KeyboardInteractivityNone
++    LayerShell.Window.keyboardInteractivity: keyboardFocus ? LayerShell.Window.KeyboardInteractivityOnDemand : LayerShell.Window.KeyboardInteractivityNone
++
++    // Keyboard input only while the drawer content asks for it (inline reply), until the drawer closes
++    property bool keyboardFocus: false
+ 
+     /**
+      * The ActionDrawer component.
+@@ -40,7 +43,16 @@ Window {
+     color: "transparent"
+ 
+     // Set input to transparent when closing to prevent window from taking unwanted touch inputs
+-    onStateChanged: MobileShell.ShellUtil.setInputTransparent(window, state === "close")
++    onStateChanged: {
++        MobileShell.ShellUtil.setInputTransparent(window, state === "close");
++        if (state === "close" && keyboardFocus) {
++            // the input panel goes with the drawer, not only once the closed drawer is hidden
++            if (window.active) {
++                Qt.inputMethod.hide();
++            }
++            keyboardFocus = false;
++        }
++    }
+ 
+     // Preload and render content to avoid lag on first open
+     Component.onCompleted: {
+@@ -59,6 +71,8 @@ Window {
+     onVisibleChanged: {
+         if (visible) {
+             window.raise();
++        } else {
++            keyboardFocus = false;
+         }
+     }
+ 
+@@ -71,5 +85,11 @@ Window {
+     ActionDrawer {
+         id: drawer
+         anchors.fill: parent
++
++        onKeyboardFocusRequested: {
++            if (window.visible && drawer.state !== "close") {
++                window.keyboardFocus = true;
++            }
++        }
+     }
+ }
+diff --git a/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml b/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml
+index 974ef5380..e34d78809 100644
+--- a/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml
++++ b/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml
+@@ -55,7 +55,10 @@ Item {
+         historyModelType: actionDrawer.notificationModelType
+         notificationSettings: actionDrawer.notificationSettings
+         actionsRequireUnlock: actionDrawer.restrictedPermissions
++        // the drawer gets no keyboard input while the screen is locked
++        replyRequiresUnlock: actionDrawer.restrictedPermissions
+         onUnlockRequested: actionDrawer.permissionsRequested()
++        onKeyboardFocusRequested: actionDrawer.keyboardFocusRequested()
+         topPadding: root.topPadding
+         showHeader: actionDrawer.mode != MobileShell.ActionDrawer.Portrait
+         listView.interactive: !actionDrawer.dragging && root.listOverflowing
+diff --git a/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml b/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
+index 38238de9c..4eac92b16 100644
+--- a/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
++++ b/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
+@@ -32,6 +32,13 @@ Item {
+      */
+     property bool requestToInvoke: false
+ 
++    /**
++     * Whether a reply can only be typed after an unlock, because the window cannot take keyboard input
++     * before (ex. the action drawer over the lockscreen). Starting a reply then goes through
++     * runActionRequested() like an action, the reply field opens after the unlock.
++     */
++    property bool replyRequiresUnlock: false
++
+     property var model
+     property int modelIndex
+ 
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml b/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml
+index 26d867b39..7a9c32cde 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml
+@@ -26,6 +26,14 @@ Item {
+ 
+     signal takeFocus()
+ 
++    function requestReply() {
++        if (notification.replyRequiresUnlock) {
++            notification.invokeOrRequest(() => replyLoader.beginReply());
++        } else {
++            replyLoader.beginReply();
++        }
++    }
++
+     Flow {
+         id: actionFlow
+         width: parent.width
+@@ -72,7 +80,7 @@ Item {
+ 
+                 onClicked: {
+                     if (modelData.actionName === "inline-reply") {
+-                        replyLoader.beginReply();
++                        actionContainer.requestReply();
+                         return;
+                     }
+                     notificationItem.actionInvoked(modelData.actionName);
+@@ -121,7 +129,7 @@ Item {
+             onReplied: notificationItem.replied(text)
+ 
+             replying: replyLoader.replying
+-            onBeginReplyRequested: replyLoader.beginReply()
++            onBeginReplyRequested: actionContainer.requestReply()
+         }
+     }
+ }
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationReplyField.qml b/components/mobileshell/qml/widgets/notifications/NotificationReplyField.qml
+index b88132807..3dc51891d 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationReplyField.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationReplyField.qml
+@@ -7,6 +7,7 @@
+ 
+ import QtQuick 2.8
+ import QtQuick.Layouts 1.1
++import QtQuick.Window
+ 
+ import org.kde.kirigami as Kirigami
+ import org.kde.plasma.components 3.0 as PlasmaComponents3
+@@ -28,23 +29,35 @@ RowLayout {
+ 
+     function activate() {
+         replyTextField.forceActiveFocus();
++        if (replyTextField.activeFocus) {
++            Qt.inputMethod.show();
++        }
+     }
+ 
+     PlasmaComponents3.TextField {
+         id: replyTextField
+         Layout.fillWidth: true
+         placeholderText: replyRow.placeholderText || i18nc("Text field placeholder", "Type a reply…")
++
++        // A window that only accepts keyboard input after the reply started gets active focus later,
++        // when the compositor has activated it; the input panel can only be requested from then on.
++        onActiveFocusChanged: {
++            if (activeFocus && replyRow.replying) {
++                Qt.inputMethod.show();
++            }
++        }
+         onAccepted: {
+             if (replyButton.enabled) {
+                 replyRow.replied(text);
+             }
+         }
+ 
+-        // Catches mouse click when reply field is already shown to start a reply
++        // Catches mouse click when reply field is already shown to start a reply,
++        // also when the window lost the keyboard focus during a reply (it may need to ask for it again)
+         MouseArea {
+             anchors.fill: parent
+             cursorShape: Qt.IBeamCursor
+-            visible: !replyRow.replying
++            visible: !replyRow.replying || !replyRow.Window.active
+             onPressed: replyRow.beginReplyRequested()
+         }
+     }
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+index 114236261..d6c3cd0fd 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+@@ -112,6 +112,17 @@ Item {
+      */
+     signal unlockRequested()
+ 
++    /**
++     * Whether replies can only be typed after an unlock (ex. the action drawer over the lockscreen).
++     * Starting a reply then emits unlockRequested() and opens the reply field after runPendingAction().
++     */
++    property bool replyRequiresUnlock: false
++
++    /**
++     * Signal emitted when a notification needs keyboard input, for example for an inline reply.
++     */
++    signal keyboardFocusRequested()
++
+     /**
+      * Run pending action that was pending for authentication when unlockRequested() was emitted.
+      */
+@@ -392,6 +403,8 @@ Item {
+                         clockSource: clock
+ 
+                         requestToInvoke: root.actionsRequireUnlock
++                        replyRequiresUnlock: root.replyRequiresUnlock
++                        onTakeFocus: root.keyboardFocusRequested()
+                         onRunActionRequested: {
+                             list.pendingNotificationWithAction = notificationItem;
+                             root.unlockRequested();
