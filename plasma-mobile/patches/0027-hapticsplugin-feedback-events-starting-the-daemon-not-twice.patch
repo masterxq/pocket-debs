@@ -1,0 +1,179 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 18:10:00 +0100
+Subject: [PATCH] hapticsplugin: feedback events that start the daemon are not triggered twice
+Description:
+ feedbackd is started by D-Bus activation: the first event after a start
+ of the session (or of the daemon) starts it. The registration of the
+ daemon was taken as its restart, and every event without a reply yet was
+ triggered again. The daemon then got the same event twice; the second
+ one was dropped as long as the first one occupied the vibration motor,
+ and the reply to the first one, now outdated, ended it. An incoming call
+ that started the daemon neither vibrated nor showed anything on the LED,
+ and the first notification lost its feedback the same way.
+ .
+ Only events that the previous daemon had accepted are triggered again.
+ Triggering a key with the event that is running for it keeps that event.
+ An event that replaces one whose reply is still pending is sent after
+ the previous one was ended, so that the daemon does not see both at the
+ same time.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/components/hapticsplugin/feedbackevents.cpp b/components/hapticsplugin/feedbackevents.cpp
+index 02310f63d..b051a1a7a 100644
+--- a/components/hapticsplugin/feedbackevents.cpp
++++ b/components/hapticsplugin/feedbackevents.cpp
+@@ -26,7 +26,25 @@ FeedbackEvents::FeedbackEvents(QObject *parent)
+ 
+ void FeedbackEvents::trigger(const QString &key, const QString &appId, const QString &event, const QVariantMap &hints, int timeout)
+ {
+-    end(key);
++    quint64 waitFor = 0;
++    const auto it = m_events.constFind(key);
++    if (it != m_events.constEnd()) {
++        // The same event of the key is still running: let it run on instead of restarting it
++        if (it->appId == appId && it->event == event && it->hints == hints && it->timeout == timeout) {
++            return;
++        }
++        if (it->pending) {
++            // Its id is not known yet. The daemon would get this event before the end of the previous one
++            // and could drop it as long as the previous one occupies a device: start it once the previous
++            // one has been ended.
++            waitFor = it->serial;
++        } else if (it->waitFor) {
++            waitFor = it->waitFor;
++        } else if (it->id) {
++            endId(it->id);
++        }
++        m_events.erase(it);
++    }
+ 
+     Event e;
+     e.appId = appId;
+@@ -34,13 +52,20 @@ void FeedbackEvents::trigger(const QString &key, const QString &appId, const QSt
+     e.hints = hints;
+     e.timeout = timeout;
+     e.serial = ++m_serial;
++    e.waitFor = waitFor;
+     m_events.insert(key, e);
+-    send(key);
++    if (!waitFor) {
++        send(key);
++    }
+ }
+ 
+ void FeedbackEvents::send(const QString &key)
+ {
+-    const Event &e = m_events.value(key);
++    Event &e = m_events[key];
++    e.serial = ++m_serial;
++    e.id = 0;
++    e.pending = true;
++    e.waitFor = 0;
+     const quint64 serial = e.serial;
+ 
+     QDBusMessage msg = QDBusMessage::createMethodCall(s_service, s_path, s_interface, u"TriggerFeedback"_s);
+@@ -50,19 +75,30 @@ void FeedbackEvents::send(const QString &key)
+     connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, key, serial](QDBusPendingCallWatcher *watcher) {
+         watcher->deleteLater();
+         const QDBusPendingReply<uint> reply = *watcher;
++        auto it = m_events.find(key);
++        const bool current = it != m_events.end() && it->serial == serial;
+         if (reply.isError()) {
+-            if (m_events.value(key).serial == serial) {
+-                m_events.remove(key);
++            if (current) {
++                if (it->timeout == 0) {
++                    // triggered again when the daemon appears
++                    it->pending = false;
++                } else {
++                    m_events.erase(it);
++                }
+             }
+-            return;
+-        }
+-        auto it = m_events.find(key);
+-        if (it == m_events.end() || it->serial != serial) {
++        } else if (current) {
++            it->pending = false;
++            it->id = reply.value();
++        } else {
+             // ended or replaced while the call was pending
+             endId(reply.value());
+-            return;
+         }
+-        it->id = reply.value();
++
++        // the event that replaced this one waited for its end
++        it = m_events.find(key);
++        if (it != m_events.end() && it->waitFor == serial) {
++            send(key);
++        }
+     });
+ }
+ 
+@@ -72,7 +108,8 @@ void FeedbackEvents::end(const QString &key)
+     if (it == m_events.constEnd()) {
+         return;
+     }
+-    const uint id = it->id;
++    // a pending event is ended when its id arrives, a waiting one was never sent
++    const uint id = it->pending ? 0 : it->id;
+     m_events.erase(it);
+     if (id) {
+         endId(id);
+@@ -104,16 +141,19 @@ void FeedbackEvents::onFeedbackEnded(uint id, uint reason)
+ 
+ void FeedbackEvents::onDaemonRestarted()
+ {
+-    // The events of the previous daemon are gone; endless ones come back
++    // The events of the previous daemon are gone; endless ones come back. Events whose call is
++    // still pending or not sent yet reach the new daemon anyway: the daemon is activated by the
++    // first call to it, which must not be triggered a second time.
+     const QStringList keys = m_events.keys();
+     for (const QString &key : keys) {
+-        Event &e = m_events[key];
++        const Event &e = m_events[key];
++        if (e.pending || e.waitFor) {
++            continue;
++        }
+         if (e.timeout != 0) {
+             m_events.remove(key);
+             continue;
+         }
+-        e.id = 0;
+-        e.serial = ++m_serial;
+         send(key);
+     }
+ }
+diff --git a/components/hapticsplugin/feedbackevents.h b/components/hapticsplugin/feedbackevents.h
+index 64bd9734a..b5adbb5b9 100644
+--- a/components/hapticsplugin/feedbackevents.h
++++ b/components/hapticsplugin/feedbackevents.h
+@@ -14,9 +14,10 @@ class QDBusServiceWatcher;
+  * Events for the feedback daemon (feedbackd, org.sigxcpu.Feedback).
+  *
+  * Each event is triggered under a key chosen by the caller. Triggering a
+- * key again ends the previous event of that key, end() ends it. Events
+- * without a timeout (0) are triggered again when the daemon restarts.
+- * Without the daemon nothing happens.
++ * key with another event ends the previous event of that key first, the
++ * same event again keeps the running one; end() ends it. Events without
++ * a timeout (0) are triggered again when the daemon restarts. Without the
++ * daemon nothing happens.
+  */
+ class FeedbackEvents : public QObject
+ {
+@@ -51,7 +52,9 @@ private:
+         QVariantMap hints;
+         int timeout = -1;
+         quint64 serial = 0;
+-        uint id = 0; // 0 while the reply of the daemon is pending
++        uint id = 0; // the id of the daemon, once the reply arrived
++        bool pending = false; // the reply of the daemon is outstanding
++        quint64 waitFor = 0; // sent when the pending call with this serial has been answered
+     };
+ 
+     void send(const QString &key);
