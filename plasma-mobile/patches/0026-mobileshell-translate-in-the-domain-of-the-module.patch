@@ -1,0 +1,363 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 14:30:00 +0100
+Subject: [PATCH] mobileshell: translate in the domain of the module
+Description:
+ The QML of the mobileshell module called i18n() without a domain, which
+ translates in the domain of the engine that loads it (plasmashell, the
+ lock screen greeter), not in plasma_org.kde.plasma.private.mobileshell
+ where these strings are translated; "Show N More" and "Clear All
+ Notifications" in the action drawer stayed in English. The calls name
+ the domain of the module now.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later, GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL, LGPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/components/mobileshell/qml/actiondrawer/private/ContentContainer.qml b/components/mobileshell/qml/actiondrawer/private/ContentContainer.qml
+index aef9d156d..c2874bb4a 100644
+--- a/components/mobileshell/qml/actiondrawer/private/ContentContainer.qml
++++ b/components/mobileshell/qml/actiondrawer/private/ContentContainer.qml
+@@ -148,7 +148,7 @@ Item {
+                     font.pointSize: Kirigami.Theme.smallFont.pointSize
+ 
+                     icon.name: "edit-clear-history"
+-                    text: i18n("Clear All Notifications")
++                    text: i18nd("plasma_org.kde.plasma.private.mobileshell", "Clear All Notifications")
+                     onClicked: notificationDrawer.notificationWidget.clearHistory()
+                 }
+             }
+diff --git a/components/mobileshell/qml/actiondrawer/private/QuickSettingsFullDelegate.qml b/components/mobileshell/qml/actiondrawer/private/QuickSettingsFullDelegate.qml
+index 5a8b16033..6472892ab 100644
+--- a/components/mobileshell/qml/actiondrawer/private/QuickSettingsFullDelegate.qml
++++ b/components/mobileshell/qml/actiondrawer/private/QuickSettingsFullDelegate.qml
+@@ -99,7 +99,7 @@ QuickSettingsDelegate {
+             MobileShell.MarqueeLabel {
+                 scrollingEnabled: root.animationsEnabled
+                 // if no status is given, just use On/Off
+-                inputText: root.status ? root.status : (root.enabled ? i18n("On") : i18n("Off"))
++                inputText: root.status ? root.status : (root.enabled ? i18nd("plasma_org.kde.plasma.private.mobileshell", "On") : i18nd("plasma_org.kde.plasma.private.mobileshell", "Off"))
+                 opacity: 0.6
+ 
+                 Layout.fillWidth: true
+diff --git a/components/mobileshell/qml/dataproviders/SignalStrengthInfo.qml b/components/mobileshell/qml/dataproviders/SignalStrengthInfo.qml
+index 8cbaf30ee..c4467884a 100644
+--- a/components/mobileshell/qml/dataproviders/SignalStrengthInfo.qml
++++ b/components/mobileshell/qml/dataproviders/SignalStrengthInfo.qml
+@@ -19,7 +19,7 @@ QtObject {
+ 
+     function _label(modem) {
+         if (!modem) return "";
+-        if (modem.simLocked) return i18n("SIM Locked");
++        if (modem.simLocked) return i18nd("plasma_org.kde.plasma.private.mobileshell", "SIM Locked");
+         return modem.operatorName;
+     }
+ 
+diff --git a/components/mobileshell/qml/popups/volumeosd/AudioApplet.qml b/components/mobileshell/qml/popups/volumeosd/AudioApplet.qml
+index 30cedf637..6a9776af0 100644
+--- a/components/mobileshell/qml/popups/volumeosd/AudioApplet.qml
++++ b/components/mobileshell/qml/popups/volumeosd/AudioApplet.qml
+@@ -86,7 +86,7 @@ ColumnLayout {
+ 
+             Kirigami.Heading {
+                 level: 2
+-                text: i18n("Output Devices")
++                text: i18nd("plasma_org.kde.plasma.private.mobileshell", "Output Devices")
+                 wrapMode: Text.Wrap
+                 Layout.fillWidth: true
+             }
+@@ -115,7 +115,7 @@ ColumnLayout {
+ 
+             Kirigami.Heading {
+                 level: 2
+-                text: i18n("Input Devices")
++                text: i18nd("plasma_org.kde.plasma.private.mobileshell", "Input Devices")
+                 wrapMode: Text.Wrap
+                 Layout.fillWidth: true
+             }
+@@ -145,7 +145,7 @@ ColumnLayout {
+ 
+             Kirigami.Heading {
+                 level: 2
+-                text: i18n("Playback Streams")
++                text: i18nd("plasma_org.kde.plasma.private.mobileshell", "Playback Streams")
+                 wrapMode: Text.Wrap
+                 Layout.fillWidth: true
+             }
+@@ -196,7 +196,7 @@ ColumnLayout {
+ 
+             Kirigami.Heading {
+                 level: 2
+-                text: i18n("Recording Streams")
++                text: i18nd("plasma_org.kde.plasma.private.mobileshell", "Recording Streams")
+                 wrapMode: Text.Wrap
+                 Layout.fillWidth: true
+             }
+diff --git a/components/mobileshell/qml/popups/volumeosd/DeviceListItem.qml b/components/mobileshell/qml/popups/volumeosd/DeviceListItem.qml
+index d296451b5..10d8eaa23 100644
+--- a/components/mobileshell/qml/popups/volumeosd/DeviceListItem.qml
++++ b/components/mobileshell/qml/popups/volumeosd/DeviceListItem.qml
+@@ -21,7 +21,7 @@ ListItemBase {
+             if (onlyOne || !model.Description) {
+                 return currentPort.description;
+             } else {
+-                return i18nc("label of device items", "%1 (%2)", currentPort.description, model.Description);
++                return i18ndc("plasma_org.kde.plasma.private.mobileshell", "label of device items", "%1 (%2)", currentPort.description, model.Description);
+             }
+         }
+         if (model.Description) {
+@@ -30,6 +30,6 @@ ListItemBase {
+         if (model.Name) {
+             return model.Name;
+         }
+-        return i18n("Device name not found");
++        return i18nd("plasma_org.kde.plasma.private.mobileshell", "Device name not found");
+     }
+ }
+diff --git a/components/mobileshell/qml/popups/volumeosd/ListItemBase.qml b/components/mobileshell/qml/popups/volumeosd/ListItemBase.qml
+index 1f84f4c2a..4a38cb300 100644
+--- a/components/mobileshell/qml/popups/volumeosd/ListItemBase.qml
++++ b/components/mobileshell/qml/popups/volumeosd/ListItemBase.qml
+@@ -120,7 +120,7 @@ Controls.AbstractButton {
+                         contextMenu.openRelative();
+                     }
+                     PlasmaComponents.ToolTip {
+-                        text: i18n("Show additional options for %1", baseItem.label)
++                        text: i18nd("plasma_org.kde.plasma.private.mobileshell", "Show additional options for %1", baseItem.label)
+                     }
+ 
+                     ListItemMenu {
+@@ -212,7 +212,7 @@ Controls.AbstractButton {
+                     Layout.alignment: Qt.AlignHCenter
+                     Layout.minimumWidth: percentMetrics.advanceWidth
+                     horizontalAlignment: Qt.AlignRight
+-                    text: i18nc("volume percentage", "%1%", displayValue)
++                    text: i18ndc("plasma_org.kde.plasma.private.mobileshell", "volume percentage", "%1%", displayValue)
+                     color: {
+                         if (displayValue <= 100) {
+                             return Kirigami.Theme.textColor
+@@ -227,7 +227,7 @@ Controls.AbstractButton {
+                 TextMetrics {
+                     id: percentMetrics
+                     font: percentText.font
+-                    text: i18nc("only used for sizing, should be widest possible string", "100%")
++                    text: i18ndc("plasma_org.kde.plasma.private.mobileshell", "only used for sizing, should be widest possible string", "100%")
+                 }
+             }
+         }
+diff --git a/components/mobileshell/qml/popups/volumeosd/StreamListItem.qml b/components/mobileshell/qml/popups/volumeosd/StreamListItem.qml
+index f066e6c44..81a6181ef 100644
+--- a/components/mobileshell/qml/popups/volumeosd/StreamListItem.qml
++++ b/components/mobileshell/qml/popups/volumeosd/StreamListItem.qml
+@@ -18,15 +18,15 @@ ListItemBase {
+ 
+     label: {
+         if (isEventStream) {
+-            return i18n("Notification Sounds");
++            return i18nd("plasma_org.kde.plasma.private.mobileshell", "Notification Sounds");
+         }
+         if (Client && Client.name) {
+-            return i18nc("label of stream items", "%1: %2", Client.name, Name);
++            return i18ndc("plasma_org.kde.plasma.private.mobileshell", "label of stream items", "%1: %2", Client.name, Name);
+         }
+         if (Name) {
+             return Name;
+         }
+-        return i18n("Stream name not found");
++        return i18nd("plasma_org.kde.plasma.private.mobileshell", "Stream name not found");
+     }
+ 
+     listIcon: {
+diff --git a/components/mobileshell/qml/popups/volumeosd/VolumeChangedPopup.qml b/components/mobileshell/qml/popups/volumeosd/VolumeChangedPopup.qml
+index ab77a2793..8cff48a86 100644
+--- a/components/mobileshell/qml/popups/volumeosd/VolumeChangedPopup.qml
++++ b/components/mobileshell/qml/popups/volumeosd/VolumeChangedPopup.qml
+@@ -158,7 +158,7 @@ Window {
+ 
+                 PlasmaComponents.ToolButton {
+                     icon.name: !PreferredDevice.sink || (PreferredDevice.sink.muted ? "audio-volume-muted" : MobileShell.AudioInfo.icon)
+-                    text: !PreferredDevice.sink || (PreferredDevice.sink.muted ? i18n("Unmute") : i18n("Mute"))
++                    text: !PreferredDevice.sink || (PreferredDevice.sink.muted ? i18nd("plasma_org.kde.plasma.private.mobileshell", "Unmute") : i18nd("plasma_org.kde.plasma.private.mobileshell", "Mute"))
+                     display: Controls.AbstractButton.IconOnly
+                     Layout.alignment: Qt.AlignVCenter
+                     Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+@@ -207,7 +207,7 @@ Window {
+ 
+                 PlasmaComponents.ToolButton {
+                     icon.name: window.showFullApplet ? "arrow-up" : "arrow-down"
+-                    text: i18n("configure audio streams")
++                    text: i18nd("plasma_org.kde.plasma.private.mobileshell", "configure audio streams")
+                     display: Controls.AbstractButton.IconOnly
+                     Layout.alignment: Qt.AlignVCenter
+                     Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+diff --git a/components/mobileshell/qml/popups/volumeosd/VolumeOSD.qml b/components/mobileshell/qml/popups/volumeosd/VolumeOSD.qml
+index 3e78b46ad..331e3eabc 100644
+--- a/components/mobileshell/qml/popups/volumeosd/VolumeOSD.qml
++++ b/components/mobileshell/qml/popups/volumeosd/VolumeOSD.qml
+@@ -197,7 +197,7 @@ Window {
+                                     source:  "settings-configure"
+                                 }
+                                 PlasmaComponents.Label {
+-                                    text: i18n("Open audio settings")
++                                    text: i18nd("plasma_org.kde.plasma.private.mobileshell", "Open audio settings")
+                                     anchors.verticalCenter: parent.verticalCenter
+                                 }
+                             }
+diff --git a/components/mobileshell/qml/statusbar/indicators/BatteryIndicator.qml b/components/mobileshell/qml/statusbar/indicators/BatteryIndicator.qml
+index 66aff7c60..5c1a98472 100644
+--- a/components/mobileshell/qml/statusbar/indicators/BatteryIndicator.qml
++++ b/components/mobileshell/qml/statusbar/indicators/BatteryIndicator.qml
+@@ -65,7 +65,7 @@ RowLayout {
+ 
+             PlasmaComponents.Label {
+                 id: batteryLabel
+-                text: i18n("%1%", Percent)
++                text: i18nd("plasma_org.kde.plasma.private.mobileshell", "%1%", Percent)
+                 Layout.alignment: Qt.AlignVCenter
+                 Layout.fillHeight: true
+ 
+diff --git a/components/mobileshell/qml/widgets/krunner/KRunnerScreen.qml b/components/mobileshell/qml/widgets/krunner/KRunnerScreen.qml
+index 65320b3f4..dc883fe75 100644
+--- a/components/mobileshell/qml/widgets/krunner/KRunnerScreen.qml
++++ b/components/mobileshell/qml/widgets/krunner/KRunnerScreen.qml
+@@ -65,7 +65,7 @@ MouseArea {
+             topPadding: Kirigami.Units.largeSpacing + Kirigami.Units.smallSpacing
+             bottomPadding: Kirigami.Units.largeSpacing + Kirigami.Units.smallSpacing
+ 
+-            placeholderText: i18nc("@info:placeholder", "Search…")
++            placeholderText: i18ndc("plasma_org.kde.plasma.private.mobileshell", "@info:placeholder", "Search…")
+             placeholderTextColor: Qt.rgba(255, 255, 255, 0.8)
+             color: 'white'
+             inputMethodHints: Qt.ImhNoPredictiveText // don't need to press "enter" to update text
+diff --git a/components/mobileshell/qml/widgets/mediacontrols/MediaControlsWidget.qml b/components/mobileshell/qml/widgets/mediacontrols/MediaControlsWidget.qml
+index bb5408091..289493a0d 100644
+--- a/components/mobileshell/qml/widgets/mediacontrols/MediaControlsWidget.qml
++++ b/components/mobileshell/qml/widgets/mediacontrols/MediaControlsWidget.qml
+@@ -169,7 +169,7 @@ Item {
+                                         id: trackLabel
+                                         Layout.fillWidth: true
+ 
+-                                        inputText: model.track || i18n("No media playing");
++                                        inputText: model.track || i18nd("plasma_org.kde.plasma.private.mobileshell", "No media playing");
+                                         textFormat: Text.PlainText
+                                         font.pointSize: Kirigami.Theme.defaultFont.pointSize
+                                     }
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml b/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml
+index 7a9c32cde..9dfd70f4e 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationFooterActions.qml
+@@ -67,7 +67,7 @@ Item {
+                 if (notificationItem.hasReplyAction) {
+                     buttons.unshift({
+                         actionName: "inline-reply",
+-                        label: notificationItem.replyActionLabel || i18nc("Reply to message", "Reply")
++                        label: notificationItem.replyActionLabel || i18ndc("plasma_org.kde.plasma.private.mobileshell", "Reply to message", "Reply")
+                     });
+                 }
+ 
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationReplyField.qml b/components/mobileshell/qml/widgets/notifications/NotificationReplyField.qml
+index 3dc51891d..d56d77ee5 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationReplyField.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationReplyField.qml
+@@ -37,7 +37,7 @@ RowLayout {
+     PlasmaComponents3.TextField {
+         id: replyTextField
+         Layout.fillWidth: true
+-        placeholderText: replyRow.placeholderText || i18nc("Text field placeholder", "Type a reply…")
++        placeholderText: replyRow.placeholderText || i18ndc("plasma_org.kde.plasma.private.mobileshell", "Text field placeholder", "Type a reply…")
+ 
+         // A window that only accepts keyboard input after the reply started gets active focus later,
+         // when the compositor has activated it; the input panel can only be requested from then on.
+@@ -65,7 +65,7 @@ RowLayout {
+     PlasmaComponents3.Button {
+         id: replyButton
+         icon.name: replyRow.buttonIconName || "document-send"
+-        text: replyRow.buttonText || i18nc("@action:button", "Send")
++        text: replyRow.buttonText || i18ndc("plasma_org.kde.plasma.private.mobileshell", "@action:button", "Send")
+         enabled: replyTextField.length > 0
+         onClicked: replyRow.replied(replyTextField.text)
+     }
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationsUtils.js b/components/mobileshell/qml/widgets/notifications/NotificationsUtils.js
+index 490934255..086eff7e1 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationsUtils.js
++++ b/components/mobileshell/qml/widgets/notifications/NotificationsUtils.js
+@@ -12,14 +12,14 @@ function determineNotificationHeadingText(notificationItem) {
+     if (notificationItem.notificationType === NotificationManager.Notifications.JobType) {
+         if (notificationItem.jobState === NotificationManager.Notifications.JobStateSuspended) {
+             if (notificationItem.summary) {
+-                return i18nc("Job name, e.g. Copying is paused", "%1 (Paused)", notificationItem.summary);
++                return i18ndc("plasma_org.kde.plasma.private.mobileshell", "Job name, e.g. Copying is paused", "%1 (Paused)", notificationItem.summary);
+             }
+         } else if (notificationItem.jobState === NotificationManager.Notifications.JobStateStopped) {
+             if (notificationItem.jobError) {
+                 if (notificationItem.summary) {
+-                    return i18nc("Job name, e.g. Copying has failed", "%1 (Failed)", notificationItem.summary);
++                    return i18ndc("plasma_org.kde.plasma.private.mobileshell", "Job name, e.g. Copying has failed", "%1 (Failed)", notificationItem.summary);
+                 } else {
+-                    return i18n("Job Failed");
++                    return i18nd("plasma_org.kde.plasma.private.mobileshell", "Job Failed");
+                 }
+             } else if (notificationItem.summary) {
+                 return i18ndc("plasma_applet_org.kde.plasma.notifications", "Job name, e.g. Copying has finished", "%1 (Finished)", notificationItem.summary);
+@@ -80,13 +80,13 @@ function generateNotificationHeaderRemainingText(notificationType, jobState, job
+     }
+ 
+     if (eta < 60) { // 1 minute
+-        return i18nc("seconds remaining, keep short", "%1 s remaining", Math.round(eta));
++        return i18ndc("plasma_org.kde.plasma.private.mobileshell", "seconds remaining, keep short", "%1 s remaining", Math.round(eta));
+     }
+     if (eta < 60 * 60) {// 1 hour
+-        return i18nc("minutes remaining, keep short", "%1m remaining", Math.round(eta / 60));
++        return i18ndc("plasma_org.kde.plasma.private.mobileshell", "minutes remaining, keep short", "%1m remaining", Math.round(eta / 60));
+     }
+     if (eta < 60 * 60 * 5) { // 5 hours max, if it takes even longer there's no real point in showing that
+-        return i18nc("hours remaining, keep short", "%1h remaining", Math.round(eta / 60 / 60));
++        return i18ndc("plasma_org.kde.plasma.private.mobileshell", "hours remaining, keep short", "%1h remaining", Math.round(eta / 60 / 60));
+     }
+ 
+     return "";
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+index 6e5254965..97e7ecf46 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+@@ -419,7 +419,7 @@ Item {
+             anchors.centerIn: parent
+             width: parent.width - (Kirigami.Units.gridUnit * 4)
+ 
+-            text: i18n("Notification service not available")
++            text: i18nd("plasma_org.kde.plasma.private.mobileshell", "Notification service not available")
+             // the lock screen is not the server, it mirrors the notifications of the shell
+             visible: list.count === 0 && !root.inLockScreen && !NotificationManager.Server.valid && historyModelType === NotificationsModelType.NotificationsModel
+ 
+@@ -429,7 +429,7 @@ Item {
+                 // PlasmaExtras.PlaceholderMessage is internally a ColumnLayout, so we can use Layout.whatever properties here
+                 Layout.fillWidth: true
+                 wrapMode: Text.WordWrap
+-                text: currentOwner ? i18nc("Vendor and product name", "Notifications are currently provided by '%1 %2'", currentOwner.vendor, currentOwner.name) : ""
++                text: currentOwner ? i18ndc("plasma_org.kde.plasma.private.mobileshell", "Vendor and product name", "Notifications are currently provided by '%1 %2'", currentOwner.vendor, currentOwner.name) : ""
+                 visible: currentOwner && currentOwner.vendor && currentOwner.name
+             }
+         }
+@@ -618,8 +618,8 @@ Item {
+ 
+                         sourceComponent: PlasmaComponents3.ToolButton {
+                             icon.name: model.isGroupExpanded ? "arrow-up" : "arrow-down"
+-                            text: model.isGroupExpanded ? i18n("Show Fewer")
+-                            : i18nc("Expand to show n more notifications",
++                            text: model.isGroupExpanded ? i18nd("plasma_org.kde.plasma.private.mobileshell", "Show Fewer")
++                            : i18ndc("plasma_org.kde.plasma.private.mobileshell", "Expand to show n more notifications",
+                                     "Show %1 More", (model.groupChildrenCount - model.expandedGroupChildrenCount))
+                             onClicked: {
+                                 list.setGroupExpanded(model.index, !model.isGroupExpanded)
+diff --git a/components/mobileshell/qml/widgets/notifications/ThumbnailStrip.qml b/components/mobileshell/qml/widgets/notifications/ThumbnailStrip.qml
+index 891259126..5a24820e3 100644
+--- a/components/mobileshell/qml/widgets/notifications/ThumbnailStrip.qml
++++ b/components/mobileshell/qml/widgets/notifications/ThumbnailStrip.qml
+@@ -131,7 +131,7 @@ MouseArea {
+ 
+             PlasmaComponents3.ToolTip {
+                 id: tooltip
+-                text: i18n("More Options…")
++                text: i18nd("plasma_org.kde.plasma.private.mobileshell", "More Options…")
+             }
+         }
+     }

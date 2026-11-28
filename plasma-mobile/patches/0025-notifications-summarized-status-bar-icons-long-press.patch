@@ -940,7 +940,7 @@ index 000000000..e8b42c805
 +    }
 +}
 diff --git a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
-index 361b81140..8741a6d40 100644
+index 361b81140..6e5254965 100644
 --- a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
 +++ b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
 @@ -97,6 +97,17 @@ Item {
@@ -1065,18 +1065,36 @@ index 361b81140..8741a6d40 100644
          function isRowExpanded(row) {
              var idx = historyModel.index(row, 0);
              return historyModel.data(idx, NotificationManager.Notifications.IsGroupExpandedRole);
-@@ -401,6 +490,10 @@ Item {
+@@ -401,6 +490,12 @@ Item {
              sourceComponent: model.isGroup ? groupDelegate : notificationDelegate
              asynchronous: true
  
-+            // left out in a fixed area
-+            visible: y < list.cutY
++            // Left out in a fixed area. Hidden through opacity, not visibility: the height of a card depends on its
++            // effective visibility (the heading of a single notification), and the fit is measured on these items.
++            readonly property bool cut: y >= list.cutY
++            enabled: !cut
 +            onHeightChanged: if (root.fixedArea) Qt.callLater(list.updateFit)
 +
              required property var model
              required property int index
  
-@@ -497,8 +590,12 @@ Item {
+@@ -417,6 +512,7 @@ Item {
+ 
+                 Column {
+                     spacing: Kirigami.Units.smallSpacing
++                    opacity: delegateLoader.cut ? 0 : 1
+ 
+                     height: headerSpace.height + groupHeader.height
+ 
+@@ -441,6 +537,7 @@ Item {
+ 
+                 Column {
+                     spacing: Kirigami.Units.smallSpacing
++                    opacity: delegateLoader.cut ? 0 : 1
+ 
+                     height: headerSpace.height + notificationItem.height + showMoreLoader.height
+ 
+@@ -497,8 +594,12 @@ Item {
                              if (typeof model.groupChildrenCount === 'undefined')
                                  return false;
  
