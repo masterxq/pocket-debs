@@ -1,0 +1,424 @@
+From: masterxq <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 10:00:00 +0100
+Subject: [PATCH] lockscreen: fingerprint icon shows whether a finger unlocks, reason in the keypad
+Description:
+ The lock screen showed the hints and errors of the fingerprint
+ authenticator as text above the fingerprint icon. The hint of
+ pam_fprintd names the enrolled finger ("Place your right index
+ finger ..."), which is wrong with several enrolled fingers and tells
+ others which finger to use. The icon itself disappeared whenever the
+ authenticator was not running, so a device with a reader could not
+ tell "not now" from "no reader".
+ .
+ A device preset can now say whether the device has a fingerprint
+ reader ([Lockscreen] fingerprintReader, applied by envmanager like the
+ panel settings; new preset for motorola,lisbon). With a reader the
+ lock screen always shows the fingerprint icon:
+ - no text above it;
+ - struck through while a finger does not unlock: the fingerprint
+   authenticator ran and stopped without unlocking (reported itself
+   unavailable or failed); it is plain again when it runs again;
+ - the icon shakes on a rejected finger (vibration as before);
+ - it stays in place when the keypad opens, above the scrim and below
+   the keypad;
+ - the keypad shows why a finger does not unlock: the last message of
+   the fingerprint authenticator if it stopped within a second after
+   it (PAM stacks can give the reason as their last message, e.g. a PIN
+   is needed first after a restart).
+ Without a reader the lock screen shows no fingerprint icon. Without
+ the setting the icon shows while the authenticator waits for a finger,
+ as before, but without the text.
+Author: masterxq
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/components/shellsettingsplugin/mobileshellsettings.cpp b/components/shellsettingsplugin/mobileshellsettings.cpp
+index 88beb01e4..c5bbd13bb 100644
+--- a/components/shellsettingsplugin/mobileshellsettings.cpp
++++ b/components/shellsettingsplugin/mobileshellsettings.cpp
+@@ -49,6 +49,7 @@ MobileShellSettings::MobileShellSettings(QObject *parent)
+         if (group.name() == LOCKSCREEN_CONFIG_GROUP) {
+             Q_EMIT lockscreenLeftButtonActionChanged();
+             Q_EMIT lockscreenRightButtonActionChanged();
++            Q_EMIT fingerprintReaderChanged();
+         }
+         if (group.name() == QUICKSETTINGS_CONFIG_GROUP) {
+             Q_EMIT quickSettingsColumnsChanged();
+@@ -325,3 +326,12 @@ void MobileShellSettings::setLockscreenRightButtonAction(const LockscreenButtonA
+     group.writeEntry("lockscreenRightButtonAction", (int)action, KConfigGroup::Notify);
+     m_config->sync();
+ }
++
++MobileShellSettings::FingerprintReader MobileShellSettings::fingerprintReader() const
++{
++    auto group = KConfigGroup{m_config, LOCKSCREEN_CONFIG_GROUP};
++    if (!group.hasKey("fingerprintReader")) {
++        return FingerprintReaderUnknown;
++    }
++    return group.readEntry("fingerprintReader", false) ? FingerprintReaderPresent : FingerprintReaderAbsent;
++}
+diff --git a/components/shellsettingsplugin/mobileshellsettings.h b/components/shellsettingsplugin/mobileshellsettings.h
+index 64be056bb..adb33d603 100644
+--- a/components/shellsettingsplugin/mobileshellsettings.h
++++ b/components/shellsettingsplugin/mobileshellsettings.h
+@@ -59,6 +59,9 @@ class MobileShellSettings : public QObject
+     Q_PROPERTY(LockscreenButtonAction lockscreenLeftButtonAction READ lockscreenLeftButtonAction WRITE setLockscreenLeftButtonAction NOTIFY lockscreenLeftButtonActionChanged)
+     Q_PROPERTY(LockscreenButtonAction lockscreenRightButtonAction READ lockscreenRightButtonAction WRITE setLockscreenRightButtonAction NOTIFY lockscreenRightButtonActionChanged)
+ 
++    // lockscreen fingerprint indicator, set by the device preset
++    Q_PROPERTY(FingerprintReader fingerprintReader READ fingerprintReader NOTIFY fingerprintReaderChanged)
++
+ public:
+     MobileShellSettings(QObject *parent = nullptr);
+ 
+@@ -76,6 +79,13 @@ public:
+     };
+     Q_ENUM(LockscreenButtonAction)
+ 
++    enum FingerprintReader {
++        FingerprintReaderUnknown, // not configured: the fingerprint icon shows while the screen locker waits for a finger
++        FingerprintReaderPresent, // the icon always shows, struck through while a finger does not unlock
++        FingerprintReaderAbsent // no fingerprint icon
++    };
++    Q_ENUM(FingerprintReader)
++
+     /**
+      * Get whether shell vibrations are enabled.
+      */
+@@ -293,6 +303,12 @@ public:
+      */
+     void setLockscreenRightButtonAction(LockscreenButtonAction action);
+ 
++    /**
++     * Whether the device has a fingerprint reader (key fingerprintReader in the group Lockscreen, true or false),
++     * set by the device preset (devices/spec.conf); unknown if the key is not set.
++     */
++    FingerprintReader fingerprintReader() const;
++
+ Q_SIGNALS:
+     void vibrationsEnabledChanged();
+     void vibrationDurationChanged();
+@@ -313,6 +329,7 @@ Q_SIGNALS:
+     void allowLogoutChanged();
+     void lockscreenLeftButtonActionChanged();
+     void lockscreenRightButtonActionChanged();
++    void fingerprintReaderChanged();
+ 
+ private:
+     void updateNavigationBarsInPlasma();
+diff --git a/devices/configs/motorola,lisbon.conf b/devices/configs/motorola,lisbon.conf
+new file mode 100644
+index 000000000..9e41a3018
+--- /dev/null
++++ b/devices/configs/motorola,lisbon.conf
+@@ -0,0 +1,8 @@
++# SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++# SPDX-License-Identifier: GPL-2.0-or-later
++
++[Device]
++name=Motorola Moto G60s
++
++[Lockscreen]
++fingerprintReader=true
+diff --git a/devices/spec.conf b/devices/spec.conf
+index 585f41ba9..5e98daa7f 100644
+--- a/devices/spec.conf
++++ b/devices/spec.conf
+@@ -5,6 +5,13 @@
+ # The name of the device.
+ name=My Phone
+ 
++# Lock screen
++[Lockscreen]
++# Whether the device has a fingerprint reader (true, false). With true the lock screen always shows the fingerprint
++# icon, struck through while a finger does not unlock, and the reason in the keypad; with false it shows no fingerprint
++# icon. If not set, the icon shows while the screen locker waits for a finger.
++fingerprintReader=
++
+ # Dimensions for a panel (fallback for any of the options below)
+ [Panels]
+ statusBarHeight=
+diff --git a/envmanager/devicepresets.cpp b/envmanager/devicepresets.cpp
+index ea29a96ef..030f3fc24 100644
+--- a/envmanager/devicepresets.cpp
++++ b/envmanager/devicepresets.cpp
+@@ -88,6 +88,11 @@ void DevicePresets::initialize()
+         writeGroup.sync();
+     }
+ 
++    // Lock screen
++    auto presetLockscreenGroup = KConfigGroup{presetConfig, u"Lockscreen"_s};
++    auto mobileLockscreenGroup = KConfigGroup{m_mobileConfig, u"Lockscreen"_s};
++    setKey(presetLockscreenGroup, presetLockscreenGroup, mobileLockscreenGroup, u"fingerprintReader"_s, u"fingerprintReader"_s);
++
+     m_mobileConfig->sync();
+ }
+ 
+diff --git a/shell/contents/lockscreen/BottomIconIndicator.qml b/shell/contents/lockscreen/BottomIconIndicator.qml
+index 78e6c78a2..b93942925 100644
+--- a/shell/contents/lockscreen/BottomIconIndicator.qml
++++ b/shell/contents/lockscreen/BottomIconIndicator.qml
+@@ -14,7 +14,7 @@ Loader {
+     property var lockScreenState
+ 
+     sourceComponent: {
+-        if (lockScreenState.isFingerprintSupported) {
++        if (lockScreenState.fingerprintIndicatorShown) {
+             return fingerprintIcon;
+         } else {
+             return scrollUpIcon;
+@@ -36,16 +36,62 @@ Loader {
+     Component {
+         id: fingerprintIcon
+ 
+-        Kirigami.Icon {
+-            source: 'fingerprint-symbolic'
++        // struck through while a finger does not unlock; shakes when a finger was not recognized
++        Item {
+             implicitWidth: Kirigami.Units.iconSizes.medium
+             implicitHeight: Kirigami.Units.iconSizes.medium
+ 
+             Kirigami.Theme.colorSet: Kirigami.Theme.Complementary
++            Kirigami.Theme.inherit: false
++
++            transform: Translate {
++                id: shakeOffset
++            }
++
++            Kirigami.Icon {
++                anchors.fill: parent
++                source: 'fingerprint-symbolic'
++            }
++
++            // the stroke over a darker band, which sets it off from the lines of the icon below
++            Rectangle {
++                visible: root.lockScreenState.fingerprintIndicatorStruck
++                anchors.centerIn: parent
++                width: strike.width + height - strike.height
++                height: strike.height * 3
++                radius: height / 2
++                rotation: -45
++                antialiasing: true
++                color: Qt.rgba(0, 0, 0, 0.5)
++            }
++
++            Rectangle {
++                id: strike
++                visible: root.lockScreenState.fingerprintIndicatorStruck
++                anchors.centerIn: parent
++                width: Math.round(parent.width * 1.3)
++                height: Math.max(2, Math.round(parent.width / 12))
++                radius: height / 2
++                rotation: -45
++                antialiasing: true
++                color: Kirigami.Theme.textColor
++            }
++
++            SequentialAnimation {
++                id: shakeAnimation
++                readonly property real distance: Kirigami.Units.smallSpacing * 2
++                NumberAnimation { target: shakeOffset; property: "x"; to: -shakeAnimation.distance; duration: 50 }
++                NumberAnimation { target: shakeOffset; property: "x"; to: shakeAnimation.distance; duration: 100 }
++                NumberAnimation { target: shakeOffset; property: "x"; to: -shakeAnimation.distance / 2; duration: 80 }
++                NumberAnimation { target: shakeOffset; property: "x"; to: 0; duration: 50 }
++            }
+ 
+-            anchors.horizontalCenter: parent.horizontalCenter
+-            anchors.bottom: parent.bottom
+-            anchors.bottomMargin: Kirigami.Units.gridUnit * 2 + flickable.position * 0.5
++            Connections {
++                target: root.lockScreenState
++                function onFingerprintFailed() {
++                    shakeAnimation.restart();
++                }
++            }
+         }
+     }
+ }
+diff --git a/shell/contents/lockscreen/Keypad.qml b/shell/contents/lockscreen/Keypad.qml
+index 7a435e050..9f2f5063c 100644
+--- a/shell/contents/lockscreen/Keypad.qml
++++ b/shell/contents/lockscreen/Keypad.qml
+@@ -130,6 +130,19 @@ Item {
+             }
+         }
+ 
++        // why a finger does not unlock now (e.g. the PIN is needed first after a restart)
++        Label {
++            id: fingerprintReasonLabel
++            Layout.alignment: Qt.AlignHCenter
++            Layout.maximumWidth: Kirigami.Units.gridUnit * 14
++            visible: text !== ""
++            text: root.lockScreenState.fingerprintReason
++            horizontalAlignment: Text.AlignHCenter
++            wrapMode: Text.WordWrap
++            color: 'white'
++            opacity: 0.8
++        }
++
+         // pin display and bar
+         PasswordBar {
+             id: passwordBar
+diff --git a/shell/contents/lockscreen/LockScreen.qml b/shell/contents/lockscreen/LockScreen.qml
+index 493c382cd..4dfaaf64c 100644
+--- a/shell/contents/lockscreen/LockScreen.qml
++++ b/shell/contents/lockscreen/LockScreen.qml
+@@ -161,43 +161,16 @@ Item {
+                 }
+             }
+ 
+-            // hint or error of the fingerprint reader, above the indicator icon
+-            PC3.Label {
+-                id: fingerprintMessage
+-                visible: text !== ""
+-                text: root.lockScreenState.fingerprintMessage
+-                opacity: Math.max(0, 1 - flickable.openFactor * 2)
+-                color: "white"
+-                horizontalAlignment: Text.AlignHCenter
+-                wrapMode: Text.WordWrap
+-                width: Math.min(parent.width - Kirigami.Units.gridUnit * 2, Kirigami.Units.gridUnit * 20)
+-
+-                anchors.bottom: scrollUpIconLoader.top
+-                anchors.bottomMargin: Kirigami.Units.largeSpacing
+-                anchors.horizontalCenter: parent.horizontalCenter
+-            }
+-
+             Connections {
+                 target: root.lockScreenState
+                 function onFingerprintFailed() {
+                     // a rejected finger is felt also while the display is off
+-                    if (ShellSettings.Settings.vibrationsEnabled) {
++                    if (ShellSettings.Settings.vibrationsEnabled && root.lockScreenState.fingerprintIndicatorShown) {
+                         HapticsPlugin.VibrationManager.vibrate(ShellSettings.Settings.vibrationDuration * 4);
+                     }
+                 }
+             }
+ 
+-            // scroll up icon
+-            BottomIconIndicator {
+-                id: scrollUpIconLoader
+-                lockScreenState: root.lockScreenState
+-                opacity: Math.max(0, 1 - flickable.openFactor * 2)
+-
+-                anchors.bottom: parent.bottom
+-                anchors.bottomMargin: Kirigami.Units.gridUnit + flickable.position * 0.1
+-                anchors.horizontalCenter: parent.horizontalCenter
+-            }
+-
+             Rectangle {
+                 id: keypadScrim
+                 anchors.fill: parent
+@@ -206,6 +179,19 @@ Item {
+                 color: Qt.rgba(0, 0, 0, 0.5)
+             }
+ 
++            // scroll up icon, or the fingerprint icon: that one stays in place over the scrim when the keypad opens
++            BottomIconIndicator {
++                id: scrollUpIconLoader
++                lockScreenState: root.lockScreenState
++                opacity: root.lockScreenState.fingerprintIndicatorShown ? 1 : Math.max(0, 1 - flickable.openFactor * 2)
++
++                anchors.bottom: parent.bottom
++                anchors.bottomMargin: root.lockScreenState.fingerprintIndicatorShown
++                    ? Kirigami.Units.gridUnit * 3
++                    : Kirigami.Units.gridUnit + flickable.position * 0.1
++                anchors.horizontalCenter: parent.horizontalCenter
++            }
++
+             MouseArea {
+                 // Disable "double tap to lock" to avoid accidental locking
+                 // when the keypad is open, and the user is typing their password.
+diff --git a/shell/contents/lockscreen/LockScreenState.qml b/shell/contents/lockscreen/LockScreenState.qml
+index 3de474e4d..88d6f945a 100644
+--- a/shell/contents/lockscreen/LockScreenState.qml
++++ b/shell/contents/lockscreen/LockScreenState.qml
+@@ -5,6 +5,7 @@ import QtQml
+ import QtQuick
+ 
+ import org.kde.kscreenlocker 1.0 as ScreenLocker
++import org.kde.plasma.private.mobileshell.shellsettingsplugin as ShellSettings
+ 
+ QtObject {
+     id: root
+@@ -36,13 +37,46 @@ QtObject {
+     // whether the device can log in with fingerprint
+     readonly property bool isFingerprintSupported: authenticator.authenticatorTypes & ScreenLocker.Authenticator.Fingerprint
+ 
+-    // last hint of the fingerprint authenticator (e.g. where to place the finger, or why only the PIN works now)
+-    property string fingerprintInfo: ""
++    // whether the device preset says that the device has a fingerprint reader
++    readonly property bool hasFingerprintReader: ShellSettings.Settings.fingerprintReader === ShellSettings.Settings.FingerprintReaderPresent
++
++    // whether the fingerprint icon shows: always on a device with a reader, never on a device without one, and
++    // without that configuration while the fingerprint authenticator waits for a finger
++    readonly property bool fingerprintIndicatorShown: {
++        switch (ShellSettings.Settings.fingerprintReader) {
++        case ShellSettings.Settings.FingerprintReaderPresent:
++            return true;
++        case ShellSettings.Settings.FingerprintReaderAbsent:
++            return false;
++        default:
++            return isFingerprintSupported;
++        }
++    }
++
++    // the fingerprint authenticator ran and stopped without unlocking (it reported itself unavailable or failed):
++    // a finger does not unlock until it runs again
++    property bool fingerprintStopped: false
+ 
+-    // last error of the fingerprint authenticator (e.g. finger not recognized), shown for a few seconds
+-    property string fingerprintError: ""
++    // why a finger does not unlock: the last message of the fingerprint authenticator if it stopped right after it
++    property string fingerprintStopReason: ""
+ 
+-    readonly property string fingerprintMessage: fingerprintError !== "" ? fingerprintError : fingerprintInfo
++    readonly property bool fingerprintIndicatorStruck: hasFingerprintReader && fingerprintStopped
++    readonly property string fingerprintReason: fingerprintIndicatorStruck ? fingerprintStopReason : ""
++
++    // last message of the fingerprint authenticator and when it came (ms since the epoch)
++    property string lastFingerprintMessage: ""
++    property double lastFingerprintMessageTime: 0
++
++    onIsFingerprintSupportedChanged: {
++        if (isFingerprintSupported) {
++            fingerprintStopped = false;
++            fingerprintStopReason = "";
++        } else if (!canBeUnlocked) {
++            fingerprintStopped = true;
++            // a message that came long before (e.g. where to place the finger) is not the reason
++            fingerprintStopReason = Date.now() - lastFingerprintMessageTime < 1000 ? lastFingerprintMessage : "";
++        }
++    }
+ 
+     // whether we are in keyboard mode (hiding the numpad)
+     property bool isKeyboardMode: false
+@@ -147,24 +181,20 @@ QtObject {
+         }
+     }
+ 
+-    property var fingerprintErrorTimer: Timer {
+-        interval: 3000
+-        onTriggered: root.fingerprintError = ""
+-    }
+-
+     property var connections: Connections {
+         target: authenticator
+ 
+         function onNoninteractiveInfo(what: int, authenticator: var): void {
+             if (what & ScreenLocker.Authenticator.Fingerprint) {
+-                root.fingerprintInfo = authenticator.infoMessage;
++                root.lastFingerprintMessage = authenticator.infoMessage;
++                root.lastFingerprintMessageTime = Date.now();
+             }
+         }
+ 
+         function onNoninteractiveError(what: int, authenticator: var): void {
+             if (what & ScreenLocker.Authenticator.Fingerprint) {
+-                root.fingerprintError = authenticator.errorMessage;
+-                root.fingerprintErrorTimer.restart();
++                root.lastFingerprintMessage = authenticator.errorMessage;
++                root.lastFingerprintMessageTime = Date.now();
+                 root.fingerprintFailed();
+             }
+         }
