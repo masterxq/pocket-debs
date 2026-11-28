@@ -1,0 +1,69 @@
+From: masterxq <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 12:00:00 +0100
+Subject: [PATCH] lockscreen: no fingerprint icon in the grace time
+Description:
+ After an automatic lock the greeter starts with a grace time, in which
+ kscreenlocker refuses to start the authenticators and any input
+ unlocks. A device with a fingerprint reader showed the fingerprint icon
+ then, though no finger is needed and none is checked. Show it once the
+ authenticators were started (state Authenticating, or the fingerprint
+ authenticator running); until then the lock screen shows the swipe
+ arrow as without a reader.
+Author: masterxq
+Forwarded: no
+License: GPL-2.0-or-later (as the patched file)
+Last-Update: 2026-11-28
+---
+diff --git a/shell/contents/lockscreen/LockScreenState.qml b/shell/contents/lockscreen/LockScreenState.qml
+index f5fa84435..5ad825d11 100644
+--- a/shell/contents/lockscreen/LockScreenState.qml
++++ b/shell/contents/lockscreen/LockScreenState.qml
+@@ -40,12 +40,16 @@ QtObject {
+     // whether the device preset says that the device has a fingerprint reader
+     readonly property bool hasFingerprintReader: ShellSettings.Settings.fingerprintReader === ShellSettings.Settings.FingerprintReaderPresent
+ 
+-    // whether the fingerprint icon shows: always on a device with a reader, never on a device without one, and
+-    // without that configuration while the fingerprint authenticator waits for a finger
++    // whether the authenticators were started; not yet in the grace time of an automatic lock, in which kscreenlocker
++    // refuses to start them and any input unlocks
++    property bool authenticationStarted: false
++
++    // whether the fingerprint icon shows: on a device with a reader once the authenticators were started, never on a
++    // device without one, and without that configuration while the fingerprint authenticator waits for a finger
+     readonly property bool fingerprintIndicatorShown: {
+         switch (ShellSettings.Settings.fingerprintReader) {
+         case ShellSettings.Settings.FingerprintReaderPresent:
+-            return true;
++            return authenticationStarted;
+         case ShellSettings.Settings.FingerprintReaderAbsent:
+             return false;
+         default:
+@@ -69,6 +73,7 @@ QtObject {
+ 
+     onIsFingerprintSupportedChanged: {
+         if (isFingerprintSupported) {
++            authenticationStarted = true;
+             fingerprintStopped = false;
+             fingerprintStopReason = "";
+         } else if (!canBeUnlocked) {
+@@ -96,6 +101,7 @@ QtObject {
+ 
+     Component.onCompleted: {
+         promptReady = authenticator.prompt !== "" || authenticator.promptForSecret !== "";
++        authenticationStarted = promptReady || authenticator.state === ScreenLocker.Authenticators.Authenticating;
+         if (!promptReady) {
+             authenticator.startAuthenticating();
+         }
+@@ -185,6 +191,12 @@ QtObject {
+     property var connections: Connections {
+         target: authenticator
+ 
++        function onStateChanged(): void {
++            if (authenticator.state === ScreenLocker.Authenticators.Authenticating) {
++                root.authenticationStarted = true;
++            }
++        }
++
+         function onNoninteractiveInfo(what: int, authenticator: var): void {
+             if (what & ScreenLocker.Authenticator.Fingerprint) {
+                 root.lastFingerprintMessage = authenticator.infoMessage;
