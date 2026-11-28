@@ -1,0 +1,120 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 12:23:05 +0100
+Subject: [PATCH] kcms/notifications: privacy of notifications on the lock screen, in popups and the history
+Description:
+ A section with how much notifications show on the lock screen, in
+ popups and in the history, and per application how much the lock screen
+ shows at most.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/kcms/notifications/ui/ApplicationConfiguration.qml b/kcms/notifications/ui/ApplicationConfiguration.qml
+index 1a9ae55663..440e40dacf 100644
+--- a/kcms/notifications/ui/ApplicationConfiguration.qml
++++ b/kcms/notifications/ui/ApplicationConfiguration.qml
+@@ -128,6 +128,27 @@ ColumnLayout {
+                         }
+                     }
+ 
++                    QQC2.ComboBox {
++                        Kirigami.FormData.label: i18nc("@label:listbox", "On the lock screen:")
++                        textRole: "text"
++                        valueRole: "value"
++                        // values of NotificationManager.Notifications.Visibility, the stricter
++                        // of this and the setting for all applications applies
++                        model: [
++                            { value: 1, text: i18nc("@item:inlistbox lock screen", "As for all applications") },
++                            { value: 2, text: i18nc("@item:inlistbox lock screen", "At most the sender of messages") },
++                            { value: 3, text: i18nc("@item:inlistbox lock screen", "At most the application") },
++                            { value: 4, text: i18nc("@item:inlistbox lock screen", "Not on the lock screen") },
++                        ]
++                        currentIndex: !!behaviorSettings ? indexOfValue(behaviorSettings.lockScreenVisibility) : 0
++                        onActivated: behaviorSettings.lockScreenVisibility = currentValue
++
++                        KCM.SettingStateBinding {
++                            configObject: behaviorSettings
++                            settingName: "LockScreenVisibility"
++                        }
++                    }
++
+                     QQC2.CheckBox {
+                         text: i18n("Show in history")
+                         checked: !!behaviorSettings && behaviorSettings.showInHistory
+diff --git a/kcms/notifications/ui/main.qml b/kcms/notifications/ui/main.qml
+index 83dc77275c..72de099311 100644
+--- a/kcms/notifications/ui/main.qml
++++ b/kcms/notifications/ui/main.qml
+@@ -26,6 +26,14 @@ KCM.SimpleKCM {
+     readonly property NotificationManager.ServerInfo currentOwnerInfo: NotificationManager.Server.currentOwner
+ 
+     readonly property bool notificationsAvailable: currentOwnerInfo.status === NotificationManager.ServerInfo.Running
++
++    // values of NotificationManager.Notifications.Visibility
++    readonly property var visibilityModel: [
++        { value: 1, text: i18nc("@item:inlistbox what notifications show", "Everything") },
++        { value: 2, text: i18nc("@item:inlistbox what notifications show", "Only the sender of messages") },
++        { value: 3, text: i18nc("@item:inlistbox what notifications show", "Only the application") },
++        { value: 4, text: i18nc("@item:inlistbox what notifications show", "Nothing") },
++    ]
+         && currentOwnerInfo.vendor === ourServerVendor && currentOwnerInfo.name === ourServerName
+ 
+     function openSourcesSettings(args) {
+@@ -216,6 +224,56 @@ KCM.SimpleKCM {
+             }
+         }
+ 
++        Item {
++            Kirigami.FormData.label: i18nc("@title:group what notifications show", "Privacy")
++            Kirigami.FormData.isSection: true
++        }
++
++        QtControls.ComboBox {
++            Kirigami.FormData.label: i18nc("@label:listbox", "On the lock screen:")
++            textRole: "text"
++            valueRole: "value"
++            model: root.visibilityModel
++            currentIndex: indexOfValue(kcm.notificationSettings.lockScreenVisibility)
++            onActivated: kcm.notificationSettings.lockScreenVisibility = currentValue
++
++            KCM.SettingStateBinding {
++                configObject: kcm.notificationSettings
++                settingName: "LockScreenVisibility"
++                extraEnabledConditions: root.notificationsAvailable
++            }
++        }
++
++        QtControls.ComboBox {
++            Kirigami.FormData.label: i18nc("@label:listbox", "In popups:")
++            textRole: "text"
++            valueRole: "value"
++            model: root.visibilityModel
++            currentIndex: indexOfValue(kcm.notificationSettings.popupVisibility)
++            onActivated: kcm.notificationSettings.popupVisibility = currentValue
++
++            KCM.SettingStateBinding {
++                configObject: kcm.notificationSettings
++                settingName: "PopupVisibility"
++                extraEnabledConditions: root.notificationsAvailable
++            }
++        }
++
++        QtControls.ComboBox {
++            Kirigami.FormData.label: i18nc("@label:listbox", "In the history:")
++            textRole: "text"
++            valueRole: "value"
++            model: root.visibilityModel
++            currentIndex: indexOfValue(kcm.notificationSettings.historyVisibility)
++            onActivated: kcm.notificationSettings.historyVisibility = currentValue
++
++            KCM.SettingStateBinding {
++                configObject: kcm.notificationSettings
++                settingName: "HistoryVisibility"
++                extraEnabledConditions: root.notificationsAvailable
++            }
++        }
++
+         QtControls.ButtonGroup {
+             id: positionGroup
+             buttons: [positionCloseToWidget, positionCustomPosition]

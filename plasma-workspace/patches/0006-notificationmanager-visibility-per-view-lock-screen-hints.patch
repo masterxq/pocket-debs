@@ -1,0 +1,1012 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 12:23:05 +0100
+Subject: [PATCH] notificationmanager: visibility of notifications per view, lock screen hints
+Description:
+ Applications could not keep the content of a notification off the lock
+ screen, and a shell had no way to show less than everything.
+ .
+ A view sets how much its model shows (Notifications.visibility):
+ everything, only the sender (the summary of messages, categories im,
+ email and call, or a public summary the application gives, and the
+ image of a message as the avatar), only the application, or nothing. On
+ the lock screen (Notifications.lockScreen) the visibility configured per
+ application and the one a notification asks for apply as well; the
+ strictest wins. A new proxy model leaves out hidden notifications and
+ empties the roles with content (summary, body, image, actions, urls,
+ hints); VisibilityRole tells the view what it may show.
+ .
+ New hints: x-kde-lock-screen-visibility (full, sender, application,
+ hidden; an unknown value hides) and x-kde-public-summary. Portal
+ notifications map hide-on-lock-screen and hide-content-on-lock-screen,
+ read the category, priority urgent becomes critical (it was unreachable)
+ and the display hint is read under its specified name display-hint.
+ .
+ New settings: LockScreenVisibility (default only the sender),
+ PopupVisibility and HistoryVisibility (default everything), and
+ LockScreenVisibility per application.
+ .
+ Notifications.source WatcherSource mirrors the notifications of the
+ server over D-Bus through the same model, for a lock screen in another
+ process.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/libnotificationmanager/CMakeLists.txt b/libnotificationmanager/CMakeLists.txt
+index fa08a7fff5..6ca1f6b80d 100644
+--- a/libnotificationmanager/CMakeLists.txt
++++ b/libnotificationmanager/CMakeLists.txt
+@@ -27,6 +27,7 @@ set(notificationmanager_LIB_SRCS
+     notificationsmodel.cpp
+     portalnotificationsmodel.cpp
+     notificationfilterproxymodel.cpp
++    notificationvisibilityproxymodel.cpp
+     notificationsortproxymodel.cpp
+     notificationgroupingproxymodel.cpp
+     notificationgroupcollapsingproxymodel.cpp
+diff --git a/libnotificationmanager/abstractnotificationsmodel.cpp b/libnotificationmanager/abstractnotificationsmodel.cpp
+index b400c4f977..116ca9a79b 100644
+--- a/libnotificationmanager/abstractnotificationsmodel.cpp
++++ b/libnotificationmanager/abstractnotificationsmodel.cpp
+@@ -451,6 +451,12 @@ QVariant AbstractNotificationsModel::data(const QModelIndex &index, int role) co
+         return notification.dismissed();
+     case Notifications::DismissableRole:
+         return notification.resident() && notification.timeout() == 0;
++    case Notifications::VisibilityRole:
++        return Notifications::VisibilityFull;
++    case Notifications::LockScreenVisibilityRole:
++        return notification.lockScreenVisibility();
++    case Notifications::PublicSummaryRole:
++        return notification.publicSummary();
+     }
+ 
+     return {};
+diff --git a/libnotificationmanager/kcfg/behaviorsettings.kcfg b/libnotificationmanager/kcfg/behaviorsettings.kcfg
+index 31d74218c8..31fa7aeaf7 100644
+--- a/libnotificationmanager/kcfg/behaviorsettings.kcfg
++++ b/libnotificationmanager/kcfg/behaviorsettings.kcfg
+@@ -20,5 +20,12 @@
+         <entry name="ShowBadges" type="Bool">
+             <default>true</default>
+         </entry>
++        <!-- Visibility on the lock screen (NotificationManager::Notifications::Visibility),
++             can only be stricter than the global one -->
++        <entry name="LockScreenVisibility" type="Int">
++            <default>1</default>
++            <min>1</min>
++            <max>4</max>
++        </entry>
+     </group>
+ </kcfg>
+diff --git a/libnotificationmanager/kcfg/notificationsettings.kcfg b/libnotificationmanager/kcfg/notificationsettings.kcfg
+index 2d5ef9081e..681d088b2d 100644
+--- a/libnotificationmanager/kcfg/notificationsettings.kcfg
++++ b/libnotificationmanager/kcfg/notificationsettings.kcfg
+@@ -33,6 +33,23 @@
+         <entry name="ShowPopupTimeout" type="Bool">
+             <default>true</default>
+         </entry>
++        <!-- Visibility of notifications (NotificationManager::Notifications::Visibility):
++             1 everything, 2 only the sender, 3 only the application, 4 nothing -->
++        <entry name="LockScreenVisibility" type="Int">
++            <default>2</default>
++            <min>1</min>
++            <max>4</max>
++        </entry>
++        <entry name="PopupVisibility" type="Int">
++            <default>1</default>
++            <min>1</min>
++            <max>4</max>
++        </entry>
++        <entry name="HistoryVisibility" type="Int">
++            <default>1</default>
++            <min>1</min>
++            <max>4</max>
++        </entry>
+     </group>
+ 
+ </kcfg>
+diff --git a/libnotificationmanager/notification.cpp b/libnotificationmanager/notification.cpp
+index 1614914152..ea4d223773 100644
+--- a/libnotificationmanager/notification.cpp
++++ b/libnotificationmanager/notification.cpp
+@@ -437,6 +437,19 @@ void Notification::Private::processFdoHints(const QVariantMap &hints)
+ 
+     category = hints.value(QStringLiteral("category")).toString();
+ 
++    // Visibility on the lock screen, an unknown value hides the notification there
++    const QString lockScreenVisibilityHint = hints.value(QStringLiteral("x-kde-lock-screen-visibility")).toString();
++    if (lockScreenVisibilityHint == "full"_L1) {
++        lockScreenVisibility = Notifications::VisibilityFull;
++    } else if (lockScreenVisibilityHint == "sender"_L1) {
++        lockScreenVisibility = Notifications::VisibilitySender;
++    } else if (lockScreenVisibilityHint == "application"_L1) {
++        lockScreenVisibility = Notifications::VisibilityApplication;
++    } else if (!lockScreenVisibilityHint.isEmpty()) {
++        lockScreenVisibility = Notifications::VisibilityHidden;
++    }
++    publicSummary = hints.value(QStringLiteral("x-kde-public-summary")).toString();
++
+     // Underscored hints was in use in version 1.1 of the spec but has been
+     // replaced by dashed hints in version 1.2. We need to support it for
+     // users of the 1.2 version of the spec.
+@@ -491,10 +504,20 @@ void Notification::Private::processPortalProperties(const QVariantMap &props)
+         // TODO add high urgency
+     } else if (priority == "normal"_L1 || priority == "high"_L1) {
+         setUrgency(Notifications::NormalUrgency);
+-    } else if (priority == "high"_L1) {
++    } else if (priority == "urgent"_L1) {
+         setUrgency(Notifications::CriticalUrgency);
+     }
+ 
++    category = props.value(u"category"_s).toString();
++
++    QStringList displayHints = props.value(u"display-hint"_s).toStringList();
++    displayHints += props.value(u"display-hints"_s).toStringList();
++    if (displayHints.contains(u"hide-on-lock-screen"_s)) {
++        lockScreenVisibility = Notifications::VisibilityHidden;
++    } else if (displayHints.contains(u"hide-content-on-lock-screen"_s)) {
++        lockScreenVisibility = Notifications::VisibilityApplication;
++    }
++
+     const QVariant iconValue = props.value(u"icon"_s);
+     if (iconValue.isValid()) {
+         // "For historical reasons, it is also possible to send a simple string
+@@ -881,6 +904,16 @@ QString Notification::category() const
+     return d->category;
+ }
+ 
++Notifications::Visibility Notification::lockScreenVisibility() const
++{
++    return d->lockScreenVisibility;
++}
++
++QString Notification::publicSummary() const
++{
++    return d->publicSummary;
++}
++
+ bool Notification::expired() const
+ {
+     return d->expired;
+diff --git a/libnotificationmanager/notification.h b/libnotificationmanager/notification.h
+index 21742b91d1..b7d28cceb8 100644
+--- a/libnotificationmanager/notification.h
++++ b/libnotificationmanager/notification.h
+@@ -113,6 +113,9 @@ public:
+ 
+     QString category() const;
+ 
++    Notifications::Visibility lockScreenVisibility() const;
++    QString publicSummary() const;
++
+     bool expired() const;
+     void setExpired(bool expired);
+ 
+diff --git a/libnotificationmanager/notification_p.h b/libnotificationmanager/notification_p.h
+index ea2230e044..4d2bbd90f7 100644
+--- a/libnotificationmanager/notification_p.h
++++ b/libnotificationmanager/notification_p.h
+@@ -91,6 +91,13 @@ public:
+ 
+     QString category;
+ 
++    // set by the application, the view decides with its own settings
++    Notifications::Visibility lockScreenVisibility = Notifications::VisibilityFull;
++    QString publicSummary;
++
++    // the arguments of org.kde.NotificationWatcher.Notify for this notification
++    QVariantList watcherArguments;
++
+     QList<QUrl> urls;
+     QVariantMap hints = QVariantMap();
+ 
+diff --git a/libnotificationmanager/notifications.cpp b/libnotificationmanager/notifications.cpp
+index e57c0278ac..05b8bf468d 100644
+--- a/libnotificationmanager/notifications.cpp
++++ b/libnotificationmanager/notifications.cpp
+@@ -27,6 +27,8 @@
+ #include "notificationgroupingproxymodel_p.h"
+ #include "notificationsmodel.h"
+ #include "notificationsortproxymodel_p.h"
++#include "notificationvisibilityproxymodel_p.h"
++#include "watchednotificationsmodel.h"
+ #include "portal_p.h"
+ #include "portalnotificationsmodel.h"
+ 
+@@ -72,11 +74,13 @@ public:
+     ~Private();
+ 
+     void initSourceModels();
++    void removeNotificationSources();
+     void initProxyModels();
+ 
+     void updateCount();
+ 
+     bool showNotifications = true;
++    Notifications::Source source = Notifications::ServerSource;
+     bool showJobs = false;
+ 
+     Notifications::GroupMode groupMode = Notifications::GroupDisabled;
+@@ -99,11 +103,13 @@ public:
+     // NOTE when you add or re-arrange models make sure to update mapFromModel()!
+     NotificationsModel::Ptr notificationsModel;
+     PortalNotificationsModel::Ptr portalNotificationsModel;
++    std::shared_ptr<WatchedNotificationsModel> watchedNotificationsModel;
+     JobsModel::Ptr jobsModel;
+     std::shared_ptr<Settings> settings() const;
+ 
+     QConcatenateTablesProxyModel *notificationsAndJobsModel = nullptr;
+ 
++    NotificationVisibilityProxyModel *visibilityModel = nullptr;
+     NotificationFilterProxyModel *filterModel = nullptr;
+     NotificationSortProxyModel *sortModel = nullptr;
+     NotificationGroupingProxyModel *groupingModel = nullptr;
+@@ -129,7 +135,12 @@ void Notifications::Private::initSourceModels()
+ {
+     Q_ASSERT(notificationsAndJobsModel); // initProxyModels must be called before initSourceModels
+ 
+-    if (showNotifications) {
++    if (showNotifications && source == WatcherSource) {
++        if (!watchedNotificationsModel) {
++            watchedNotificationsModel = std::make_shared<WatchedNotificationsModel>();
++            notificationsAndJobsModel->addSourceModel(watchedNotificationsModel.get());
++        }
++    } else if (showNotifications) {
+         if (!notificationsModel) {
+             notificationsModel = NotificationsModel::createNotificationsModel();
+             notificationsAndJobsModel->addSourceModel(notificationsModel.get());
+@@ -143,16 +154,7 @@ void Notifications::Private::initSourceModels()
+             notificationsAndJobsModel->addSourceModel(portalNotificationsModel.get());
+         }
+     } else {
+-        if (notificationsModel) {
+-            notificationsAndJobsModel->removeSourceModel(notificationsModel.get());
+-            disconnect(notificationsModel.get(), nullptr, q, nullptr); // disconnect all
+-            notificationsModel = nullptr;
+-        }
+-        if (portalNotificationsModel) {
+-            notificationsAndJobsModel->removeSourceModel(portalNotificationsModel.get());
+-            disconnect(portalNotificationsModel.get(), nullptr, q, nullptr);
+-            portalNotificationsModel = nullptr;
+-        }
++        removeNotificationSources();
+     }
+ 
+     if (showJobs && !jobsModel) {
+@@ -165,6 +167,24 @@ void Notifications::Private::initSourceModels()
+     }
+ }
+ 
++void Notifications::Private::removeNotificationSources()
++{
++    if (notificationsModel) {
++        notificationsAndJobsModel->removeSourceModel(notificationsModel.get());
++        disconnect(notificationsModel.get(), nullptr, q, nullptr); // disconnect all
++        notificationsModel = nullptr;
++    }
++    if (portalNotificationsModel) {
++        notificationsAndJobsModel->removeSourceModel(portalNotificationsModel.get());
++        disconnect(portalNotificationsModel.get(), nullptr, q, nullptr);
++        portalNotificationsModel = nullptr;
++    }
++    if (watchedNotificationsModel) {
++        notificationsAndJobsModel->removeSourceModel(watchedNotificationsModel.get());
++        watchedNotificationsModel = nullptr;
++    }
++}
++
+ void Notifications::Private::initProxyModels()
+ {
+     /* The data flow is as follows:
+@@ -176,6 +196,10 @@ void Notifications::Private::initProxyModels()
+      *     QConcatenateTablesProxyModel
+      *               |||
+      *               |||
++     *   NotificationVisibilityProxyModel
++     *   (leaves out hidden notifications, empties hidden content)
++     *               |||
++     *               |||
+      *     NotificationFilterProxyModel
+      *     (filters by urgency, whitelist, etc)
+      *                |
+@@ -213,6 +237,15 @@ void Notifications::Private::initProxyModels()
+ #endif
+     }
+ 
++    if (!visibilityModel) {
++        visibilityModel = new NotificationVisibilityProxyModel(q);
++        connect(visibilityModel, &NotificationVisibilityProxyModel::visibilityChanged, q, &Notifications::visibilityChanged);
++        connect(visibilityModel, &NotificationVisibilityProxyModel::lockScreenChanged, q, &Notifications::lockScreenChanged);
++        connect(visibilityModel, &NotificationVisibilityProxyModel::applicationsChanged, q, &Notifications::lockScreenVisibilityApplicationsChanged);
++        connect(visibilityModel, &NotificationVisibilityProxyModel::servicesChanged, q, &Notifications::lockScreenVisibilityServicesChanged);
++        visibilityModel->setSourceModel(notificationsAndJobsModel);
++    }
++
+     if (!filterModel) {
+         filterModel = new NotificationFilterProxyModel();
+         connect(filterModel, &NotificationFilterProxyModel::urgenciesChanged, q, &Notifications::urgenciesChanged);
+@@ -223,7 +256,7 @@ void Notifications::Private::initProxyModels()
+         connect(filterModel, &NotificationFilterProxyModel::blacklistedDesktopEntriesChanged, q, &Notifications::blacklistedDesktopEntriesChanged);
+         connect(filterModel, &NotificationFilterProxyModel::blacklistedNotifyRcNamesChanged, q, &Notifications::blacklistedNotifyRcNamesChanged);
+ 
+-        filterModel->setSourceModel(notificationsAndJobsModel);
++        filterModel->setSourceModel(visibilityModel);
+ 
+         connect(filterModel, &QAbstractItemModel::rowsInserted, q, [this] {
+             updateCount();
+@@ -379,6 +412,7 @@ QModelIndex Notifications::Private::mapFromModel(const QModelIndex &idx) const
+ 
+     QAbstractItemModel *models[] = {
+         notificationsAndJobsModel,
++        visibilityModel,
+         filterModel,
+         sortModel,
+         groupingModel,
+@@ -405,7 +439,8 @@ QModelIndex Notifications::Private::mapFromModel(const QModelIndex &idx) const
+                     break;
+                 }
+             } else if (auto *concatenateModel = qobject_cast<QConcatenateTablesProxyModel *>(model)) {
+-                if (idxModel == notificationsModel.get() || idxModel == portalNotificationsModel.get() || idxModel == jobsModel.get()) {
++                if (idxModel == notificationsModel.get() || idxModel == portalNotificationsModel.get() || idxModel == watchedNotificationsModel.get()
++                    || idxModel == jobsModel.get()) {
+                     resolvedIdx = concatenateModel->mapFromSource(resolvedIdx);
+                     found = true;
+                     break;
+@@ -644,6 +679,65 @@ void Notifications::setShowJobs(bool show)
+     Q_EMIT showJobsChanged();
+ }
+ 
++Notifications::Source Notifications::source() const
++{
++    return d->source;
++}
++
++void Notifications::setSource(Source source)
++{
++    if (d->source == source) {
++        return;
++    }
++
++    d->source = source;
++    if (d->notificationsModel || d->portalNotificationsModel || d->watchedNotificationsModel) {
++        d->removeNotificationSources();
++        d->initSourceModels();
++    }
++    Q_EMIT sourceChanged();
++}
++
++Notifications::Visibility Notifications::visibility() const
++{
++    return d->visibilityModel->visibility();
++}
++
++void Notifications::setVisibility(Visibility visibility)
++{
++    d->visibilityModel->setVisibility(visibility);
++}
++
++bool Notifications::lockScreen() const
++{
++    return d->visibilityModel->lockScreen();
++}
++
++void Notifications::setLockScreen(bool lockScreen)
++{
++    d->visibilityModel->setLockScreen(lockScreen);
++}
++
++QVariantMap Notifications::lockScreenVisibilityApplications() const
++{
++    return d->visibilityModel->applications();
++}
++
++void Notifications::setLockScreenVisibilityApplications(const QVariantMap &visibilities)
++{
++    d->visibilityModel->setApplications(visibilities);
++}
++
++QVariantMap Notifications::lockScreenVisibilityServices() const
++{
++    return d->visibilityModel->services();
++}
++
++void Notifications::setLockScreenVisibilityServices(const QVariantMap &visibilities)
++{
++    d->visibilityModel->setServices(visibilities);
++}
++
+ Notifications::Urgencies Notifications::urgencies() const
+ {
+     return d->filterModel->urgencies();
+@@ -928,6 +1022,9 @@ void Notifications::clear(ClearFlags flags)
+     if (d->portalNotificationsModel) {
+         d->portalNotificationsModel->clear(flags);
+     }
++    if (d->watchedNotificationsModel) {
++        d->watchedNotificationsModel->clear(flags);
++    }
+     if (d->jobsModel) {
+         d->jobsModel->clear(flags);
+     }
+diff --git a/libnotificationmanager/notifications.h b/libnotificationmanager/notifications.h
+index 79759817f5..91f3915367 100644
+--- a/libnotificationmanager/notifications.h
++++ b/libnotificationmanager/notifications.h
+@@ -241,6 +241,53 @@ class NOTIFICATIONMANAGER_EXPORT Notifications : public QSortFilterProxyModel, p
+      * This is used to tell the xdg_activation_v1 protocol who is requesting the activation.
+      */
+     Q_PROPERTY(QWindow *window READ window WRITE setWindow NOTIFY windowChanged)
++
++    /**
++     * Where the notifications come from.
++     *
++     * By default this model is the notification server. A process that is
++     * not the server (e.g. the lock screen) uses @c WatcherSource: the
++     * notifications of the server are mirrored over D-Bus.
++     *
++     * @since 6.7
++     */
++    Q_PROPERTY(Source source READ source WRITE setSource NOTIFY sourceChanged)
++
++    /**
++     * How much of the notifications the view shows, see @c Visibility.
++     *
++     * Default is @c VisibilityFull.
++     *
++     * @since 6.7
++     */
++    Q_PROPERTY(Visibility visibility READ visibility WRITE setVisibility NOTIFY visibilityChanged)
++
++    /**
++     * Whether the view is on the lock screen.
++     *
++     * On the lock screen the visibility an application asks for with the
++     * @c x-kde-lock-screen-visibility hint (or the portal display hints) and
++     * the visibility configured for the application apply as well.
++     *
++     * @since 6.7
++     */
++    Q_PROPERTY(bool lockScreen READ lockScreen WRITE setLockScreen NOTIFY lockScreenChanged)
++
++    /**
++     * The lock screen visibility configured per application, desktop entry to @c Visibility.
++     *
++     * @since 6.7
++     */
++    Q_PROPERTY(QVariantMap lockScreenVisibilityApplications READ lockScreenVisibilityApplications WRITE setLockScreenVisibilityApplications NOTIFY
++                   lockScreenVisibilityApplicationsChanged)
++
++    /**
++     * The lock screen visibility configured per service, notifyrc name to @c Visibility.
++     *
++     * @since 6.7
++     */
++    Q_PROPERTY(QVariantMap lockScreenVisibilityServices READ lockScreenVisibilityServices WRITE setLockScreenVisibilityServices NOTIFY
++                   lockScreenVisibilityServicesChanged)
+ public:
+     explicit Notifications(QObject *parent = nullptr);
+     ~Notifications() override;
+@@ -317,6 +364,9 @@ public:
+         WasAddedDuringInhibitionRole, ///< Whether the notification was added while inhibition was active. @since 6.3
+         HintsRole, ///< To provide extra data to a notification server that the server may be able to make use of. @since 6.4
+         DismissableRole, ///< Whether a notification can be dismissed (minimized). @since 6.4
++        VisibilityRole, ///< How much of the notification is shown, see @c Visibility. The roles with content are empty when hidden. @since 6.7
++        LockScreenVisibilityRole, ///< The visibility on the lock screen the application asked for. @since 6.7
++        PublicSummaryRole, ///< The summary the application allows to show instead of the summary when only the sender is shown. @since 6.7
+     };
+     Q_ENUM(Roles)
+ 
+@@ -345,6 +395,34 @@ public:
+     Q_DECLARE_FLAGS(Urgencies, Urgency)
+     Q_FLAG(Urgencies)
+ 
++    /**
++     * How much of a notification is shown.
++     *
++     * The stricter of the visibility of the view, of the application and of
++     * the notification itself wins.
++     *
++     * @since 6.7
++     */
++    enum Visibility {
++        VisibilityFull = 1, ///< Everything.
++        VisibilitySender = 2, ///< Only the sender: the summary of messages (categories im, email, call) or the public summary, and the image of a message (an avatar).
++                              ///< Notifications without either are shown as with @c VisibilityApplication.
++        VisibilityApplication = 3, ///< Only the application.
++        VisibilityHidden = 4, ///< Nothing, the notification is left out.
++    };
++    Q_ENUM(Visibility)
++
++    /**
++     * Where the notifications come from, see @c source.
++     *
++     * @since 6.7
++     */
++    enum Source {
++        ServerSource, ///< This process is the notification server.
++        WatcherSource, ///< The notifications of the server are mirrored over D-Bus.
++    };
++    Q_ENUM(Source)
++
+     /**
+      * Which items should be cleared in a call to @c clear
+      */
+@@ -430,6 +508,21 @@ public:
+     Urgencies urgencies() const;
+     void setUrgencies(Urgencies urgencies);
+ 
++    Source source() const;
++    void setSource(Source source);
++
++    Visibility visibility() const;
++    void setVisibility(Visibility visibility);
++
++    bool lockScreen() const;
++    void setLockScreen(bool lockScreen);
++
++    QVariantMap lockScreenVisibilityApplications() const;
++    void setLockScreenVisibilityApplications(const QVariantMap &visibilities);
++
++    QVariantMap lockScreenVisibilityServices() const;
++    void setLockScreenVisibilityServices(const QVariantMap &visibilities);
++
+     SortMode sortMode() const;
+     void setSortMode(SortMode sortMode);
+ 
+@@ -603,6 +696,11 @@ Q_SIGNALS:
+     void showNotificationsChanged();
+     void showJobsChanged();
+     void urgenciesChanged();
++    void sourceChanged();
++    void visibilityChanged();
++    void lockScreenChanged();
++    void lockScreenVisibilityApplicationsChanged();
++    void lockScreenVisibilityServicesChanged();
+     void sortModeChanged();
+     void sortOrderChanged();
+     void groupModeChanged();
+diff --git a/libnotificationmanager/notificationvisibilityproxymodel.cpp b/libnotificationmanager/notificationvisibilityproxymodel.cpp
+new file mode 100644
+index 0000000000..23485c149b
+--- /dev/null
++++ b/libnotificationmanager/notificationvisibilityproxymodel.cpp
+@@ -0,0 +1,175 @@
++/*
++    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#include "notificationvisibilityproxymodel_p.h"
++
++#include <QImage>
++#include <algorithm>
++#include <QUrl>
++
++using namespace Qt::StringLiterals;
++using namespace NotificationManager;
++
++NotificationVisibilityProxyModel::NotificationVisibilityProxyModel(QObject *parent)
++    : QSortFilterProxyModel(parent)
++{
++}
++
++NotificationVisibilityProxyModel::~NotificationVisibilityProxyModel() = default;
++
++Notifications::Visibility NotificationVisibilityProxyModel::visibility() const
++{
++    return m_visibility;
++}
++
++void NotificationVisibilityProxyModel::setVisibility(Notifications::Visibility visibility)
++{
++    if (m_visibility != visibility) {
++        m_visibility = visibility;
++        invalidate();
++        Q_EMIT visibilityChanged();
++    }
++}
++
++bool NotificationVisibilityProxyModel::lockScreen() const
++{
++    return m_lockScreen;
++}
++
++void NotificationVisibilityProxyModel::setLockScreen(bool lockScreen)
++{
++    if (m_lockScreen != lockScreen) {
++        m_lockScreen = lockScreen;
++        invalidate();
++        Q_EMIT lockScreenChanged();
++    }
++}
++
++QVariantMap NotificationVisibilityProxyModel::applications() const
++{
++    return m_applications;
++}
++
++void NotificationVisibilityProxyModel::setApplications(const QVariantMap &visibilities)
++{
++    if (m_applications != visibilities) {
++        m_applications = visibilities;
++        invalidate();
++        Q_EMIT applicationsChanged();
++    }
++}
++
++QVariantMap NotificationVisibilityProxyModel::services() const
++{
++    return m_services;
++}
++
++void NotificationVisibilityProxyModel::setServices(const QVariantMap &visibilities)
++{
++    if (m_services != visibilities) {
++        m_services = visibilities;
++        invalidate();
++        Q_EMIT servicesChanged();
++    }
++}
++
++bool NotificationVisibilityProxyModel::isMessageCategory(const QString &category)
++{
++    // freedesktop categories im, im.received, email.arrived, portal call.incoming, ...
++    for (const auto &prefix : {u"im"_s, u"email"_s, u"call"_s}) {
++        if (category == prefix || category.startsWith(prefix + u'.')) {
++            return true;
++        }
++    }
++    return category == "x-kde.incoming-call"_L1;
++}
++
++Notifications::Visibility NotificationVisibilityProxyModel::visibilityOf(const QModelIndex &sourceIdx) const
++{
++    if (sourceIdx.data(Notifications::TypeRole).toInt() != Notifications::NotificationType) {
++        return Notifications::VisibilityFull;
++    }
++
++    int visibility = m_visibility;
++    if (m_lockScreen) {
++        visibility = std::max(visibility, sourceIdx.data(Notifications::LockScreenVisibilityRole).toInt());
++
++        const QString desktopEntry = sourceIdx.data(Notifications::DesktopEntryRole).toString();
++        if (!desktopEntry.isEmpty()) {
++            visibility = std::max(visibility, m_applications.value(desktopEntry, int(Notifications::VisibilityFull)).toInt());
++        }
++        const QString notifyRcName = sourceIdx.data(Notifications::NotifyRcNameRole).toString();
++        if (!notifyRcName.isEmpty()) {
++            visibility = std::max(visibility, m_services.value(notifyRcName, int(Notifications::VisibilityFull)).toInt());
++        }
++    }
++
++    // Only messages have a sender in their summary
++    if (visibility == Notifications::VisibilitySender && sourceIdx.data(Notifications::PublicSummaryRole).toString().isEmpty()
++        && !isMessageCategory(sourceIdx.data(Notifications::CategoryRole).toString())) {
++        visibility = Notifications::VisibilityApplication;
++    }
++
++    return static_cast<Notifications::Visibility>(std::clamp(visibility, int(Notifications::VisibilityFull), int(Notifications::VisibilityHidden)));
++}
++
++bool NotificationVisibilityProxyModel::filterAcceptsRow(int source_row, const QModelIndex &source_parent) const
++{
++    return visibilityOf(sourceModel()->index(source_row, 0, source_parent)) != Notifications::VisibilityHidden;
++}
++
++QVariant NotificationVisibilityProxyModel::data(const QModelIndex &index, int role) const
++{
++    const QModelIndex sourceIdx = mapToSource(index);
++    const Notifications::Visibility visibility = visibilityOf(sourceIdx);
++
++    if (role == Notifications::VisibilityRole) {
++        return visibility;
++    }
++    if (visibility == Notifications::VisibilityFull) {
++        return sourceIdx.data(role);
++    }
++
++    const bool sender = visibility == Notifications::VisibilitySender;
++    switch (role) {
++    case Notifications::SummaryRole: {
++        if (!sender) {
++            return QString();
++        }
++        const QString publicSummary = sourceIdx.data(Notifications::PublicSummaryRole).toString();
++        return publicSummary.isEmpty() ? sourceIdx.data(role) : publicSummary;
++    }
++    case Notifications::ImageRole:
++    case Notifications::IconNameRole:
++        // the image of a message shows the sender (avatar), others show content
++        if (sender && isMessageCategory(sourceIdx.data(Notifications::CategoryRole).toString())) {
++            return sourceIdx.data(role);
++        }
++        return role == Notifications::ImageRole ? QVariant() : QVariant(QString());
++    case Notifications::OriginNameRole:
++        return sender ? sourceIdx.data(role) : QVariant(QString());
++    case Notifications::BodyRole:
++    case Notifications::DefaultActionLabelRole:
++    case Notifications::ReplyActionLabelRole:
++    case Notifications::ReplyPlaceholderTextRole:
++    case Notifications::ReplySubmitButtonTextRole:
++    case Notifications::ReplySubmitButtonIconNameRole:
++        return QString();
++    case Notifications::ActionNamesRole:
++    case Notifications::ActionLabelsRole:
++        return QStringList();
++    case Notifications::HasReplyActionRole:
++        return false;
++    case Notifications::UrlsRole:
++        return QVariant::fromValue(QList<QUrl>());
++    case Notifications::HintsRole:
++        return QVariantMap();
++    }
++
++    return sourceIdx.data(role);
++}
++
++#include "moc_notificationvisibilityproxymodel_p.cpp"
+diff --git a/libnotificationmanager/notificationvisibilityproxymodel_p.h b/libnotificationmanager/notificationvisibilityproxymodel_p.h
+new file mode 100644
+index 0000000000..e757b6ffa0
+--- /dev/null
++++ b/libnotificationmanager/notificationvisibilityproxymodel_p.h
+@@ -0,0 +1,62 @@
++/*
++    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++
++    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
++*/
++
++#pragma once
++
++#include <QSortFilterProxyModel>
++#include <QVariantMap>
++
++#include "notifications.h"
++
++namespace NotificationManager
++{
++/**
++ * Applies the visibility of a view (popups, history, lock screen): leaves
++ * out hidden notifications and empties the roles with content of the others.
++ */
++class NotificationVisibilityProxyModel : public QSortFilterProxyModel
++{
++    Q_OBJECT
++
++public:
++    explicit NotificationVisibilityProxyModel(QObject *parent = nullptr);
++    ~NotificationVisibilityProxyModel() override;
++
++    Notifications::Visibility visibility() const;
++    void setVisibility(Notifications::Visibility visibility);
++
++    bool lockScreen() const;
++    void setLockScreen(bool lockScreen);
++
++    QVariantMap applications() const;
++    void setApplications(const QVariantMap &visibilities);
++
++    QVariantMap services() const;
++    void setServices(const QVariantMap &visibilities);
++
++    QVariant data(const QModelIndex &index, int role) const override;
++
++    static bool isMessageCategory(const QString &category);
++
++Q_SIGNALS:
++    void visibilityChanged();
++    void lockScreenChanged();
++    void applicationsChanged();
++    void servicesChanged();
++
++protected:
++    bool filterAcceptsRow(int source_row, const QModelIndex &source_parent) const override;
++
++private:
++    Notifications::Visibility visibilityOf(const QModelIndex &sourceIdx) const;
++
++    Notifications::Visibility m_visibility = Notifications::VisibilityFull;
++    bool m_lockScreen = false;
++    QVariantMap m_applications;
++    QVariantMap m_services;
++};
++
++} // namespace NotificationManager
+diff --git a/libnotificationmanager/portal_p.cpp b/libnotificationmanager/portal_p.cpp
+index 3724fe6f14..ab4946cec8 100644
+--- a/libnotificationmanager/portal_p.cpp
++++ b/libnotificationmanager/portal_p.cpp
+@@ -181,7 +181,8 @@ void Portal::AddNotification(const QString &appId, const QString &portalNotifica
+ 
+     notification.d->processPortalProperties(props);
+ 
+-    const bool showAsNew = props.value(u"display-hints"_s).toStringList().contains(u"show-as-new"_s);
++    const bool showAsNew = props.value(u"display-hint"_s).toStringList().contains(u"show-as-new"_s)
++        || props.value(u"display-hints"_s).toStringList().contains(u"show-as-new"_s);
+ 
+     if (wasReplaced) {
+         notification.resetUpdated();
+diff --git a/libnotificationmanager/settings.cpp b/libnotificationmanager/settings.cpp
+index 9e0da288ab..0899422209 100644
+--- a/libnotificationmanager/settings.cpp
++++ b/libnotificationmanager/settings.cpp
+@@ -6,8 +6,10 @@
+ */
+ 
+ #include "settings.h"
++#include "notifications.h"
+ 
+ #include <QDebug>
++#include <algorithm>
+ 
+ #include <KConfigWatcher>
+ #include <KService>
+@@ -41,6 +43,7 @@ public:
+     KConfigGroup applicationsGroup() const;
+ 
+     QStringList behaviorMatchesList(const KConfigGroup &group, Settings::NotificationBehavior behavior, bool on) const;
++    QVariantMap lockScreenVisibilities(const KConfigGroup &group) const;
+ 
+     Settings *const q;
+ 
+@@ -148,6 +151,21 @@ QStringList Settings::Private::behaviorMatchesList(const KConfigGroup &group, Se
+     return matches;
+ }
+ 
++QVariantMap Settings::Private::lockScreenVisibilities(const KConfigGroup &group) const
++{
++    QVariantMap visibilities;
++
++    const QStringList apps = group.groupList();
++    for (const QString &app : apps) {
++        const int visibility = group.group(app).readEntry("LockScreenVisibility", int(Notifications::VisibilityFull));
++        if (visibility > Notifications::VisibilityFull) {
++            visibilities.insert(app, std::min(visibility, int(Notifications::VisibilityHidden)));
++        }
++    }
++
++    return visibilities;
++}
++
+ Settings::Settings(QObject *parent)
+     : QObject(parent)
+     , d(new Private(this))
+@@ -423,6 +441,48 @@ void Settings::setPopupTimeout(int timeout)
+     d->setDirty(true);
+ }
+ 
++int Settings::lockScreenVisibility() const
++{
++    return d->notificationSettings.lockScreenVisibility();
++}
++
++void Settings::setLockScreenVisibility(int visibility)
++{
++    if (lockScreenVisibility() == visibility) {
++        return;
++    }
++    d->notificationSettings.setLockScreenVisibility(visibility);
++    d->setDirty(true);
++}
++
++int Settings::popupVisibility() const
++{
++    return d->notificationSettings.popupVisibility();
++}
++
++void Settings::setPopupVisibility(int visibility)
++{
++    if (popupVisibility() == visibility) {
++        return;
++    }
++    d->notificationSettings.setPopupVisibility(visibility);
++    d->setDirty(true);
++}
++
++int Settings::historyVisibility() const
++{
++    return d->notificationSettings.historyVisibility();
++}
++
++void Settings::setHistoryVisibility(int visibility)
++{
++    if (historyVisibility() == visibility) {
++        return;
++    }
++    d->notificationSettings.setHistoryVisibility(visibility);
++    d->setDirty(true);
++}
++
+ void Settings::resetPopupTimeout()
+ {
+     setPopupTimeout(d->notificationSettings.defaultPopupTimeoutValue());
+@@ -488,6 +548,16 @@ QStringList Settings::knownApplications() const
+     return d->applicationsGroup().groupList();
+ }
+ 
++QVariantMap Settings::lockScreenVisibilityApplications() const
++{
++    return d->lockScreenVisibilities(d->applicationsGroup());
++}
++
++QVariantMap Settings::lockScreenVisibilityServices() const
++{
++    return d->lockScreenVisibilities(d->servicesGroup());
++}
++
+ QStringList Settings::popupBlacklistedApplications() const
+ {
+     return d->behaviorMatchesList(d->applicationsGroup(), ShowPopups, false);
+diff --git a/libnotificationmanager/settings.h b/libnotificationmanager/settings.h
+index 82eb89d055..5885df62ba 100644
+--- a/libnotificationmanager/settings.h
++++ b/libnotificationmanager/settings.h
+@@ -8,6 +8,7 @@
+ #pragma once
+ 
+ #include <QObject>
++#include <QVariantMap>
+ 
+ #include <KSharedConfig>
+ 
+@@ -62,6 +63,16 @@ class NOTIFICATIONMANAGER_EXPORT Settings : public QObject
+      */
+     Q_PROPERTY(int popupTimeout READ popupTimeout WRITE setPopupTimeout RESET resetPopupTimeout NOTIFY settingsChanged)
+ 
++    /**
++     * How much of notifications the lock screen, popups and the history show,
++     * values of @c Notifications::Visibility.
++     *
++     * @since 6.7
++     */
++    Q_PROPERTY(int lockScreenVisibility READ lockScreenVisibility WRITE setLockScreenVisibility NOTIFY settingsChanged)
++    Q_PROPERTY(int popupVisibility READ popupVisibility WRITE setPopupVisibility NOTIFY settingsChanged)
++    Q_PROPERTY(int historyVisibility READ historyVisibility WRITE setHistoryVisibility NOTIFY settingsChanged)
++
+     /**
+      * Whether to show the timeout indicator (progress bar) in notification popups.
+      */
+@@ -113,6 +124,15 @@ class NOTIFICATIONMANAGER_EXPORT Settings : public QObject
+      */
+     Q_PROPERTY(QStringList historyBlacklistedServices READ historyBlacklistedServices NOTIFY settingsChanged)
+ 
++    /**
++     * Lock screen visibility of applications and services that are stricter than
++     * showing everything, desktop entry or notifyrc name to @c Notifications::Visibility.
++     *
++     * @since 6.7
++     */
++    Q_PROPERTY(QVariantMap lockScreenVisibilityApplications READ lockScreenVisibilityApplications NOTIFY settingsChanged)
++    Q_PROPERTY(QVariantMap lockScreenVisibilityServices READ lockScreenVisibilityServices NOTIFY settingsChanged)
++
+     /**
+      * A list of desktop entries of applications which shouldn't show badges in task manager.
+      */
+@@ -284,6 +304,13 @@ public:
+     void setPopupTimeout(int popupTimeout);
+     void resetPopupTimeout();
+ 
++    int lockScreenVisibility() const;
++    void setLockScreenVisibility(int visibility);
++    int popupVisibility() const;
++    void setPopupVisibility(int visibility);
++    int historyVisibility() const;
++    void setHistoryVisibility(int visibility);
++
+     bool showPopupTimeout() const;
+     void setShowPopupTimeout(bool show);
+ 
+@@ -307,6 +334,9 @@ public:
+     QStringList historyBlacklistedApplications() const;
+     QStringList historyBlacklistedServices() const;
+ 
++    QVariantMap lockScreenVisibilityApplications() const;
++    QVariantMap lockScreenVisibilityServices() const;
++
+     QStringList badgeBlacklistedApplications() const;
+ 
+     QDateTime notificationsInhibitedUntil() const;
