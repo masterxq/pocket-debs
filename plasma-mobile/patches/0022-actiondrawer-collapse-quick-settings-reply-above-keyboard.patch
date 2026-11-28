@@ -1,0 +1,169 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 10:50:49 +0100
+Subject: [PATCH] actiondrawer: collapse the quick settings for the notifications, keep a reply above the keyboard
+Description:
+ In a fully opened action drawer the quick settings take most of the
+ screen and the notifications only get the rest below them. Replying to
+ a notification there put the reply field below the on-screen keyboard,
+ and it was not obvious how to collapse the drawer.
+ .
+ Scrolling the notifications, invoking an action of one or starting a
+ reply now collapses the quick settings to their minimized (pinned)
+ size. How the drawer opens stays as configured.
+ .
+ While a text field in the notification list has focus and the input
+ panel is shown, the list scrolls the field above the keyboard (the
+ keyboard rectangle reported by the input method) and gets that much
+ room below the last notification, so that a reply to the last one can
+ be scrolled up as well.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: LGPL-2.0-or-later, GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml b/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml
+index e34d78809..225df245f 100644
+--- a/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml
++++ b/components/mobileshell/qml/actiondrawer/private/NotificationDrawer.qml
+@@ -33,6 +33,18 @@ Item {
+ 
+     height: Math.min(actionDrawer.height - toolButtons.height, notificationWidget.listView.contentHeight + 10 + topMargin)
+ 
++    // The notifications get the room: scrolling them, invoking an action or starting a reply collapses the quick
++    // settings of a fully opened drawer to their minimized (pinned) size. The way the drawer opens is unchanged.
++    function collapseQuickSettings() {
++        if (actionDrawer.mode !== MobileShell.ActionDrawer.Portrait || !actionDrawer.opened
++                || actionDrawer.offset <= contentContainer.minimizedQuickSettingsOffset + 1) {
++            return false;
++        }
++        actionDrawer.openToPinnedMode = true;
++        actionDrawer.open();
++        return true;
++    }
++
+     // time source for the time and date whenin landscape mode
+     Clock {
+         id: clockSource
+@@ -58,7 +70,11 @@ Item {
+         // the drawer gets no keyboard input while the screen is locked
+         replyRequiresUnlock: actionDrawer.restrictedPermissions
+         onUnlockRequested: actionDrawer.permissionsRequested()
+-        onKeyboardFocusRequested: actionDrawer.keyboardFocusRequested()
++        onKeyboardFocusRequested: {
++            actionDrawer.keyboardFocusRequested();
++            root.collapseQuickSettings();
++        }
++        onInteracted: root.collapseQuickSettings()
+         topPadding: root.topPadding
+         showHeader: actionDrawer.mode != MobileShell.ActionDrawer.Portrait
+         listView.interactive: !actionDrawer.dragging && root.listOverflowing
+@@ -124,6 +140,10 @@ Item {
+ 
+                 if (!(dragHandler.startedAtYBeginning && dragHandler.startedAtYEnd) && ((dragHandler.startedAtYBeginning && (dragHandler.startMouseY - translation.y) > 0) || (dragHandler.startedAtYEnd && (translation.y - dragHandler.startMouseY) > 0))) {
+                     actionDrawer.state = currentState;
++                    if (dragHandler.drawerDrag && root.collapseQuickSettings()) {
++                        // keep the collapsing state for the rest of this scroll
++                        currentState = actionDrawer.state;
++                    }
+                     dragHandler.drawerDrag = false;
+                 }
+ 
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+index d6c3cd0fd..b9f8150b1 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+@@ -123,6 +123,66 @@ Item {
+      */
+     signal keyboardFocusRequested()
+ 
++    /**
++     * Signal emitted when the user interacts with the notifications: the list is scrolled or an action of a
++     * notification is invoked.
++     */
++    signal interacted()
++
++    /**
++     * Height of the list covered by the on-screen keyboard while a text field in the list (inline reply) has focus.
++     */
++    property real keyboardOverlap: 0
++
++    /**
++     * Scrolls the list so that the text field with active focus (inline reply) is above the on-screen keyboard.
++     */
++    function keepFocusAboveKeyboard() {
++        const focusItem = root.Window.activeFocusItem;
++        let inList = false;
++        for (let item = focusItem; item; item = item.parent) {
++            if (item === list.contentItem) {
++                inList = true;
++                break;
++            }
++        }
++        const keyboard = Qt.inputMethod.keyboardRectangle;
++        if (!inList || !Qt.inputMethod.visible || keyboard.height <= 0) {
++            if (root.keyboardOverlap > 0) {
++                root.keyboardOverlap = 0;
++                list.returnToBounds();
++            }
++            return;
++        }
++
++        const listBottom = list.mapToItem(null, 0, list.height).y;
++        root.keyboardOverlap = Math.max(0, listBottom - keyboard.y);
++
++        const focusBottom = focusItem.mapToItem(null, 0, focusItem.height).y + list.spacing;
++        if (focusBottom > keyboard.y) {
++            list.contentY += focusBottom - keyboard.y;
++        }
++    }
++
++    // after the keyboard and the drawer have settled
++    Timer {
++        id: keepFocusTimer
++        interval: Kirigami.Units.veryLongDuration + Kirigami.Units.shortDuration
++        onTriggered: root.keepFocusAboveKeyboard()
++    }
++
++    Connections {
++        target: Qt.inputMethod
++        function onVisibleChanged() {
++            keepFocusTimer.restart();
++        }
++        function onKeyboardRectangleChanged() {
++            keepFocusTimer.restart();
++        }
++    }
++
++    onKeyboardFocusRequested: keepFocusTimer.restart()
++
+     /**
+      * Run pending action that was pending for authentication when unlockRequested() was emitted.
+      */
+@@ -214,8 +274,11 @@ Item {
+         readonly property bool listOverflowing: listHeight + spacing >= root.height
+         readonly property int listHeight: contentItem.childrenRect.height
+ 
+-        bottomMargin: spacing
+-        height: count === 0 ? (root.topPadding + (showHeader ? root.header.height + listHeight + Kirigami.Units.largeSpacing * 2 : 0)) : (listOverflowing ? root.height : listHeight + bottomMargin)
++        // the room below the last notification can grow so that a reply field can be scrolled above the keyboard
++        bottomMargin: spacing + root.keyboardOverlap
++        height: count === 0 ? (root.topPadding + (showHeader ? root.header.height + listHeight + Kirigami.Units.largeSpacing * 2 : 0)) : (listOverflowing ? root.height : listHeight + spacing)
++
++        onMovementStarted: root.interacted()
+ 
+         anchors {
+             top: parent.top
+@@ -405,6 +468,13 @@ Item {
+                         requestToInvoke: root.actionsRequireUnlock
+                         replyRequiresUnlock: root.replyRequiresUnlock
+                         onTakeFocus: root.keyboardFocusRequested()
++
++                        Connections {
++                            target: notificationItem
++                            function onActionInvoked() {
++                                root.interacted();
++                            }
++                        }
+                         onRunActionRequested: {
+                             list.pendingNotificationWithAction = notificationItem;
+                             root.unlockRequested();
