@@ -1,0 +1,90 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 12:24:22 +0100
+Subject: [PATCH] po/de: German translation of the privacy settings of notifications
+Description:
+ .
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/po/de/kcm_notifications.po b/po/de/kcm_notifications.po
+index b79a9a02ae..1b3fe3d7fa 100644
+--- a/po/de/kcm_notifications.po
++++ b/po/de/kcm_notifications.po
+@@ -377,3 +377,75 @@ msgstr ""
+ 
+ #~ msgid "Popup position:"
+ #~ msgstr "Position des Aufklappfensters:"
++
++#: ui/main.qml
++#, kde-format
++msgctxt "@title:group what notifications show"
++msgid "Privacy"
++msgstr "Datenschutz"
++
++#: ui/main.qml
++#, kde-format
++msgctxt "@label:listbox"
++msgid "On the lock screen:"
++msgstr "Auf dem Sperrbildschirm:"
++
++#: ui/main.qml
++#, kde-format
++msgctxt "@label:listbox"
++msgid "In popups:"
++msgstr "In Popups:"
++
++#: ui/main.qml
++#, kde-format
++msgctxt "@label:listbox"
++msgid "In the history:"
++msgstr "Im Verlauf:"
++
++#: ui/main.qml
++#, kde-format
++msgctxt "@item:inlistbox what notifications show"
++msgid "Everything"
++msgstr "Alles"
++
++#: ui/main.qml
++#, kde-format
++msgctxt "@item:inlistbox what notifications show"
++msgid "Only the sender of messages"
++msgstr "Nur den Absender von Nachrichten"
++
++#: ui/main.qml
++#, kde-format
++msgctxt "@item:inlistbox what notifications show"
++msgid "Only the application"
++msgstr "Nur die Anwendung"
++
++#: ui/main.qml
++#, kde-format
++msgctxt "@item:inlistbox what notifications show"
++msgid "Nothing"
++msgstr "Nichts"
++
++#: ui/ApplicationConfiguration.qml
++#, kde-format
++msgctxt "@item:inlistbox lock screen"
++msgid "As for all applications"
++msgstr "Wie für alle Anwendungen"
++
++#: ui/ApplicationConfiguration.qml
++#, kde-format
++msgctxt "@item:inlistbox lock screen"
++msgid "At most the sender of messages"
++msgstr "Höchstens den Absender von Nachrichten"
++
++#: ui/ApplicationConfiguration.qml
++#, kde-format
++msgctxt "@item:inlistbox lock screen"
++msgid "At most the application"
++msgstr "Höchstens die Anwendung"
++
++#: ui/ApplicationConfiguration.qml
++#, kde-format
++msgctxt "@item:inlistbox lock screen"
++msgid "Not on the lock screen"
++msgstr "Nicht auf dem Sperrbildschirm"

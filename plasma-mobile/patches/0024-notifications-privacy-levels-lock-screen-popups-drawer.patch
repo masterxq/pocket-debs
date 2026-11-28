@@ -1,0 +1,188 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 12:22:39 +0100
+Subject: [PATCH] notifications: privacy levels on the lock screen, in popups and the drawer
+Description:
+ The lock screen showed every notification in full, also with the
+ content of messages, and ignored the settings per application.
+ .
+ The views now set how much the notification model shows
+ (Notifications.visibility, lockScreen and the lock screen visibility
+ per application of libnotificationmanager): everything, only the sender of messages, only
+ the application, or nothing. The lock screen uses the visibility for the
+ lock screen, the stricter one of the application and the one a
+ notification asks for; popups use theirs, while locked the stricter one
+ with the lock screen; the drawer uses the history visibility and shows
+ no notifications over the lock screen. The model empties what may not be
+ shown, the cards show "New notification" when only the application may
+ be seen. Tapping a card still leads to its application after the unlock.
+ .
+ The lock screen mirrors the notifications through the same model as the
+ shell (watcher source) instead of WatchedNotificationsModel, so it gets
+ the filtering and the notifications that were there before it locked.
+ .
+ The time of a notification ("now", "5m ago") is translated in the
+ domain of the shell components; the greeter of the lock screen looked it
+ up in its own domain. A new notification only turns the display on if
+ the lock screen shows it.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later, LGPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/components/mobileshell/qml/popups/notifications/NotificationFeedback.qml b/components/mobileshell/qml/popups/notifications/NotificationFeedback.qml
+index d15d0f013..c45114e6a 100644
+--- a/components/mobileshell/qml/popups/notifications/NotificationFeedback.qml
++++ b/components/mobileshell/qml/popups/notifications/NotificationFeedback.qml
+@@ -153,7 +153,13 @@ Item {
+             HapticsPlugin.FeedbackEvents.trigger("unseen", shellId, f.missed, {}, 0);
+         }
+ 
+-        if (!quiet && !screenOn && f.kind !== "call" && ShellSettings.Settings.wakeScreenOnNotification) {
++        // the display shows the lock screen: nothing to wake up for if it hides the notification
++        const lockScreenVisibility = Math.max(s.lockScreenVisibility,
++                                              notifications.data(idx, N.LockScreenVisibilityRole) || N.VisibilityFull,
++                                              s.lockScreenVisibilityApplications[desktopEntry] || N.VisibilityFull,
++                                              s.lockScreenVisibilityServices[notifyRcName] || N.VisibilityFull);
++        if (!quiet && !screenOn && f.kind !== "call" && lockScreenVisibility < N.VisibilityHidden
++            && ShellSettings.Settings.wakeScreenOnNotification) {
+             HapticsPlugin.FeedbackEvents.wakeScreen();
+         }
+     }
+diff --git a/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml b/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml
+index 0b558959a..78f49fd06 100644
+--- a/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml
++++ b/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml
+@@ -33,6 +33,12 @@ QtObject {
+         showDismissed: false
+         blacklistedDesktopEntries: notificationSettings.popupBlacklistedApplications
+         blacklistedNotifyRcNames: notificationSettings.popupBlacklistedServices
++        // while locked a popup is on the lock screen
++        lockScreen: MobileShellState.LockscreenDBusClient.lockscreenActive
++        visibility: lockScreen ? Math.max(notificationSettings.popupVisibility, notificationSettings.lockScreenVisibility)
++                               : notificationSettings.popupVisibility
++        lockScreenVisibilityApplications: notificationSettings.lockScreenVisibilityApplications
++        lockScreenVisibilityServices: notificationSettings.lockScreenVisibilityServices
+         whitelistedDesktopEntries: notificationProvider.inhibited ? notificationSettings.doNotDisturbPopupWhitelistedApplications : []
+         whitelistedNotifyRcNames: notificationProvider.inhibited ? notificationSettings.doNotDisturbPopupWhitelistedServices : []
+ 
+diff --git a/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml b/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
+index 4eac92b16..52f6b76a0 100644
+--- a/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
++++ b/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
+@@ -53,7 +53,11 @@ Item {
+     readonly property string applicationName: model.applicationName
+     readonly property string originName: model.originName || ""
+ 
+-    readonly property string summary: model.summary
++    // only the application may be shown: the model left out the content
++    readonly property bool contentHidden: (model.visibility || NotificationManager.Notifications.VisibilityFull) >= NotificationManager.Notifications.VisibilityApplication
++    readonly property string summary: contentHidden && model.type === NotificationManager.Notifications.NotificationType
++                                      ? i18nd("plasma_org.kde.plasma.private.mobileshell", "New notification")
++                                      : model.summary
+     readonly property var time: model.updated || model.created
+ 
+     readonly property bool hasReplyAction: model.hasReplyAction || false
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationsUtils.js b/components/mobileshell/qml/widgets/notifications/NotificationsUtils.js
+index f017a422d..490934255 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationsUtils.js
++++ b/components/mobileshell/qml/widgets/notifications/NotificationsUtils.js
+@@ -42,12 +42,13 @@ function generateNotificationHeaderAgoText(time, jobState) {
+ 
+     const deltaMinutes = Math.floor((Date.now() - time.getTime()) / 1000 / 60);
+     if (deltaMinutes < 1) {
+-        return i18n("now");
++        // explicit domain: the lock screen greeter translates i18n() in its own domain
++        return i18nd("plasma_org.kde.plasma.private.mobileshell", "now");
+     }
+ 
+     // Received less than an hour ago, show relative minutes
+     if (deltaMinutes < 60) {
+-        return i18nc("Notification was added minutes ago, keep short", "%1m ago", deltaMinutes);
++        return i18ndc("plasma_org.kde.plasma.private.mobileshell", "Notification was added minutes ago, keep short", "%1m ago", deltaMinutes);
+     }
+     // Received less than a day ago, show time, 22 hours so the time isn't as ambiguous between today and yesterday
+     if (deltaMinutes < 60 * 22) {
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+index b9f8150b1..361b81140 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+@@ -337,7 +337,8 @@ Item {
+             width: parent.width - (Kirigami.Units.gridUnit * 4)
+ 
+             text: i18n("Notification service not available")
+-            visible: list.count === 0 && !NotificationManager.Server.valid && historyModelType === NotificationsModelType.NotificationsModel
++            // the lock screen is not the server, it mirrors the notifications of the shell
++            visible: list.count === 0 && !root.inLockScreen && !NotificationManager.Server.valid && historyModelType === NotificationsModelType.NotificationsModel
+ 
+             PlasmaComponents3.Label {
+                 // Checking valid to avoid creating ServerInfo object if everything is alright
+diff --git a/containments/panel/qml/StatusPanel.qml b/containments/panel/qml/StatusPanel.qml
+index fc0655b99..719c06d50 100644
+--- a/containments/panel/qml/StatusPanel.qml
++++ b/containments/panel/qml/StatusPanel.qml
+@@ -163,6 +163,9 @@ Item {
+             expandUnread: true
+             blacklistedDesktopEntries: drawer.actionDrawer.notificationSettings.historyBlacklistedApplications
+             blacklistedNotifyRcNames: drawer.actionDrawer.notificationSettings.historyBlacklistedServices
++            // over the lock screen the drawer has the quick settings, the notifications are on the lock screen
++            visibility: MobileShellState.LockscreenDBusClient.lockscreenActive ? NotificationManager.Notifications.VisibilityHidden
++                                                                                 : drawer.actionDrawer.notificationSettings.historyVisibility
+             urgencies: {
+                 var urgencies = NotificationManager.Notifications.CriticalUrgency
+                             | NotificationManager.Notifications.NormalUrgency;
+diff --git a/po/de/plasma_org.kde.plasma.private.mobileshell.po b/po/de/plasma_org.kde.plasma.private.mobileshell.po
+index 28cc96ab4..5215448f0 100644
+--- a/po/de/plasma_org.kde.plasma.private.mobileshell.po
++++ b/po/de/plasma_org.kde.plasma.private.mobileshell.po
+@@ -353,6 +353,11 @@ msgstr "Vorgang abgeschlossen"
+ msgid "now"
+ msgstr "jetzt"
+ 
++#: qml/widgets/notifications/BaseNotificationItem.qml
++#, kde-format
++msgid "New notification"
++msgstr "Neue Benachrichtigung"
++
+ #: qml/widgets/notifications/NotificationsUtils.js:50
+ #, kde-format
+ msgctxt "Notification was added minutes ago, keep short"
+diff --git a/shell/contents/lockscreen/LockScreen.qml b/shell/contents/lockscreen/LockScreen.qml
+index 1bc939662..9c0037118 100644
+--- a/shell/contents/lockscreen/LockScreen.qml
++++ b/shell/contents/lockscreen/LockScreen.qml
+@@ -26,7 +26,21 @@ Item {
+     id: root
+ 
+     readonly property var lockScreenState: LockScreenState {}
+-    readonly property var notifModel: Notifications.WatchedNotificationsModel {}
++    readonly property var notifSettings: Notifications.Settings {}
++    // the notifications of the server in the shell, with what the lock screen may show of them
++    readonly property var notifModel: Notifications.Notifications {
++        source: Notifications.Notifications.WatcherSource
++        lockScreen: true
++        visibility: root.notifSettings.lockScreenVisibility
++        lockScreenVisibilityApplications: root.notifSettings.lockScreenVisibilityApplications
++        lockScreenVisibilityServices: root.notifSettings.lockScreenVisibilityServices
++        showExpired: true
++        showDismissed: true
++        showJobs: false
++        groupMode: Notifications.Notifications.GroupDisabled
++        sortMode: Notifications.Notifications.SortByDate
++        sortOrder: Qt.DescendingOrder
++    }
+ 
+     // Only show widescreen mode for short height devices (ex. phone landscape)
+     readonly property bool isWidescreen: root.height < Kirigami.Units.gridUnit * 25 && (root.height < root.width * 0.75)
+diff --git a/shell/contents/lockscreen/NotificationsComponent.qml b/shell/contents/lockscreen/NotificationsComponent.qml
+index 5ae6898a6..021be2021 100644
+--- a/shell/contents/lockscreen/NotificationsComponent.qml
++++ b/shell/contents/lockscreen/NotificationsComponent.qml
+@@ -84,7 +84,7 @@ Loader {
+                 anchors.fill: parent
+                 opacity: 0 // we display with the opacity gradient below
+ 
+-                historyModelType: MobileShell.NotificationsModelType.WatchedNotificationsModel
++                historyModelType: MobileShell.NotificationsModelType.NotificationsModel
+                 actionsRequireUnlock: true
+                 historyModel: root.notificationsModel
+                 notificationSettings: root.notificationSettings

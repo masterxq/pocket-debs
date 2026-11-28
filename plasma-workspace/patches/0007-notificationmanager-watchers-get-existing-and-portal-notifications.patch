@@ -1,0 +1,319 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 12:23:05 +0100
+Subject: [PATCH] notificationmanager: watchers get the existing and the portal notifications
+Description:
+ A notification watcher (the lock screen) only saw notifications that
+ arrived after it registered, without the desktop entry the server
+ resolved itself, and never notifications of the portal.
+ .
+ The server keeps the watcher arguments with each notification and sends
+ the notifications of the model to a watcher when it registers. Portal
+ notifications go to the watchers as well (added, replaced, removed);
+ actions a watcher invokes on them go to the portal.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/libnotificationmanager/notificationsmodel.cpp b/libnotificationmanager/notificationsmodel.cpp
+index 21a1fceff4..1cc1fe803a 100644
+--- a/libnotificationmanager/notificationsmodel.cpp
++++ b/libnotificationmanager/notificationsmodel.cpp
+@@ -35,6 +35,17 @@ NotificationsModel::NotificationsModel()
+     connect(&Server::self(), &Server::notificationRemoved, this, [this](uint removedId, Server::CloseReason reason) {
+         onNotificationRemoved(removedId, reason);
+     });
++    connect(&Server::self(), &Server::watcherRegistered, this, [this](const QString &service) {
++        // A watcher (the lock screen) gets the notifications that are already there
++        const auto notificationList = notifications();
++        for (const Notification &notification : notificationList) {
++            QVariantList arguments = notification.d->watcherArguments;
++            if (arguments.size() > 2) {
++                arguments[2] = 0u; // replaces_id
++                Server::self().notifyWatchers(arguments, service);
++            }
++        }
++    });
+     connect(&Server::self(), &Server::serviceOwnershipLost, this, [this] {
+         // Expire all notifications as we're defunct now
+         const auto notificationList = notifications();
+diff --git a/libnotificationmanager/portalnotificationsmodel.cpp b/libnotificationmanager/portalnotificationsmodel.cpp
+index b0f0154a14..89201b219c 100644
+--- a/libnotificationmanager/portalnotificationsmodel.cpp
++++ b/libnotificationmanager/portalnotificationsmodel.cpp
+@@ -31,16 +31,92 @@ PortalNotificationsModel::PortalNotificationsModel()
+ {
+     connect(&Portal::self(), &Portal::notificationAdded, this, [this](const Notification &notification) {
+         onNotificationAdded(notification);
++        Server::self().notifyWatchers(watcherArguments(notification, 0));
+     });
+     connect(&Portal::self(), &Portal::notificationReplaced, this, [this](uint replacedId, const Notification &notification) {
+         onNotificationReplaced(replacedId, notification);
++        Server::self().notifyWatchers(watcherArguments(notification, replacedId));
+     });
+     connect(&Portal::self(), &Portal::notificationRemoved, this, [this](uint removedId) {
+         onNotificationRemoved(removedId, Server::CloseReason::Revoked);
++        Server::self().closeOnWatchers(removedId);
++    });
++    // Watchers (the lock screen) show portal notifications as well
++    connect(&Server::self(), &Server::watcherRegistered, this, [this](const QString &service) {
++        const auto notificationList = notifications();
++        for (const Notification &notification : notificationList) {
++            Server::self().notifyWatchers(watcherArguments(notification, 0), service);
++        }
++    });
++    connect(&Server::self(), &Server::watcherInvokedAction, this, [this](uint id, const QString &actionName) {
++        if (rowOfNotification(id) < 0) {
++            return;
++        }
++        if (actionName == QLatin1String("default")) {
++            invokeDefaultAction(id, Notifications::None);
++        } else {
++            invokeAction(id, actionName, Notifications::None);
++        }
+     });
+     Portal::self().init();
+ }
+ 
++QVariantList PortalNotificationsModel::watcherArguments(const Notification &notification, uint replacesId)
++{
++    QStringList actions;
++    if (notification.hasDefaultAction()) {
++        actions << QStringLiteral("default") << notification.defaultActionLabel();
++    }
++    const QStringList actionNames = notification.actionNames();
++    const QStringList actionLabels = notification.actionLabels();
++    for (int i = 0; i < actionNames.size() && i < actionLabels.size(); ++i) {
++        actions << actionNames.at(i) << actionLabels.at(i);
++    }
++
++    QVariantMap hints;
++    hints.insert(QStringLiteral("desktop-entry"), notification.desktopEntry());
++    if (!notification.category().isEmpty()) {
++        hints.insert(QStringLiteral("category"), notification.category());
++    }
++    switch (notification.urgency()) {
++    case Notifications::LowUrgency:
++        hints.insert(QStringLiteral("urgency"), 0);
++        break;
++    case Notifications::NormalUrgency:
++        hints.insert(QStringLiteral("urgency"), 1);
++        break;
++    case Notifications::CriticalUrgency:
++        hints.insert(QStringLiteral("urgency"), 2);
++        break;
++    }
++    switch (notification.lockScreenVisibility()) {
++    case Notifications::VisibilityFull:
++        break;
++    case Notifications::VisibilitySender:
++        hints.insert(QStringLiteral("x-kde-lock-screen-visibility"), QStringLiteral("sender"));
++        break;
++    case Notifications::VisibilityApplication:
++        hints.insert(QStringLiteral("x-kde-lock-screen-visibility"), QStringLiteral("application"));
++        break;
++    case Notifications::VisibilityHidden:
++        hints.insert(QStringLiteral("x-kde-lock-screen-visibility"), QStringLiteral("hidden"));
++        break;
++    }
++    if (!notification.icon().isEmpty()) {
++        hints.insert(QStringLiteral("image-path"), notification.icon());
++    }
++
++    return {notification.id(),
++            notification.applicationName(),
++            replacesId,
++            notification.applicationIconName(),
++            notification.summary(),
++            notification.rawBody(),
++            actions,
++            hints,
++            notification.timeout()};
++}
++
+ void PortalNotificationsModel::expire(uint notificationId)
+ {
+     if (rowOfNotification(notificationId) > -1) {
+diff --git a/libnotificationmanager/portalnotificationsmodel.h b/libnotificationmanager/portalnotificationsmodel.h
+index 72e32e952f..8337f7e987 100644
+--- a/libnotificationmanager/portalnotificationsmodel.h
++++ b/libnotificationmanager/portalnotificationsmodel.h
+@@ -29,6 +29,7 @@ public:
+     void configure(uint notificationId);
+ 
+ private:
++    static QVariantList watcherArguments(const Notification &notification, uint replacesId);
+     PortalNotificationsModel();
+ };
+ 
+diff --git a/libnotificationmanager/server.cpp b/libnotificationmanager/server.cpp
+index 59becf2715..ae2e38ecd8 100644
+--- a/libnotificationmanager/server.cpp
++++ b/libnotificationmanager/server.cpp
+@@ -16,6 +16,9 @@
+ #include <KStartupInfo>
+ #include <KWaylandExtras>
+ #include <KWindowSystem>
++#include <QDBusConnection>
++#include <QDBusMessage>
++#include <QDBusServiceWatcher>
+ #include <QDebug>
+ 
+ using namespace NotificationManager;
+@@ -64,6 +67,31 @@ ServerInfo *Server::currentOwner() const
+     return d->currentOwner();
+ }
+ 
++void Server::notifyWatchers(const QVariantList &notifyArguments, const QString &service)
++{
++    const QStringList services = service.isEmpty() ? d->m_notificationWatchers->watchedServices() : QStringList{service};
++    for (const QString &watcher : services) {
++        QDBusMessage msg = QDBusMessage::createMethodCall(watcher,
++                                                          QStringLiteral("/NotificationWatcher"),
++                                                          QStringLiteral("org.kde.NotificationWatcher"),
++                                                          QStringLiteral("Notify"));
++        msg.setArguments(notifyArguments);
++        QDBusConnection::sessionBus().call(msg, QDBus::NoBlock);
++    }
++}
++
++void Server::closeOnWatchers(uint id)
++{
++    for (const QString &watcher : d->m_notificationWatchers->watchedServices()) {
++        QDBusMessage msg = QDBusMessage::createMethodCall(watcher,
++                                                          QStringLiteral("/NotificationWatcher"),
++                                                          QStringLiteral("org.kde.NotificationWatcher"),
++                                                          QStringLiteral("CloseNotification"));
++        msg.setArguments({id});
++        QDBusConnection::sessionBus().call(msg, QDBus::NoBlock);
++    }
++}
++
+ void Server::closeNotification(uint notificationId, CloseReason reason)
+ {
+     d->m_notificationServices.remove(notificationId);
+diff --git a/libnotificationmanager/server.h b/libnotificationmanager/server.h
+index 795170ab5d..cc5336d628 100644
+--- a/libnotificationmanager/server.h
++++ b/libnotificationmanager/server.h
+@@ -173,6 +173,23 @@ public:
+      */
+     uint add(const Notification &notification);
+ 
++    /**
++     * Sends a notification to the notification watchers
++     *
++     * @param notifyArguments The arguments of org.kde.NotificationWatcher.Notify
++     * @param service The watcher to send it to, all watchers if empty
++     * @since 6.7
++     */
++    void notifyWatchers(const QVariantList &notifyArguments, const QString &service = QString());
++
++    /**
++     * Tells the notification watchers that a notification is closed
++     *
++     * @param id The notification ID
++     * @since 6.7
++     */
++    void closeOnWatchers(uint id);
++
+ Q_SIGNALS:
+     /**
+      * Emitted when the notification service validity changes,
+@@ -227,6 +244,21 @@ Q_SIGNALS:
+      */
+     void serviceOwnershipLost();
+ 
++    /**
++     * Emitted when a notification watcher registered. The notifications
++     * that are already there should be sent to it with @c notifyWatchers.
++     * @since 6.7
++     */
++    void watcherRegistered(const QString &service);
++
++    /**
++     * Emitted when a notification watcher invokes an action of a
++     * notification that did not come through this server (a portal
++     * notification).
++     * @since 6.7
++     */
++    void watcherInvokedAction(uint id, const QString &actionName);
++
+ private:
+     explicit Server(QObject *parent = nullptr);
+     Q_DISABLE_COPY(Server)
+diff --git a/libnotificationmanager/server_p.cpp b/libnotificationmanager/server_p.cpp
+index 14e44dba2f..85a94984f9 100644
+--- a/libnotificationmanager/server_p.cpp
++++ b/libnotificationmanager/server_p.cpp
+@@ -233,6 +233,25 @@ uint ServerPrivate::Notify(const QString &app_name,
+     m_lastNotification = notification;
+     m_notificationServices.insert(notificationId, message().service());
+ 
++    // What the watchers get, with the desktop entry resolved here; kept with the
++    // notification for watchers that register later
++    QVariantMap watcherHints = hints;
++    if (!notification.desktopEntry().isEmpty()) {
++        watcherHints.insert(QStringLiteral("desktop-entry"), notification.desktopEntry());
++    }
++    const QVariantList watcherArguments{notificationId,
++                                        notification.applicationName(),
++                                        replaces_id,
++                                        notification.applicationIconName(),
++                                        notification.summary(),
++                                        // we pass raw body data since this data goes through another sanitization
++                                        // in WatchedNotificationsModel when notification object is created.
++                                        notification.rawBody(),
++                                        actions,
++                                        watcherHints,
++                                        notification.timeout()};
++    notification.d->watcherArguments = watcherArguments;
++
+     if (wasReplaced) {
+         notification.resetUpdated();
+         Q_EMIT static_cast<Server *>(parent())->notificationReplaced(replaces_id, notification);
+@@ -242,24 +261,7 @@ uint ServerPrivate::Notify(const QString &app_name,
+ 
+     // currently we dispatch all notification, this is ugly
+     // TODO: come up with proper authentication/user selection
+-    for (const QString &service : m_notificationWatchers->watchedServices()) {
+-        QDBusMessage msg = QDBusMessage::createMethodCall(service,
+-                                                          QStringLiteral("/NotificationWatcher"),
+-                                                          QStringLiteral("org.kde.NotificationWatcher"),
+-                                                          QStringLiteral("Notify"));
+-        msg.setArguments({notificationId,
+-                          notification.applicationName(),
+-                          replaces_id,
+-                          notification.applicationIconName(),
+-                          notification.summary(),
+-                          // we pass raw body data since this data goes through another sanitization
+-                          // in WatchedNotificationsModel when notification object is created.
+-                          notification.rawBody(),
+-                          actions,
+-                          hints,
+-                          notification.timeout()});
+-        QDBusConnection::sessionBus().call(msg, QDBus::NoBlock);
+-    }
++    static_cast<Server *>(parent())->notifyWatchers(watcherArguments);
+ 
+     return notificationId;
+ }
+@@ -543,6 +545,7 @@ void ServerPrivate::clearExternalInhibitions()
+ void ServerPrivate::RegisterWatcher()
+ {
+     m_notificationWatchers->addWatchedService(message().service());
++    Q_EMIT static_cast<Server *>(parent())->watcherRegistered(message().service());
+ }
+ 
+ void ServerPrivate::UnRegisterWatcher()
+@@ -552,6 +555,10 @@ void ServerPrivate::UnRegisterWatcher()
+ 
+ void ServerPrivate::InvokeAction(uint id, const QString &actionKey)
+ {
++    if (Portal::isPortalNotificationId(id)) {
++        Q_EMIT static_cast<Server *>(parent())->watcherInvokedAction(id, actionKey);
++        return;
++    }
+     Q_EMIT ActionInvoked(id, actionKey);
+ }
+ 
