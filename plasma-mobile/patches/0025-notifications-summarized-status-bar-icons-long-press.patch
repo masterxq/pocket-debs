@@ -1,0 +1,1426 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 13:13:21 +0100
+Subject: [PATCH] notifications: summarized conversations, status bar icons, application settings on a long press
+Description:
+ A chat with many messages filled the drawer, the lock screen and the
+ popups, and the shell did not show which applications have
+ notifications.
+ .
+ Notifications of the same application and conversation are summarized
+ from two on (libnotificationmanager GroupConversationsFlat): the drawer
+ shows the newest of a conversation and the others behind "Show more";
+ where only the application may be shown, a group of an application
+ says how many notifications it has, where only the sender may be
+ shown, how many messages. Dismissing a summarized notification
+ dismisses its group. Of the popups of a conversation only the newest
+ stays, the older ones expire into the drawer.
+ .
+ The lock screen has a fixed area for notifications: it does not scroll,
+ it shows the groups that fit and below them how many notifications are
+ left out. When the conversations do not fit, the notifications are
+ summarized by application until there are fewer of them.
+ .
+ The status bar shows the icons of the applications with notifications
+ in the drawer, newest first; while locked those the lock screen shows.
+ At most as many as set in the shell settings (statusBarNotificationIcons
+ in plasmamobilerc, default 4, 0 for none); with more applications one
+ icon less and an ellipsis. Applications with badges turned off in the
+ notification settings are left out.
+ .
+ A long press on a notification card shows the settings of its
+ application: mute it (only the LED), show it on the lock screen or not,
+ and its page in the notification settings (its own settings action if
+ it has one; not on the lock screen). The feedback set for an
+ application in the notification settings applies to sound, vibration,
+ LED and turning on the display.
+ .
+ The cards of notifications on the lock screen were empty: the greeter
+ renders with the software backend, which draws no layers, and the card
+ clipped its content through a layer (and the list through an opacity
+ mask). The card uses the layer only with a hardware renderer now.
+ "Show more" appears below the last shown notification of every group,
+ also when a single notification follows it.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later, GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL, LGPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/components/mobileshell/CMakeLists.txt b/components/mobileshell/CMakeLists.txt
+index 0f905cd67..e4a62316f 100644
+--- a/components/mobileshell/CMakeLists.txt
++++ b/components/mobileshell/CMakeLists.txt
+@@ -101,6 +101,7 @@ ecm_target_qml_sources(mobileshellplugin SOURCES
+     qml/statusbar/indicators/BluetoothIndicator.qml
+     qml/statusbar/indicators/HotspotIndicator.qml
+     qml/statusbar/indicators/IndicatorPulse.qml
++    qml/statusbar/indicators/NotificationIndicator.qml
+     qml/statusbar/indicators/SignalStrengthIndicator.qml
+     qml/statusbar/indicators/StatusGlyph.qml
+     qml/statusbar/indicators/VolumeIndicator.qml
+@@ -121,6 +122,7 @@ ecm_target_qml_sources(mobileshellplugin SOURCES
+     qml/widgets/notifications/NotificationItem.qml
+     qml/widgets/notifications/NotificationJobDetails.qml
+     qml/widgets/notifications/NotificationJobItem.qml
++    qml/widgets/notifications/NotificationOptions.qml
+     qml/widgets/notifications/NotificationPopupItem.qml
+     qml/widgets/notifications/NotificationReplyField.qml
+     qml/widgets/notifications/NotificationsModelType.qml
+diff --git a/components/mobileshell/qml/popups/notifications/NotificationFeedback.qml b/components/mobileshell/qml/popups/notifications/NotificationFeedback.qml
+index c45114e6a..1b3110a13 100644
+--- a/components/mobileshell/qml/popups/notifications/NotificationFeedback.qml
++++ b/components/mobileshell/qml/popups/notifications/NotificationFeedback.qml
+@@ -21,6 +21,8 @@ import org.kde.plasma.private.mobileshell.dpmsplugin as DPMS
+  *
+  * - Applications using KNotification play their own sounds, so their
+  *   events get no sound from feedbackd.
++ * - The feedback set for an application (Settings.Feedback) reduces it:
++ *   muted is only the LED, none is nothing.
+  * - Do not disturb: only alarms keep their feedback, everything else
+  *   (incoming calls too) only lights the LED.
+  * - A notification that arrives while the phone is locked or the
+@@ -121,6 +123,13 @@ Item {
+             return;
+         }
+ 
++        // the feedback of the application, Settings.Feedback
++        const feedback = Math.max(s.feedbackApplications[desktopEntry] || NotificationManager.Settings.FeedbackFull,
++                                  s.feedbackServices[notifyRcName] || NotificationManager.Settings.FeedbackFull);
++        if (feedback >= NotificationManager.Settings.FeedbackNone) {
++            return;
++        }
++
+         const id = notifications.data(idx, N.IdRole);
+         const category = notifications.data(idx, N.CategoryRole) || "";
+         const notificationHints = notifications.data(idx, N.HintsRole) || {};
+@@ -132,10 +141,11 @@ Item {
+         const quiet = inhibited && !exempt;
+ 
+         const hints = {};
+-        if (quiet) {
++        if (quiet || feedback === NotificationManager.Settings.FeedbackSilent) {
+             hints.profile = "silent";
+-        } else if (notificationHints["suppress-sound"] === true || ("x-kde-appname" in notificationHints)) {
+-            // the application plays its sound itself
++        } else if (feedback === NotificationManager.Settings.FeedbackQuiet
++                   || notificationHints["suppress-sound"] === true || ("x-kde-appname" in notificationHints)) {
++            // no sound, or the application plays its sound itself
+             hints.profile = "quiet";
+         } else if (notificationHints["sound-file"]) {
+             hints["sound-file"] = notificationHints["sound-file"];
+@@ -159,6 +169,7 @@ Item {
+                                               s.lockScreenVisibilityApplications[desktopEntry] || N.VisibilityFull,
+                                               s.lockScreenVisibilityServices[notifyRcName] || N.VisibilityFull);
+         if (!quiet && !screenOn && f.kind !== "call" && lockScreenVisibility < N.VisibilityHidden
++            && feedback < NotificationManager.Settings.FeedbackSilent
+             && ShellSettings.Settings.wakeScreenOnNotification) {
+             HapticsPlugin.FeedbackEvents.wakeScreen();
+         }
+diff --git a/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml b/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml
+index 78f49fd06..50d15cb42 100644
+--- a/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml
++++ b/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml
+@@ -29,6 +29,20 @@ QtObject {
+     }
+ 
+     property QtObject popupNotificationsModel: NotificationManager.Notifications {
++        id: popupModel
++
++        // Of the notifications of a conversation only the newest pops up, the others are in the drawer
++        onRowsInserted: (parent, first, last) => {
++            const N = NotificationManager.Notifications;
++            for (let row = first; row <= last; ++row) {
++                const idx = popupModel.index(row, 0);
++                if (popupModel.data(idx, N.TypeRole) === N.NotificationType) {
++                    notificationProvider.newPopups.push(popupModel.data(idx, N.IdRole));
++                }
++            }
++            Qt.callLater(notificationProvider.replaceOlderPopups);
++        }
++
+         showExpired: false
+         showDismissed: false
+         blacklistedDesktopEntries: notificationSettings.popupBlacklistedApplications
+@@ -68,6 +82,75 @@ QtObject {
+         }
+     }
+ 
++    // ids of new popups whose older popups of the same conversation are still to be replaced
++    property var newPopups: []
++
++    // The application and conversation of a popup, as grouped in the drawer: the conversation the application
++    // names or the summary; both are empty if the popup only shows the application.
++    function conversationKey(idx) {
++        const N = NotificationManager.Notifications;
++        const model = popupNotificationsModel;
++        const conversation = model.data(idx, N.ConversationRole) || "";
++        return [model.data(idx, N.ApplicationNameRole) || "",
++                model.data(idx, N.DesktopEntryRole) || "",
++                model.data(idx, N.OriginNameRole) || "",
++                conversation !== "" ? "c:" + conversation : "s:" + (model.data(idx, N.SummaryRole) || "")].join("\n");
++    }
++
++    function replaceOlderPopups() {
++        const N = NotificationManager.Notifications;
++        const model = popupNotificationsModel;
++        const ids = newPopups;
++        newPopups = [];
++
++        const rowOf = id => {
++            for (let row = 0; row < model.count; ++row) {
++                if (model.data(model.index(row, 0), N.IdRole) === id) {
++                    return row;
++                }
++            }
++            return -1;
++        };
++
++        for (const id of ids) {
++            const newRow = rowOf(id);
++            if (newRow < 0) {
++                continue;
++            }
++            const newIdx = model.index(newRow, 0);
++            if (model.data(newIdx, N.UrgencyRole) === N.CriticalUrgency) {
++                continue;
++            }
++            const key = conversationKey(newIdx);
++            const created = model.data(newIdx, N.CreatedRole);
++
++            const older = [];
++            for (let row = 0; row < model.count; ++row) {
++                const idx = model.index(row, 0);
++                const otherId = model.data(idx, N.IdRole);
++                if (otherId !== id && model.data(idx, N.TypeRole) === N.NotificationType
++                    && model.data(idx, N.UrgencyRole) !== N.CriticalUrgency
++                    && model.data(idx, N.CreatedRole) <= created && conversationKey(idx) === key) {
++                    older.push(otherId);
++                }
++            }
++
++            for (const otherId of older) {
++                const row = rowOf(otherId);
++                if (row < 0) {
++                    continue;
++                }
++                const idx = model.index(row, 0);
++                if (model.data(idx, N.ResidentRole)) {
++                    // like a resident popup that timed out: it stays a notification
++                    model.setData(idx, true, N.ExpiredRole);
++                } else {
++                    model.expire(idx);
++                }
++            }
++        }
++    }
++
+     // TODO use pulseaudio-qt for this once it becomes a framework
+     property QtObject __pulseAudio: Loader {
+         source: "PulseAudio.qml"
+diff --git a/components/mobileshell/qml/statusbar/StatusBar.qml b/components/mobileshell/qml/statusbar/StatusBar.qml
+index 28beed6aa..26dcfab11 100644
+--- a/components/mobileshell/qml/statusbar/StatusBar.qml
++++ b/components/mobileshell/qml/statusbar/StatusBar.qml
+@@ -46,6 +46,11 @@ Item {
+      */
+     property bool showTime: true
+ 
++    /**
++     * Whether to show the icons of the applications with notifications.
++     */
++    property bool showNotificationIcons: false
++
+     readonly property real textPixelSize: Math.round(11 * ShellSettings.Settings.statusBarScaleFactor)
+     readonly property real smallerTextPixelSize: Math.round(9 * ShellSettings.Settings.statusBarScaleFactor)
+     readonly property real elementSpacing: Math.round(Kirigami.Units.smallSpacing * 1.5)
+@@ -113,6 +118,17 @@ Item {
+                     textPixelSize: root.textPixelSize
+                 }
+ 
++                Loader {
++                    active: root.showNotificationIcons
++                    visible: active && item && item.shown
++                    Layout.leftMargin: root.elementSpacing * 2
++                    Layout.maximumHeight: mainRow.rowHeight
++                    sourceComponent: MobileShell.NotificationIndicator {
++                        iconSize: Math.round(mainRow.rowHeight * 0.75)
++                        textPixelSize: root.textPixelSize
++                    }
++                }
++
+                 // spacing in the middle
+                 Item {
+                     Layout.fillWidth: true
+diff --git a/components/mobileshell/qml/statusbar/indicators/NotificationIndicator.qml b/components/mobileshell/qml/statusbar/indicators/NotificationIndicator.qml
+new file mode 100644
+index 000000000..550520a5c
+--- /dev/null
++++ b/components/mobileshell/qml/statusbar/indicators/NotificationIndicator.qml
+@@ -0,0 +1,120 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++import QtQuick
++import QtQuick.Layouts
++
++import org.kde.kirigami as Kirigami
++import org.kde.plasma.components 3.0 as PlasmaComponents
++import org.kde.notificationmanager as NotificationManager
++import org.kde.plasma.private.mobileshell.shellsettingsplugin as ShellSettings
++import org.kde.plasma.private.mobileshell.state as MobileShellState
++
++/**
++ * The icons of the applications with notifications in the drawer, newest first.
++ *
++ * While locked only the applications whose notifications the lock screen shows.
++ * At most ShellSettings.Settings.statusBarNotificationIcons icons; with more
++ * applications one icon less and an ellipsis. Applications with badges turned
++ * off in the notification settings are left out.
++ */
++RowLayout {
++    id: root
++
++    property real iconSize: Kirigami.Units.iconSizes.small
++    property real textPixelSize: 11
++
++    readonly property int maximum: ShellSettings.Settings.statusBarNotificationIcons
++    readonly property bool locked: MobileShellState.LockscreenDBusClient.lockscreenActive
++
++    // {key, icon} of each application, newest notification first
++    property var applications: []
++    readonly property bool overflowing: applications.length > maximum
++
++    // whether there is an icon to show (visible also depends on the parent)
++    readonly property bool shown: maximum > 0 && applications.length > 0
++
++    spacing: Math.round(Kirigami.Units.smallSpacing / 2)
++    visible: shown
++
++    function update() {
++        const N = NotificationManager.Notifications;
++        const hiddenApplications = settings.badgeBlacklistedApplications;
++        const hiddenServices = settings.badgeBlacklistedServices;
++        const seen = new Set();
++        const list = [];
++        for (let row = 0; row < notifications.count; ++row) {
++            const idx = notifications.index(row, 0);
++            const desktopEntry = notifications.data(idx, N.DesktopEntryRole) || "";
++            const notifyRcName = notifications.data(idx, N.NotifyRcNameRole) || "";
++            if ((desktopEntry !== "" && hiddenApplications.includes(desktopEntry))
++                || (notifyRcName !== "" && hiddenServices.includes(notifyRcName))) {
++                continue;
++            }
++            const key = desktopEntry || notifyRcName || notifications.data(idx, N.ApplicationNameRole) || "";
++            if (seen.has(key)) {
++                continue;
++            }
++            seen.add(key);
++            list.push({ key: key, icon: notifications.data(idx, N.ApplicationIconNameRole) || "preferences-desktop-notification-bell" });
++        }
++        applications = list;
++    }
++
++    NotificationManager.Settings {
++        id: settings
++        onSettingsChanged: Qt.callLater(root.update)
++    }
++
++    // the notifications that stay in the drawer until they are dismissed or closed by their application
++    NotificationManager.Notifications {
++        id: notifications
++
++        showExpired: true
++        showDismissed: true
++        showJobs: false
++        groupMode: NotificationManager.Notifications.GroupDisabled
++        sortMode: NotificationManager.Notifications.SortByDate
++        sortOrder: Qt.DescendingOrder
++        blacklistedDesktopEntries: settings.historyBlacklistedApplications
++        blacklistedNotifyRcNames: settings.historyBlacklistedServices
++        urgencies: NotificationManager.Notifications.CriticalUrgency
++                   | NotificationManager.Notifications.NormalUrgency
++                   | (settings.lowPriorityHistory ? NotificationManager.Notifications.LowUrgency : 0)
++
++        // over the lock screen the icons show what the lock screen shows
++        lockScreen: root.locked
++        visibility: root.locked ? settings.lockScreenVisibility : settings.historyVisibility
++        lockScreenVisibilityApplications: settings.lockScreenVisibilityApplications
++        lockScreenVisibilityServices: settings.lockScreenVisibilityServices
++
++        onCountChanged: Qt.callLater(root.update)
++        onDataChanged: Qt.callLater(root.update)
++        onLayoutChanged: Qt.callLater(root.update)
++        onModelReset: Qt.callLater(root.update)
++    }
++
++    Repeater {
++        model: root.overflowing ? Math.max(root.maximum - 1, 0) : root.applications.length
++
++        delegate: Kirigami.Icon {
++            required property int index
++
++            Layout.preferredWidth: root.iconSize
++            Layout.preferredHeight: root.iconSize
++            Layout.alignment: Qt.AlignVCenter
++            source: root.applications[index] ? root.applications[index].icon : ""
++        }
++    }
++
++    PlasmaComponents.Label {
++        Layout.alignment: Qt.AlignVCenter
++        visible: root.overflowing
++        text: "…"
++        font.pixelSize: root.textPixelSize
++        color: Kirigami.Theme.textColor
++    }
++}
+diff --git a/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml b/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
+index 52f6b76a0..6c12bbe6f 100644
+--- a/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
++++ b/components/mobileshell/qml/widgets/notifications/BaseNotificationItem.qml
+@@ -53,11 +53,27 @@ Item {
+     readonly property string applicationName: model.applicationName
+     readonly property string originName: model.originName || ""
+ 
++    readonly property string desktopEntry: model.desktopEntry || ""
++    readonly property string notifyRcName: model.notifyRcName || ""
++
++    // how much the model shows of the notification, NotificationManager.Notifications.Visibility
++    readonly property int visibility: model.visibility || NotificationManager.Notifications.VisibilityFull
+     // only the application may be shown: the model left out the content
+-    readonly property bool contentHidden: (model.visibility || NotificationManager.Notifications.VisibilityFull) >= NotificationManager.Notifications.VisibilityApplication
+-    readonly property string summary: contentHidden && model.type === NotificationManager.Notifications.NotificationType
+-                                      ? i18nd("plasma_org.kde.plasma.private.mobileshell", "New notification")
+-                                      : model.summary
++    readonly property bool contentHidden: visibility >= NotificationManager.Notifications.VisibilityApplication
++
++    // the number of notifications this one stands for: the only shown notification of a collapsed group stands for the group
++    readonly property int summarizedCount: inGroup && !model.isGroupExpanded && model.expandedGroupChildrenCount === 1
++                                           ? Math.max(model.groupChildrenCount || 1, 1) : 1
++
++    readonly property string summary: {
++        if (!contentHidden || model.type !== NotificationManager.Notifications.NotificationType) {
++            return model.summary;
++        }
++        if (summarizedCount > 1) {
++            return i18ndp("plasma_org.kde.plasma.private.mobileshell", "%1 new notification", "%1 new notifications", summarizedCount);
++        }
++        return i18nd("plasma_org.kde.plasma.private.mobileshell", "New notification");
++    }
+     readonly property var time: model.updated || model.created
+ 
+     readonly property bool hasReplyAction: model.hasReplyAction || false
+@@ -76,7 +92,10 @@ Item {
+     readonly property bool dismissed: model.dismissed || false
+     readonly property bool closable: model.closable
+ 
+-    readonly property string body: model.body || ""
++    // only the sender may be shown: a collapsed group says how many messages it has
++    readonly property string body: visibility === NotificationManager.Notifications.VisibilitySender && summarizedCount > 1
++                                   ? i18ndp("plasma_org.kde.plasma.private.mobileshell", "%1 new message", "%1 new messages", summarizedCount)
++                                   : (model.body || "")
+     readonly property var icon: model.image || model.iconName
+ 
+     readonly property var urls: model.urls || []
+@@ -140,7 +159,9 @@ Item {
+         if (notificationsModelType === NotificationsModelType.WatchedNotificationsModel) {
+             notificationsModel.close(model.notificationId);
+         } else if (notificationsModelType === NotificationsModelType.NotificationsModel) {
+-            notificationsModel.close(notificationsModel.index(modelIndex, 0));
++            const idx = notificationsModel.index(modelIndex, 0);
++            // dismissing a collapsed group dismisses all notifications it stands for
++            notificationsModel.close(summarizedCount > 1 ? notificationsModel.groupIndex(idx) : idx);
+         }
+     }
+ 
+@@ -149,6 +170,22 @@ Item {
+         notificationsModel.configure(notificationsModel.index(modelIndex, 0))
+     }
+ 
++    // The settings of the application: its own settings action, otherwise its page in the notification settings
++    function openSettings() {
++        if (configureActionLabel !== "") {
++            configure();
++            return;
++        }
++        const args = [];
++        if (desktopEntry !== "") {
++            args.push("--desktop-entry " + desktopEntry);
++        }
++        if (notifyRcName !== "") {
++            args.push("--notifyrc " + notifyRcName);
++        }
++        ShellUtil.executeCommand("plasma-settings -m kcm_notifications \"--args=" + args.join(" ") + "\"");
++    }
++
+     property var pendingAction: () => {}
+     function runPendingAction() {
+         pendingAction();
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationCard.qml b/components/mobileshell/qml/widgets/notifications/NotificationCard.qml
+index 6c0e4a39d..a371abe22 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationCard.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationCard.qml
+@@ -59,6 +59,11 @@ Item {
+      */
+     property bool tapEnabled: false
+ 
++    /**
++     * Whether a long press on this notification is enabled.
++     */
++    property bool longPressEnabled: false
++
+     /**
+      * Whether swipping on this notification is enabled.
+      */
+@@ -70,6 +75,7 @@ Item {
+     property real dragOffset: 0
+ 
+     signal tapped()
++    signal longPressed()
+     signal dismissRequested()
+     signal configureClicked() // TODO implement settings button
+     signal dragStart()
+@@ -158,8 +164,8 @@ Item {
+             }
+         }
+ 
+-        // clip
+-        layer.enabled: true
++        // clip; the software renderer (the lock screen greeter) draws no layers
++        layer.enabled: GraphicsInfo.api !== GraphicsInfo.Software
+ 
+         // ensure this is behind the content to not interfere
+         MouseArea {
+@@ -170,6 +176,14 @@ Item {
+                     root.tapped()
+                 }
+             }
++            onPressAndHold: mouse => {
++                if (root.longPressEnabled && root.dragOffset === 0) {
++                    root.longPressed();
++                } else {
++                    // a release still counts as a tap
++                    mouse.accepted = false;
++                }
++            }
+         }
+ 
+         // content parent
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationItem.qml b/components/mobileshell/qml/widgets/notifications/NotificationItem.qml
+index 3c7078199..3bb1e50b4 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationItem.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationItem.qml
+@@ -29,6 +29,11 @@ BaseNotificationItem {
+ 
+     property var cardColorScheme: Kirigami.Theme.View
+ 
++    // the settings of the application instead of the content (long press)
++    property bool optionsShown: false
++    readonly property bool optionsAvailable: notificationType === NotificationManager.Notifications.NotificationType
++                                             && (desktopEntry !== "" || notifyRcName !== "")
++
+     signal dragStart()
+     signal dragEnd()
+     signal takeFocus()
+@@ -56,8 +61,10 @@ BaseNotificationItem {
+         anchors.left: parent.left
+         anchors.right: parent.right
+ 
+-        tapEnabled: notificationItem.hasDefaultAction
++        tapEnabled: notificationItem.hasDefaultAction && !notificationItem.optionsShown
+         onTapped: notificationItem.actionInvoked("default");
++        longPressEnabled: notificationItem.optionsAvailable && !notificationItem.optionsShown
++        onLongPressed: notificationItem.optionsShown = true
+         swipeGestureEnabled: notificationItem.closable
+         onDismissRequested: notificationItem.close();
+         inLockScreen: notificationItem.inLockScreen
+@@ -69,131 +76,157 @@ BaseNotificationItem {
+         Kirigami.Theme.inherit: false
+         Kirigami.Theme.colorSet: notificationItem.cardColorScheme
+ 
+-        ColumnLayout {
+-            id: column
+-            spacing: 0
+-
+-            // notification summary row
+-            RowLayout {
+-                Layout.alignment: Qt.AlignRight
+-                Layout.fillWidth: summaryLabel.visible
+-                Layout.bottomMargin: Kirigami.Units.smallSpacing
+-
+-                // notification summary
+-                PlasmaComponents.Label {
+-                    id: summaryLabel
+-                    Layout.fillWidth: true
+-                    textFormat: Text.PlainText
+-                    maximumLineCount: 3
+-                    wrapMode: Text.WordWrap
+-                    elide: Text.ElideRight
+-                    font.pointSize: Kirigami.Theme.defaultFont.pointSize
+-                    text: MobileShell.NotificationsUtils.determineNotificationHeadingText(notificationItem)
+-                    visible: text !== ""
+-                    font.weight: Font.DemiBold
+-                }
+-
+-                // notification timestamp
+-                NotificationTimeText {
+-                    Layout.alignment: Qt.AlignRight | Qt.AlignTop
+-                    notificationType: notificationItem.notificationType
+-                    jobState: notificationItem.jobState
+-                    jobDetails: notificationItem.jobDetails
++        Item {
++            implicitHeight: notificationItem.optionsShown && optionsLoader.item ? optionsLoader.item.implicitHeight : column.implicitHeight
+ 
+-                    time: notificationItem.time
+-                    clockSource: notificationItem.clockSource
++            Loader {
++                id: optionsLoader
++                anchors.left: parent.left
++                anchors.right: parent.right
++                anchors.top: parent.top
++                active: notificationItem.optionsShown
++
++                sourceComponent: NotificationOptions {
++                    applicationName: notificationItem.applicationName
++                    desktopEntry: notificationItem.desktopEntry
++                    notifyRcName: notificationItem.notifyRcName
++                    // the lock screen cannot start applications
++                    settingsAvailable: !notificationItem.inLockScreen
++                    onCloseRequested: notificationItem.optionsShown = false
++                    onSettingsRequested: notificationItem.openSettings()
+                 }
+             }
+ 
+-            // notification contents
+-            RowLayout {
+-                Layout.fillWidth: true
+-                spacing: Kirigami.Units.smallSpacing
++            ColumnLayout {
++                id: column
++                anchors.left: parent.left
++                anchors.right: parent.right
++                anchors.top: parent.top
++                visible: !notificationItem.optionsShown
++                spacing: 0
++
++                // notification summary row
++                RowLayout {
++                    Layout.alignment: Qt.AlignRight
++                    Layout.fillWidth: summaryLabel.visible
++                    Layout.bottomMargin: Kirigami.Units.smallSpacing
+ 
++                    // notification summary
++                    PlasmaComponents.Label {
++                        id: summaryLabel
++                        Layout.fillWidth: true
++                        textFormat: Text.PlainText
++                        maximumLineCount: 3
++                        wrapMode: Text.WordWrap
++                        elide: Text.ElideRight
++                        font.pointSize: Kirigami.Theme.defaultFont.pointSize
++                        text: MobileShell.NotificationsUtils.determineNotificationHeadingText(notificationItem)
++                        visible: text !== ""
++                        font.weight: Font.DemiBold
++                    }
+ 
+-                // notification text
+-                NotificationBodyLabel {
+-                    id: bodyLabel
+-                    Layout.alignment: Qt.AlignTop | Qt.AlignLeft
+-                    Layout.preferredWidth: column.width - iconContainer.width - Kirigami.Units.smallSpacing
++                    // notification timestamp
++                    NotificationTimeText {
++                        Layout.alignment: Qt.AlignRight | Qt.AlignTop
++                        notificationType: notificationItem.notificationType
++                        jobState: notificationItem.jobState
++                        jobDetails: notificationItem.jobDetails
+ 
+-                    text: ShellUtil.toPlainText(notificationItem.body)
++                        time: notificationItem.time
++                        clockSource: notificationItem.clockSource
++                    }
+                 }
+ 
+-                // notification icon
+-                Item {
+-                    id: iconContainer
+-                    Layout.preferredWidth: Kirigami.Units.iconSizes.large
+-                    Layout.preferredHeight: Kirigami.Units.iconSizes.large
+-                    Layout.topMargin: Kirigami.Units.smallSpacing
+-                    Layout.bottomMargin: Kirigami.Units.smallSpacing
++                // notification contents
++                RowLayout {
++                    Layout.fillWidth: true
++                    spacing: Kirigami.Units.smallSpacing
++
++
++                    // notification text
++                    NotificationBodyLabel {
++                        id: bodyLabel
++                        Layout.alignment: Qt.AlignTop | Qt.AlignLeft
++                        Layout.preferredWidth: column.width - iconContainer.width - Kirigami.Units.smallSpacing
+ 
+-                    visible: iconItem.shouldBeShown
+-
+-                    Kirigami.Icon {
+-                        id: iconItem
+-                        // don't show two identical icons
+-                        readonly property bool shouldBeShown: valid && source != notificationItem.applicationIconSource
+-                        anchors.fill: parent
+-                        smooth: true
+-                        // don't show a generic "info" icon since this is a notification already
+-                        source: notificationItem.icon !== "dialog-information" ? notificationItem.icon : ""
+-                        visible: shouldBeShown
++                        text: ShellUtil.toPlainText(notificationItem.body)
++                    }
++
++                    // notification icon
++                    Item {
++                        id: iconContainer
++                        Layout.preferredWidth: Kirigami.Units.iconSizes.large
++                        Layout.preferredHeight: Kirigami.Units.iconSizes.large
++                        Layout.topMargin: Kirigami.Units.smallSpacing
++                        Layout.bottomMargin: Kirigami.Units.smallSpacing
++
++                        visible: iconItem.shouldBeShown
++
++                        Kirigami.Icon {
++                            id: iconItem
++                            // don't show two identical icons
++                            readonly property bool shouldBeShown: valid && source != notificationItem.applicationIconSource
++                            anchors.fill: parent
++                            smooth: true
++                            // don't show a generic "info" icon since this is a notification already
++                            source: notificationItem.icon !== "dialog-information" ? notificationItem.icon : ""
++                            visible: shouldBeShown
++                        }
+                     }
+                 }
+-            }
+ 
+-            // Job progress reporting
+-            Loader {
+-                id: jobLoader
+-                Layout.fillWidth: true
+-                Layout.preferredHeight: item ? item.implicitHeight : 0
+-                active: notificationItem.notificationType === NotificationManager.Notifications.JobType
+-                visible: active
+-                sourceComponent: NotificationJobItem {
+-                    iconContainerItem: iconContainer
+-
+-                    jobState: notificationItem.jobState
+-                    jobError: notificationItem.jobError
+-                    percentage: notificationItem.percentage
+-                    suspendable: notificationItem.suspendable
+-                    killable: notificationItem.killable
+-
+-                    jobDetails: notificationItem.jobDetails
+-
+-                    onSuspendJobClicked: notificationItem.suspendJobClicked()
+-                    onResumeJobClicked: notificationItem.resumeJobClicked()
+-                    onKillJobClicked: notificationItem.killJobClicked()
+-
+-                    onOpenUrl: notificationItem.openUrl(url)
+-                    onFileActionInvoked: notificationItem.fileActionInvoked(action)
++                // Job progress reporting
++                Loader {
++                    id: jobLoader
++                    Layout.fillWidth: true
++                    Layout.preferredHeight: item ? item.implicitHeight : 0
++                    active: notificationItem.notificationType === NotificationManager.Notifications.JobType
++                    visible: active
++                    sourceComponent: NotificationJobItem {
++                        iconContainerItem: iconContainer
++
++                        jobState: notificationItem.jobState
++                        jobError: notificationItem.jobError
++                        percentage: notificationItem.percentage
++                        suspendable: notificationItem.suspendable
++                        killable: notificationItem.killable
++
++                        jobDetails: notificationItem.jobDetails
++
++                        onSuspendJobClicked: notificationItem.suspendJobClicked()
++                        onResumeJobClicked: notificationItem.resumeJobClicked()
++                        onKillJobClicked: notificationItem.killJobClicked()
++
++                        onOpenUrl: notificationItem.openUrl(url)
++                        onFileActionInvoked: notificationItem.fileActionInvoked(action)
++                    }
+                 }
+-            }
+ 
+-            // notification actions
+-            NotificationFooterActions {
+-                Layout.fillWidth: true
+-                Layout.topMargin: Kirigami.Units.smallSpacing
+-                notification: notificationItem
+-                onTakeFocus: notificationItem.takeFocus()
+-            }
++                // notification actions
++                NotificationFooterActions {
++                    Layout.fillWidth: true
++                    Layout.topMargin: Kirigami.Units.smallSpacing
++                    notification: notificationItem
++                    onTakeFocus: notificationItem.takeFocus()
++                }
+ 
+-            // thumbnails
+-            Loader {
+-                id: thumbnailStripLoader
+-                Layout.topMargin: Kirigami.Units.largeSpacing
+-                Layout.fillWidth: true
+-                active: notificationItem.urls.length > 0
+-                visible: active
+-                asynchronous: true
+-                sourceComponent: ThumbnailStrip {
+-                    leftPadding: -thumbnailStripLoader.Layout.leftMargin
+-                    rightPadding: -thumbnailStripLoader.Layout.rightMargin
+-                    topPadding: -notificationItem.thumbnailTopPadding
+-                    bottomPadding: -thumbnailStripLoader.Layout.bottomMargin
+-                    urls: notificationItem.urls
+-                    onOpenUrl: notificationItem.openUrl(url)
+-                    onFileActionInvoked: notificationItem.fileActionInvoked(action)
++                // thumbnails
++                Loader {
++                    id: thumbnailStripLoader
++                    Layout.topMargin: Kirigami.Units.largeSpacing
++                    Layout.fillWidth: true
++                    active: notificationItem.urls.length > 0
++                    visible: active
++                    asynchronous: true
++                    sourceComponent: ThumbnailStrip {
++                        leftPadding: -thumbnailStripLoader.Layout.leftMargin
++                        rightPadding: -thumbnailStripLoader.Layout.rightMargin
++                        topPadding: -notificationItem.thumbnailTopPadding
++                        bottomPadding: -thumbnailStripLoader.Layout.bottomMargin
++                        urls: notificationItem.urls
++                        onOpenUrl: notificationItem.openUrl(url)
++                        onFileActionInvoked: notificationItem.fileActionInvoked(action)
++                    }
+                 }
+             }
+         }
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationOptions.qml b/components/mobileshell/qml/widgets/notifications/NotificationOptions.qml
+new file mode 100644
+index 000000000..e8b42c805
+--- /dev/null
++++ b/components/mobileshell/qml/widgets/notifications/NotificationOptions.qml
+@@ -0,0 +1,130 @@
++/*
++ * SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++import QtQuick
++import QtQuick.Layouts
++
++import org.kde.kirigami as Kirigami
++import org.kde.plasma.components 3.0 as PlasmaComponents
++import org.kde.notificationmanager as NotificationManager
++
++/**
++ * The settings of the application of a notification, shown in its card on a long press:
++ * mute it, hide it on the lock screen, open its notification settings.
++ *
++ * The settings belong to the service (notifyrc name) of applications using KNotification,
++ * otherwise to the application (desktop entry), like in the notification settings.
++ */
++ColumnLayout {
++    id: root
++
++    required property string applicationName
++    required property string desktopEntry
++    required property string notifyRcName
++
++    /**
++     * Whether the notification settings can be opened from here.
++     */
++    property bool settingsAvailable: true
++
++    signal closeRequested()
++    signal settingsRequested()
++
++    readonly property bool service: notifyRcName !== ""
++    readonly property string configName: service ? notifyRcName : desktopEntry
++
++    readonly property int feedback: {
++        settings.feedbackApplications;
++        settings.feedbackServices;
++        return service ? settings.serviceFeedback(configName) : settings.applicationFeedback(configName);
++    }
++    readonly property int lockScreenVisibility: {
++        settings.lockScreenVisibilityApplications;
++        settings.lockScreenVisibilityServices;
++        return service ? settings.serviceLockScreenVisibility(configName) : settings.applicationLockScreenVisibility(configName);
++    }
++
++    readonly property bool muted: feedback >= NotificationManager.Settings.FeedbackSilent
++    readonly property bool hiddenOnLockScreen: lockScreenVisibility >= NotificationManager.Notifications.VisibilityHidden
++
++    spacing: 0
++
++    NotificationManager.Settings {
++        id: settings
++    }
++
++    function setFeedback(value) {
++        if (service) {
++            settings.setServiceFeedback(configName, value);
++        } else {
++            settings.setApplicationFeedback(configName, value);
++        }
++        settings.save();
++    }
++
++    function setLockScreenVisibility(value) {
++        if (service) {
++            settings.setServiceLockScreenVisibility(configName, value);
++        } else {
++            settings.setApplicationLockScreenVisibility(configName, value);
++        }
++        settings.save();
++    }
++
++    RowLayout {
++        Layout.fillWidth: true
++        Layout.bottomMargin: Kirigami.Units.smallSpacing
++
++        PlasmaComponents.Label {
++            Layout.fillWidth: true
++            textFormat: Text.PlainText
++            elide: Text.ElideRight
++            font.weight: Font.DemiBold
++            text: i18nd("plasma_org.kde.plasma.private.mobileshell", "Notifications of %1", root.applicationName)
++        }
++
++        PlasmaComponents.ToolButton {
++            icon.name: "window-close-symbolic"
++            display: PlasmaComponents.AbstractButton.IconOnly
++            text: i18nd("plasma_org.kde.plasma.private.mobileshell", "Close")
++            onClicked: root.closeRequested()
++        }
++    }
++
++    PlasmaComponents.ToolButton {
++        Layout.fillWidth: true
++        icon.name: root.muted ? "audio-volume-high-symbolic" : "audio-volume-muted-symbolic"
++        text: root.muted ? i18nd("plasma_org.kde.plasma.private.mobileshell", "Sound and vibration on")
++                         : i18nd("plasma_org.kde.plasma.private.mobileshell", "Mute")
++        onClicked: {
++            root.setFeedback(root.muted ? NotificationManager.Settings.FeedbackFull : NotificationManager.Settings.FeedbackSilent);
++            root.closeRequested();
++        }
++    }
++
++    PlasmaComponents.ToolButton {
++        Layout.fillWidth: true
++        icon.name: root.hiddenOnLockScreen ? "view-visible-symbolic" : "view-hidden-symbolic"
++        text: root.hiddenOnLockScreen ? i18nd("plasma_org.kde.plasma.private.mobileshell", "Show on the lock screen")
++                                      : i18nd("plasma_org.kde.plasma.private.mobileshell", "Not on the lock screen")
++        onClicked: {
++            root.setLockScreenVisibility(root.hiddenOnLockScreen ? NotificationManager.Notifications.VisibilityFull
++                                                                 : NotificationManager.Notifications.VisibilityHidden);
++            root.closeRequested();
++        }
++    }
++
++    PlasmaComponents.ToolButton {
++        Layout.fillWidth: true
++        visible: root.settingsAvailable
++        icon.name: "configure-symbolic"
++        text: i18nd("plasma_org.kde.plasma.private.mobileshell", "Settings")
++        onClicked: {
++            root.settingsRequested();
++            root.closeRequested();
++        }
++    }
++}
+diff --git a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+index 361b81140..6e5254965 100644
+--- a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
++++ b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
+@@ -97,6 +97,17 @@ Item {
+      */
+     readonly property bool hasNotifications: list.count > 0
+ 
++    /**
++     * Whether the notifications have a fixed area (ex. the lockscreen): the list does not scroll, it shows the
++     * groups and notifications that fit and below them how many notifications are left out.
++     */
++    property bool fixedArea: false
++
++    /**
++     * The number of notifications left out in a fixed area.
++     */
++    readonly property int hiddenNotifications: list.hiddenNotifications
++
+     readonly property bool doNotDisturbModeEnabled: !isNaN(notificationSettings.notificationsInhibitedUntil)
+ 
+     enum ModelType {
+@@ -258,6 +269,18 @@ Item {
+         id: clock
+     }
+ 
++    // the number of notifications left out in a fixed area, right below the last shown one
++    PlasmaComponents3.Label {
++        id: hiddenLabel
++        anchors.left: parent.left
++        anchors.right: parent.right
++        y: list.y + list.cutY - list.contentY + list.spacing / 2
++        visible: root.fixedArea && list.hiddenNotifications > 0
++        horizontalAlignment: Text.AlignHCenter
++        opacity: 0.8
++        text: i18ndp("plasma_org.kde.plasma.private.mobileshell", "+%1 more notification", "+%1 more notifications", list.hiddenNotifications)
++    }
++
+     ListView {
+         id: list
+         model: historyModel
+@@ -276,10 +299,70 @@ Item {
+ 
+         // the room below the last notification can grow so that a reply field can be scrolled above the keyboard
+         bottomMargin: spacing + root.keyboardOverlap
+-        height: count === 0 ? (root.topPadding + (showHeader ? root.header.height + listHeight + Kirigami.Units.largeSpacing * 2 : 0)) : (listOverflowing ? root.height : listHeight + spacing)
++        height: root.fixedArea ? root.height
++                               : count === 0 ? (root.topPadding + (showHeader ? root.header.height + listHeight + Kirigami.Units.largeSpacing * 2 : 0)) : (listOverflowing ? root.height : listHeight + spacing)
+ 
+         onMovementStarted: root.interacted()
+ 
++        // Fixed area: everything below cutY (content coordinates) is left out, a group only as a whole
++        property real cutY: Number.POSITIVE_INFINITY
++        property int hiddenNotifications: 0
++
++        function updateFit() {
++            if (!root.fixedArea) {
++                cutY = Number.POSITIVE_INFINITY;
++                hiddenNotifications = 0;
++                return;
++            }
++
++            // a group with its shown notifications, or a single notification
++            const N = NotificationManager.Notifications;
++            const units = [];
++            for (let row = 0; row < count; ++row) {
++                const idx = historyModel.index(row, 0);
++                if (!historyModel.data(idx, N.IsInGroupRole) || units.length === 0) {
++                    const isGroup = historyModel.data(idx, N.IsGroupRole);
++                    units.push({ last: row, notifications: isGroup ? historyModel.data(idx, N.GroupChildrenCountRole) : 1 });
++                } else {
++                    units[units.length - 1].last = row;
++                }
++            }
++
++            const fit = bottomLimit => {
++                let bottom = contentY;
++                let fitting = 0;
++                for (const unit of units) {
++                    const item = itemAtIndex(unit.last);
++                    if (!item || item.y + item.height > bottomLimit) {
++                        break;
++                    }
++                    bottom = item.y + item.height;
++                    ++fitting;
++                }
++                return { bottom: bottom, fitting: fitting };
++            };
++
++            let result = fit(contentY + height);
++            if (result.fitting < units.length) {
++                // room for the line with the number of notifications left out
++                result = fit(contentY + height - hiddenLabel.implicitHeight - spacing);
++            }
++
++            cutY = result.fitting < units.length ? result.bottom : Number.POSITIVE_INFINITY;
++            hiddenNotifications = units.slice(result.fitting).reduce((sum, unit) => sum + unit.notifications, 0);
++        }
++
++        onCountChanged: if (root.fixedArea) Qt.callLater(updateFit)
++        onHeightChanged: if (root.fixedArea) Qt.callLater(updateFit)
++        onContentHeightChanged: if (root.fixedArea) Qt.callLater(updateFit)
++
++        Connections {
++            target: root.fixedArea ? root.historyModel : null
++            function onDataChanged() {
++                Qt.callLater(list.updateFit);
++            }
++        }
++
+         anchors {
+             top: parent.top
+             left: parent.left
+@@ -360,6 +443,12 @@ Item {
+             NumberAnimation { properties: "y"; duration: list.animationDuration }
+         }
+ 
++        // whether the row is the last shown notification of its group (the next row is no notification of a group)
++        function isLastInGroup(row, count) {
++            return row + 1 >= count
++                || !historyModel.data(historyModel.index(row + 1, 0), NotificationManager.Notifications.IsInGroupRole);
++        }
++
+         function isRowExpanded(row) {
+             var idx = historyModel.index(row, 0);
+             return historyModel.data(idx, NotificationManager.Notifications.IsGroupExpandedRole);
+@@ -401,6 +490,12 @@ Item {
+             sourceComponent: model.isGroup ? groupDelegate : notificationDelegate
+             asynchronous: true
+ 
++            // Left out in a fixed area. Hidden through opacity, not visibility: the height of a card depends on its
++            // effective visibility (the heading of a single notification), and the fit is measured on these items.
++            readonly property bool cut: y >= list.cutY
++            enabled: !cut
++            onHeightChanged: if (root.fixedArea) Qt.callLater(list.updateFit)
++
+             required property var model
+             required property int index
+ 
+@@ -417,6 +512,7 @@ Item {
+ 
+                 Column {
+                     spacing: Kirigami.Units.smallSpacing
++                    opacity: delegateLoader.cut ? 0 : 1
+ 
+                     height: headerSpace.height + groupHeader.height
+ 
+@@ -441,6 +537,7 @@ Item {
+ 
+                 Column {
+                     spacing: Kirigami.Units.smallSpacing
++                    opacity: delegateLoader.cut ? 0 : 1
+ 
+                     height: headerSpace.height + notificationItem.height + showMoreLoader.height
+ 
+@@ -497,8 +594,12 @@ Item {
+                             if (typeof model.groupChildrenCount === 'undefined')
+                                 return false;
+ 
++                            // a fixed area does not grow; without content the notifications of a group look alike
++                            if (root.fixedArea || (model.visibility || NotificationManager.Notifications.VisibilityFull) >= NotificationManager.Notifications.VisibilitySender)
++                                return false;
++
+                             return (model.groupChildrenCount > model.expandedGroupChildrenCount || model.isGroupExpanded)
+-                            && delegateLoader.ListView.nextSection != delegateLoader.ListView.section;
++                            && list.isLastInGroup(delegateLoader.index, list.count);
+                         }
+ 
+                         // state + transition: animates the item when it becomes visible. Fade off is handled by above ListView.onRemove.
+diff --git a/components/shellsettingsplugin/mobileshellsettings.cpp b/components/shellsettingsplugin/mobileshellsettings.cpp
+index 51e687a21..f46c91172 100644
+--- a/components/shellsettingsplugin/mobileshellsettings.cpp
++++ b/components/shellsettingsplugin/mobileshellsettings.cpp
+@@ -16,6 +16,8 @@
+ #include <QDBusPendingCall>
+ #include <QDebug>
+ 
++#include <algorithm>
++
+ const QString CONFIG_FILE = QStringLiteral("plasmamobilerc");
+ const QString GENERAL_CONFIG_GROUP = QStringLiteral("General");
+ const QString LOCKSCREEN_CONFIG_GROUP = QStringLiteral("Lockscreen");
+@@ -34,6 +36,7 @@ MobileShellSettings::MobileShellSettings(QObject *parent)
+             Q_EMIT wakeScreenOnNotificationChanged();
+             Q_EMIT animationsEnabledChanged();
+             Q_EMIT dateInStatusBarChanged();
++            Q_EMIT statusBarNotificationIconsChanged();
+             Q_EMIT statusBarScaleFactorChanged();
+             Q_EMIT showBatteryPercentageChanged();
+             Q_EMIT navigationPanelEnabledChanged();
+@@ -123,6 +126,19 @@ void MobileShellSettings::setDateInStatusBar(bool dateInStatusBar)
+     m_config->sync();
+ }
+ 
++int MobileShellSettings::statusBarNotificationIcons() const
++{
++    auto group = KConfigGroup{m_config, GENERAL_CONFIG_GROUP};
++    return std::max(group.readEntry("statusBarNotificationIcons", 4), 0);
++}
++
++void MobileShellSettings::setStatusBarNotificationIcons(int icons)
++{
++    auto group = KConfigGroup{m_config, GENERAL_CONFIG_GROUP};
++    group.writeEntry("statusBarNotificationIcons", std::max(icons, 0), KConfigGroup::Notify);
++    m_config->sync();
++}
++
+ float MobileShellSettings::statusBarScaleFactor() const
+ {
+     auto group = KConfigGroup{m_config, GENERAL_CONFIG_GROUP};
+diff --git a/components/shellsettingsplugin/mobileshellsettings.h b/components/shellsettingsplugin/mobileshellsettings.h
+index 669bf0cd6..369608c11 100644
+--- a/components/shellsettingsplugin/mobileshellsettings.h
++++ b/components/shellsettingsplugin/mobileshellsettings.h
+@@ -32,6 +32,7 @@ class MobileShellSettings : public QObject
+ 
+     // status bar
+     Q_PROPERTY(bool dateInStatusBar READ dateInStatusBar WRITE setDateInStatusBar NOTIFY dateInStatusBarChanged)
++    Q_PROPERTY(int statusBarNotificationIcons READ statusBarNotificationIcons WRITE setStatusBarNotificationIcons NOTIFY statusBarNotificationIconsChanged)
+     Q_PROPERTY(float statusBarScaleFactor READ statusBarScaleFactor WRITE setStatusBarScaleFactor NOTIFY statusBarScaleFactorChanged)
+     Q_PROPERTY(bool showBatteryPercentage READ showBatteryPercentage WRITE setShowBatteryPercentage NOTIFY showBatteryPercentageChanged)
+ 
+@@ -154,6 +155,19 @@ public:
+      */
+     void setDateInStatusBar(bool dateInStatusBar);
+ 
++    /**
++     * The number of icons of applications with notifications in the status bar, 0 for none.
++     * With more applications one icon less is shown and an ellipsis.
++     */
++    int statusBarNotificationIcons() const;
++
++    /**
++     * Set the number of icons of applications with notifications in the status bar.
++     *
++     * @param icons The number of icons, 0 for none.
++     */
++    void setStatusBarNotificationIcons(int icons);
++
+     /**
+      * Scale factor for status bar height.
+      *
+@@ -332,6 +346,7 @@ Q_SIGNALS:
+     void keyboardButtonEnabledChanged();
+     void animationsEnabledChanged();
+     void dateInStatusBarChanged();
++    void statusBarNotificationIconsChanged();
+     void statusBarScaleFactorChanged();
+     void showBatteryPercentageChanged();
+     void taskSwitcherPreviewsEnabledChanged();
+diff --git a/containments/panel/qml/StatusBarWrapper.qml b/containments/panel/qml/StatusBarWrapper.qml
+index 4488f55f1..327831fc2 100644
+--- a/containments/panel/qml/StatusBarWrapper.qml
++++ b/containments/panel/qml/StatusBarWrapper.qml
+@@ -37,6 +37,7 @@ Item {
+         anchors.fill: parent
+ 
+         showSecondRow: false
++        showNotificationIcons: true
+         showTime: !MobileShellState.LockscreenDBusClient.lockscreenActive // Don't show time on the lockscreen, since we already have a massive clock
+ 
+         showDropShadow: root.forcedComplementary
+diff --git a/containments/panel/qml/StatusPanel.qml b/containments/panel/qml/StatusPanel.qml
+index 719c06d50..3765bb74a 100644
+--- a/containments/panel/qml/StatusPanel.qml
++++ b/containments/panel/qml/StatusPanel.qml
+@@ -158,9 +158,10 @@ Item {
+             showDismissed: true
+             showJobs: drawer.actionDrawer.notificationSettings.jobsInNotifications
+             sortMode: NotificationManager.Notifications.SortByTypeAndUrgency
+-            groupMode: NotificationManager.Notifications.GroupApplicationsFlat
+-            groupLimit: 2
+-            expandUnread: true
++            // from two notifications of a conversation on only the newest, the others behind "Show more"
++            groupMode: NotificationManager.Notifications.GroupConversationsFlat
++            groupLimit: 1
++            expandUnread: false
+             blacklistedDesktopEntries: drawer.actionDrawer.notificationSettings.historyBlacklistedApplications
+             blacklistedNotifyRcNames: drawer.actionDrawer.notificationSettings.historyBlacklistedServices
+             // over the lock screen the drawer has the quick settings, the notifications are on the lock screen
+diff --git a/kcms/mobileshell/ui/main.qml b/kcms/mobileshell/ui/main.qml
+index 6a5cbe522..3a31dd150 100644
+--- a/kcms/mobileshell/ui/main.qml
++++ b/kcms/mobileshell/ui/main.qml
+@@ -108,6 +108,22 @@ KCM.SimpleKCM {
+                 }
+             }
+ 
++            FormCard.FormDelegateSeparator { above: dateInStatusBar; below: statusBarNotificationIcons }
++
++            FormCard.FormSpinBoxDelegate {
++                id: statusBarNotificationIcons
++                label: i18n("Notification icons")
++                description: i18n("At most this many applications with notifications are shown in the status bar, 0 shows none.")
++                from: 0
++                to: 10
++                value: ShellSettings.Settings.statusBarNotificationIcons
++                onValueChanged: {
++                    if (value != ShellSettings.Settings.statusBarNotificationIcons) {
++                        ShellSettings.Settings.statusBarNotificationIcons = value;
++                    }
++                }
++            }
++
+             FormCard.FormDelegateSeparator { above: quickSettingsButton; below: topLeftActionDrawerModeDelegate }
+ 
+             FormCard.FormSwitchDelegate {
+diff --git a/po/de/kcm_mobileshell.po b/po/de/kcm_mobileshell.po
+index a2a0c71e9..373204de9 100644
+--- a/po/de/kcm_mobileshell.po
++++ b/po/de/kcm_mobileshell.po
+@@ -332,3 +332,17 @@ msgstr ""
+ 
+ #~ msgid "Task Switcher"
+ #~ msgstr "Anwendungsumschalter"
++
++#: ui/main.qml
++#, kde-format
++msgid "Notification icons"
++msgstr "Benachrichtigungssymbole"
++
++#: ui/main.qml
++#, kde-format
++msgid ""
++"At most this many applications with notifications are shown in the status "
++"bar, 0 shows none."
++msgstr ""
++"Höchstens so viele Anwendungen mit Benachrichtigungen zeigt die "
++"Statusleiste, 0 zeigt keine."
+diff --git a/po/de/plasma_org.kde.plasma.private.mobileshell.po b/po/de/plasma_org.kde.plasma.private.mobileshell.po
+index 5215448f0..63799dbb6 100644
+--- a/po/de/plasma_org.kde.plasma.private.mobileshell.po
++++ b/po/de/plasma_org.kde.plasma.private.mobileshell.po
+@@ -429,3 +429,54 @@ msgstr "%1 mehr anzeigen"
+ 
+ #~ msgid "Decrease Volume"
+ #~ msgstr "Lautstärke verringern"
++
++#: qml/widgets/notifications/BaseNotificationItem.qml
++#, kde-format
++msgid "%1 new notification"
++msgid_plural "%1 new notifications"
++msgstr[0] "%1 neue Benachrichtigung"
++msgstr[1] "%1 neue Benachrichtigungen"
++
++#: qml/widgets/notifications/BaseNotificationItem.qml
++#, kde-format
++msgid "%1 new message"
++msgid_plural "%1 new messages"
++msgstr[0] "%1 neue Nachricht"
++msgstr[1] "%1 neue Nachrichten"
++
++#: qml/widgets/notifications/NotificationsWidget.qml
++#, kde-format
++msgid "+%1 more notification"
++msgid_plural "+%1 more notifications"
++msgstr[0] "+%1 weitere Benachrichtigung"
++msgstr[1] "+%1 weitere Benachrichtigungen"
++
++#: qml/widgets/notifications/NotificationOptions.qml
++#, kde-format
++msgid "Notifications of %1"
++msgstr "Benachrichtigungen von %1"
++
++#: qml/widgets/notifications/NotificationOptions.qml
++#, kde-format
++msgid "Close"
++msgstr "Schließen"
++
++#: qml/widgets/notifications/NotificationOptions.qml
++#, kde-format
++msgid "Sound and vibration on"
++msgstr "Ton und Vibration an"
++
++#: qml/widgets/notifications/NotificationOptions.qml
++#, kde-format
++msgid "Show on the lock screen"
++msgstr "Auf dem Sperrbildschirm zeigen"
++
++#: qml/widgets/notifications/NotificationOptions.qml
++#, kde-format
++msgid "Not on the lock screen"
++msgstr "Nicht auf dem Sperrbildschirm"
++
++#: qml/widgets/notifications/NotificationOptions.qml
++#, kde-format
++msgid "Settings"
++msgstr "Einstellungen"
+diff --git a/shell/contents/lockscreen/LockScreen.qml b/shell/contents/lockscreen/LockScreen.qml
+index 9c0037118..6b199ee84 100644
+--- a/shell/contents/lockscreen/LockScreen.qml
++++ b/shell/contents/lockscreen/LockScreen.qml
+@@ -37,7 +37,10 @@ Item {
+         showExpired: true
+         showDismissed: true
+         showJobs: false
+-        groupMode: Notifications.Notifications.GroupDisabled
++        // summarized: only the newest notification of a conversation (NotificationsComponent may group by application)
++        groupMode: Notifications.Notifications.GroupConversationsFlat
++        groupLimit: 1
++        expandUnread: false
+         sortMode: Notifications.Notifications.SortByDate
+         sortOrder: Qt.DescendingOrder
+     }
+diff --git a/shell/contents/lockscreen/NotificationsComponent.qml b/shell/contents/lockscreen/NotificationsComponent.qml
+index 021be2021..db387daf7 100644
+--- a/shell/contents/lockscreen/NotificationsComponent.qml
++++ b/shell/contents/lockscreen/NotificationsComponent.qml
+@@ -32,6 +32,31 @@ Loader {
+ 
+     signal passwordRequested()
+ 
++    // The notifications of a conversation are summarized; when the conversations do not fit, those of an
++    // application. Back to conversations once there are fewer notifications than at that moment.
++    property bool groupByApplication: false
++    property int notificationsAtOverflow: 0
++    readonly property int notificationCount: (notificationsModel.activeNotificationsCount || 0) + (notificationsModel.expiredNotificationsCount || 0)
++    readonly property int hiddenNotifications: notificationsList ? notificationsList.hiddenNotifications : 0
++
++    function updateGrouping() {
++        if (groupByApplication) {
++            if (notificationCount < notificationsAtOverflow) {
++                groupByApplication = false;
++            }
++        } else if (hiddenNotifications > 0) {
++            notificationsAtOverflow = notificationCount;
++            groupByApplication = true;
++        }
++    }
++
++    onHiddenNotificationsChanged: Qt.callLater(updateGrouping)
++    onNotificationCountChanged: Qt.callLater(updateGrouping)
++    onGroupByApplicationChanged: {
++        notificationsModel.groupMode = groupByApplication ? NotificationManager.Notifications.GroupApplicationsFlat
++                                                          : NotificationManager.Notifications.GroupConversationsFlat;
++    }
++
+     // perform delayed loading of notifications
+     active: false
+     Timer {
+@@ -77,12 +102,12 @@ Loader {
+             Kirigami.Theme.colorSet: Kirigami.Theme.Complementary
+             Kirigami.Theme.inherit: false
+ 
+-            height: Math.min(parent.height - root.topMargin - root.bottomMargin, notificationsList.listView.listHeight + Kirigami.Units.gridUnit)
++            // a fixed area: the notifications that fit, no scrolling
++            height: parent.height - root.topMargin - root.bottomMargin
+ 
+             MobileShell.NotificationsWidget {
+                 id: notificationsList
+                 anchors.fill: parent
+-                opacity: 0 // we display with the opacity gradient below
+ 
+                 historyModelType: MobileShell.NotificationsModelType.NotificationsModel
+                 actionsRequireUnlock: true
+@@ -90,9 +115,10 @@ Loader {
+                 notificationSettings: root.notificationSettings
+                 panelType: MobileShell.PanelBackground.PanelType.Wallpaper
+                 inLockScreen: true
++                fixedArea: true
+                 topPadding: root.topPadding
+                 bottomPadding: Kirigami.Units.gridUnit
+-                listView.interactive: !root.scrollLock && listView.listOverflowing
++                listView.interactive: false
+ 
+                 cardColorScheme: Kirigami.Theme.Window
+ 
+@@ -103,17 +129,6 @@ Loader {
+                     root.passwordRequested();
+                 }
+             }
+-
+-            // opacity gradient at flickable edges
+-            MobileShell.FlickableOpacityGradient {
+-                anchors {
+-                    top: notificationsList.top
+-                    left: notificationsList.left
+-                    right: notificationsList.right
+-                }
+-                height: notificationsList.listView.height
+-                flickable: notificationsList.listView
+-            }
+         }
+     }
+ }

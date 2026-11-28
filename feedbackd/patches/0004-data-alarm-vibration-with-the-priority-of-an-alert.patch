@@ -1,0 +1,25 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 18:10:00 +0100
+Subject: [PATCH] data: alarm vibration with the priority of an alert
+Description:
+ The vibration of alarm-clock-elapsed had no priority, unlike its sound
+ and the other alerts. It used priority 0: any other vibration, a new
+ message included, ended it, and while one ran the alarm did not vibrate.
+ Give it priority 192 like the incoming call.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-3.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/data/default.json b/data/default.json
+index 600ea79..a3335f6 100644
+--- a/data/default.json
++++ b/data/default.json
+@@ -116,6 +116,7 @@
+       "feedbacks" : [
+         {
+           "event-name"   : "alarm-clock-elapsed",
++          "priority"     : 192,
+           "type"         : "VibraPeriodic",
+           "magnitude"    : 0.5,
+           "duration"     : 1000

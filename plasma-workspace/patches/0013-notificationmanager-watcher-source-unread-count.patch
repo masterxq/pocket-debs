@@ -1,0 +1,25 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 13:06:44 +0100
+Subject: [PATCH] notificationmanager: no unread count from the server models with the watcher source
+Description:
+ With the watcher source there is no portal notifications model; an expired
+ portal notification dereferenced it while counting unread notifications.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/libnotificationmanager/notifications.cpp b/libnotificationmanager/notifications.cpp
+index f75830770b..92b05d4bb6 100644
+--- a/libnotificationmanager/notifications.cpp
++++ b/libnotificationmanager/notifications.cpp
+@@ -352,7 +352,8 @@ void Notifications::Private::updateCount()
+                 date = idx.data(Notifications::CreatedRole).toDateTime();
+             }
+ 
+-            if ((Portal::isPortalNotificationId(Private::notificationId(idx)) && date > portalNotificationsModel->lastRead())
++            // the server models are not there with the watcher source
++            if ((Portal::isPortalNotificationId(Private::notificationId(idx)) && portalNotificationsModel && date > portalNotificationsModel->lastRead())
+                 || (notificationsModel && date > notificationsModel->lastRead())) {
+                 ++unread;
+             }

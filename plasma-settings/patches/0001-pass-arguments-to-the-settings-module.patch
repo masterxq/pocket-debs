@@ -1,0 +1,255 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 13:12:59 +0100
+Subject: [PATCH] Pass arguments to the settings module
+Description:
+ New option --args, like systemsettings: the arguments go to the module
+ given with --module when it is loaded, or through activationRequested
+ when it is open already. A module can open a page with them, for
+ example kcm_notifications the settings of one application
+ (--desktop-entry, --notifyrc).
+ .
+ The page of a module is put on the page stack before the module loads,
+ so that pages it pushes while loading come after it instead of below.
+ Switching between the narrow and the wide layout rebuilds the page
+ stack; the pages the module pushed on top of its main page are put back
+ as well. A window that starts wide and gets its narrow size afterwards
+ (a phone) lost the page the module opened for its arguments.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/src/main.cpp b/src/main.cpp
+index 28d4995..0238bbf 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -71,6 +71,7 @@ int main(int argc, char **argv)
+         i18n("formfactor"));
+     const QCommandLineOption moduleOption({QStringLiteral("m"), QStringLiteral("module")}, i18n("Settings module to open"), i18n("modulename"));
+     const QCommandLineOption singleModuleOption({QStringLiteral("s"), QStringLiteral("singleModule")}, i18n("Only show a single module, requires --module"));
++    const QCommandLineOption argsOption(QStringLiteral("args"), i18n("Arguments for the settings module, requires --module"), i18n("arguments"));
+     const QCommandLineOption fullscreenOption({QStringLiteral("f"), QStringLiteral("fullscreen")}, i18n("Start window fullscreen"));
+     const QCommandLineOption layoutOption(QStringLiteral("layout"), i18n("Package to use for the UI (default org.kde.mobile.settings)"), i18n("packagename"));
+     QCommandLineOption selfTestOption(QStringLiteral("self-test"));
+@@ -80,6 +81,7 @@ int main(int argc, char **argv)
+     parser.addOption(formfactorOption);
+     parser.addOption(moduleOption);
+     parser.addOption(singleModuleOption);
++    parser.addOption(argsOption);
+     parser.addOption(fullscreenOption);
+     parser.addOption(layoutOption);
+     parser.addOption(selfTestOption);
+diff --git a/src/module.cpp b/src/module.cpp
+index 6023b05..b9e6939 100644
+--- a/src/module.cpp
++++ b/src/module.cpp
+@@ -9,6 +9,8 @@
+ 
+ #include <KPluginFactory>
+ 
++#include <utility>
++
+ Module::Module(QObject *parent)
+     : QObject(parent)
+ {
+@@ -24,9 +26,25 @@ QString Module::path() const
+     return m_path;
+ }
+ 
++void Module::setArgs(const QString &moduleId, const QVariantList &args)
++{
++    m_argsModuleId = moduleId;
++    m_args = args;
++}
++
+ void Module::setPath(const QString &path)
+ {
++    // opening a category opens its first module before the requested one
++    QVariantList args;
++    if (!m_argsModuleId.isEmpty() && QFileInfo(path).baseName() == m_argsModuleId) {
++        args = std::exchange(m_args, {});
++        m_argsModuleId.clear();
++    }
++
+     if (m_path == path) {
++        if (m_kcm && !args.isEmpty()) {
++            Q_EMIT m_kcm->activationRequested(args);
++        }
+         return;
+     }
+ 
+@@ -43,7 +61,7 @@ void Module::setPath(const QString &path)
+         m_path = kcmMetaData.fileName();
+         Q_EMIT pathChanged();
+ 
+-        m_kcm = KQuickConfigModuleLoader::loadModule(kcmMetaData, this).plugin;
++        m_kcm = KQuickConfigModuleLoader::loadModule(kcmMetaData, this, args).plugin;
+         Q_EMIT kcmChanged();
+         Q_EMIT nameChanged();
+ 
+diff --git a/src/module.h b/src/module.h
+index e1525f3..d7443e6 100644
+--- a/src/module.h
++++ b/src/module.h
+@@ -30,6 +30,13 @@ public:
+     QString path() const;
+     void setPath(const QString &name);
+ 
++    /**
++     * Arguments for the module with the plugin id @p moduleId when it is opened next,
++     * e.g. a page to show. If the module is open already, it gets them through
++     * KQuickConfigModule::activationRequested.
++     */
++    void setArgs(const QString &moduleId, const QVariantList &args);
++
+     QString name() const
+     {
+         return QFileInfo(m_path).baseName();
+@@ -49,6 +56,8 @@ Q_SIGNALS:
+ private:
+     KQuickConfigModule *m_kcm{nullptr};
+     QString m_path;
++    QString m_argsModuleId;
++    QVariantList m_args;
+ 
+     bool m_valid{false};
+     bool m_isInSubCategory{false};
+diff --git a/src/qml/KCMContainer.qml b/src/qml/KCMContainer.qml
+index 04f6f52..c739aa3 100644
+--- a/src/qml/KCMContainer.qml
++++ b/src/qml/KCMContainer.qml
+@@ -25,6 +25,11 @@ KCMPageContainer {
+         }
+     }
+ 
++    // Puts a page of the module back on the page stack after the stack was rebuilt
++    function restoreSubPage(page) {
++        applicationWindow().pageStack.push(kcmPageContainer, {"kcm": kcm, "internalPage": page}, Controls.StackView.Immediate);
++    }
++
+     Component {
+         id: kcmPageContainer
+         KCMPageContainer {}
+diff --git a/src/qml/Main.qml b/src/qml/Main.qml
+index 66c0f60..a0cffde 100644
+--- a/src/qml/Main.qml
++++ b/src/qml/Main.qml
+@@ -41,10 +41,30 @@ Kirigami.AbstractApplicationWindow {
+         id: contextDrawer
+     }
+ 
++    // The pages the module pushed on top of its main page. Their containers belong to the page stack,
++    // the pages themselves to the module.
++    function kcmSubPages() {
++        const pages = [];
++        let aboveKCMPage = false;
++        for (let i = 0; i < pageStack.depth; ++i) {
++            const item = pageStack.get(i);
++            const page = item && item.page !== undefined ? item.page : item;
++            if (page === root.loadedKCMPage) {
++                aboveKCMPage = true;
++            } else if (aboveKCMPage && page && page.internalPage) {
++                pages.push(page.internalPage);
++            }
++        }
++        return pages;
++    }
++
+     // change between sidebar and single page listview
+     function changeNav(toWidescreen) {
+         if (SettingsApp.singleModule) return;
+ 
++        // rebuilding the page stack destroys the containers of the pages of the module
++        const kcmPages = kcmSubPages();
++
+         if (toWidescreen) {
+             sidebarLoader.active = true;
+             root.globalDrawer = sidebarLoader.item;
+@@ -58,6 +78,9 @@ Kirigami.AbstractApplicationWindow {
+             // restore the kcm page
+             if (SettingsApp.activeModule.name && root.loadedKCMPage) {
+                 pageStack.push(root.loadedKCMPage, null, QQC2.StackView.Immediate);
++                for (const page of kcmPages) {
++                    root.loadedKCMPage.restoreSubPage(page);
++                }
+             }
+ 
+             // go to correct sidebar page
+@@ -90,6 +113,9 @@ Kirigami.AbstractApplicationWindow {
+             // restore the kcm page
+             if (SettingsApp.activeModule.name && root.loadedKCMPage) {
+                 pageStack.push(root.loadedKCMPage, null, QQC2.StackView.Immediate);
++                for (const page of kcmPages) {
++                    root.loadedKCMPage.restoreSubPage(page);
++                }
+             }
+         }
+     }
+@@ -178,9 +204,10 @@ Kirigami.AbstractApplicationWindow {
+                 pageStack,
+                 {"kcm": SettingsApp.activeModule.kcm, "internalPage": SettingsApp.activeModule.kcm.mainUi}
+             );
+-            loadedKCMPage.loadKCM();
+-
++            // pages the module pushes while loading (e.g. for its --args) go on top of it
+             pageStack.push(loadedKCMPage);
++
++            loadedKCMPage.loadKCM();
+         } else if (isWidescreen) {
+             pageStack.push(defaultPage);
+         }
+diff --git a/src/settingsapp.cpp b/src/settingsapp.cpp
+index 933567d..1f2bd20 100644
+--- a/src/settingsapp.cpp
++++ b/src/settingsapp.cpp
+@@ -13,6 +13,7 @@
+ #include <QQmlEngine>
+ 
+ #include <KDBusService>
++#include <KShell>
+ 
+ #include <KLocalizedString>
+ 
+@@ -52,10 +53,21 @@ void SettingsApp::init(QCommandLineParser &parser, QString startModule, bool sin
+     m_subCategoryModel = new SubcategoryModel(m_categoryModel, this);
+ 
+     if (!startModule.isEmpty()) {
++        m_activeModule->setArgs(startModule, moduleArgs());
+         loadModuleById(startModule);
+     }
+ }
+ 
++QVariantList SettingsApp::moduleArgs() const
++{
++    QVariantList args;
++    const QStringList arguments = KShell::splitArgs(m_parser->value(u"args"_s));
++    for (const QString &argument : arguments) {
++        args.append(argument);
++    }
++    return args;
++}
++
+ SettingsApp::~SettingsApp() = default;
+ 
+ void SettingsApp::setupKDBus()
+@@ -71,6 +83,7 @@ void SettingsApp::setupKDBus()
+             const QString module = m_parser->value(u"module"_s);
+             qDebug() << "Loading module:" << module;
+ 
++            m_activeModule->setArgs(module, moduleArgs());
+             loadModuleById(module);
+             Q_EMIT moduleChangeRequested();
+         }
+diff --git a/src/settingsapp.h b/src/settingsapp.h
+index dfa463b..3926ab8 100644
+--- a/src/settingsapp.h
++++ b/src/settingsapp.h
+@@ -89,6 +89,8 @@ Q_SIGNALS:
+ 
+ private:
+     void setupKDBus();
++    // the --args of the command line for the module to open
++    QVariantList moduleArgs() const;
+     QCommandLineParser *m_parser;
+ 
+     QString m_startModule;

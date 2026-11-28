@@ -1,0 +1,75 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 18:40:00 +0100
+Subject: [PATCH] pulse-server: stream-restore: channel map for entries stored without one
+Description:
+ The session manager stores the restore entries of streams with their
+ volumes but without channel positions. The READ reply of the
+ stream-restore extension then had volumes for every channel and an
+ empty channel map. Clients reject such an entry when they write it back
+ (libpulse requires the volume to be compatible with the channel map),
+ so changing e.g. the mute state of the event role through the extension
+ failed.
+ .
+ Give an entry without a matching channel map the default map for its
+ number of volumes.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: MIT (as the patched file)
+Last-Update: 2026-11-28
+---
+diff --git a/src/modules/module-protocol-pulse/modules/module-stream-restore.c b/src/modules/module-protocol-pulse/modules/module-stream-restore.c
+index a33ab6f..f16d203 100644
+--- a/src/modules/module-protocol-pulse/modules/module-stream-restore.c
++++ b/src/modules/module-protocol-pulse/modules/module-stream-restore.c
+@@ -169,6 +169,41 @@ static int key_to_name(const char *key, char *name, size_t maxlen)
+ 
+ }
+ 
++/* A volume goes with a channel map of the same size in the protocol;
++ * clients refuse to write back an entry where they differ. Entries
++ * stored without channel positions get the default map for their
++ * number of volumes. */
++static void default_channel_map(uint8_t channels, struct channel_map *map)
++{
++	uint8_t i;
++
++	switch (channels) {
++	case 1:
++		*map = (struct channel_map) {
++			.channels = 1,
++			.map[0] = SPA_AUDIO_CHANNEL_MONO,
++		};
++		break;
++	case 2:
++		channel_map_parse("stereo", map);
++		break;
++	case 4:
++		channel_map_parse("surround-40", map);
++		break;
++	case 6:
++		channel_map_parse("surround-51", map);
++		break;
++	case 8:
++		channel_map_parse("surround-71", map);
++		break;
++	default:
++		map->channels = channels;
++		for (i = 0; i < channels; i++)
++			map->map[i] = SPA_AUDIO_CHANNEL_AUX0 + i;
++		break;
++	}
++}
++
+ static int do_extension_stream_restore_read(struct module *module, struct client *client, uint32_t command, uint32_t tag, struct message *m)
+ {
+ 	struct message *reply;
+@@ -232,6 +267,9 @@ static int do_extension_stream_restore_read(struct module *module, struct client
+ 					continue;
+ 			}
+ 		}
++		if (vol.channels > 0 && map.channels != vol.channels)
++			default_channel_map(vol.channels, &map);
++
+ 		message_put(reply,
+ 			TAG_STRING, name,
+ 			TAG_CHANNEL_MAP, &map,
