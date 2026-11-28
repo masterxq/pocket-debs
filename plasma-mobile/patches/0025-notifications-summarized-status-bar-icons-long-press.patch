@@ -33,6 +33,13 @@ Description:
  it has one; not on the lock screen). The feedback set for an
  application in the notification settings applies to sound, vibration,
  LED and turning on the display.
+ .
+ The cards of notifications on the lock screen were empty: the greeter
+ renders with the software backend, which draws no layers, and the card
+ clipped its content through a layer (and the list through an opacity
+ mask). The card uses the layer only with a hardware renderer now.
+ "Show more" appears below the last shown notification of every group,
+ also when a single notification follows it.
 Author: masterxq <masterxq@users.noreply.github.com>
 Forwarded: no
 License: GPL-2.0-or-later, GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL, LGPL-2.0-or-later (as the patched files)
@@ -452,7 +459,7 @@ index 52f6b76a0..6c12bbe6f 100644
      function runPendingAction() {
          pendingAction();
 diff --git a/components/mobileshell/qml/widgets/notifications/NotificationCard.qml b/components/mobileshell/qml/widgets/notifications/NotificationCard.qml
-index 6c0e4a39d..8c4197380 100644
+index 6c0e4a39d..a371abe22 100644
 --- a/components/mobileshell/qml/widgets/notifications/NotificationCard.qml
 +++ b/components/mobileshell/qml/widgets/notifications/NotificationCard.qml
 @@ -59,6 +59,11 @@ Item {
@@ -475,6 +482,17 @@ index 6c0e4a39d..8c4197380 100644
      signal dismissRequested()
      signal configureClicked() // TODO implement settings button
      signal dragStart()
+@@ -158,8 +164,8 @@ Item {
+             }
+         }
+ 
+-        // clip
+-        layer.enabled: true
++        // clip; the software renderer (the lock screen greeter) draws no layers
++        layer.enabled: GraphicsInfo.api !== GraphicsInfo.Software
+ 
+         // ensure this is behind the content to not interfere
+         MouseArea {
 @@ -170,6 +176,14 @@ Item {
                      root.tapped()
                  }
@@ -922,7 +940,7 @@ index 000000000..e8b42c805
 +    }
 +}
 diff --git a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
-index 361b81140..ae9ad5837 100644
+index 361b81140..8741a6d40 100644
 --- a/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
 +++ b/components/mobileshell/qml/widgets/notifications/NotificationsWidget.qml
 @@ -97,6 +97,17 @@ Item {
@@ -1034,7 +1052,20 @@ index 361b81140..ae9ad5837 100644
          anchors {
              top: parent.top
              left: parent.left
-@@ -401,6 +484,10 @@ Item {
+@@ -360,6 +443,12 @@ Item {
+             NumberAnimation { properties: "y"; duration: list.animationDuration }
+         }
+ 
++        // whether the row is the last shown notification of its group (the next row is no notification of a group)
++        function isLastInGroup(row, count) {
++            return row + 1 >= count
++                || !historyModel.data(historyModel.index(row + 1, 0), NotificationManager.Notifications.IsInGroupRole);
++        }
++
+         function isRowExpanded(row) {
+             var idx = historyModel.index(row, 0);
+             return historyModel.data(idx, NotificationManager.Notifications.IsGroupExpandedRole);
+@@ -401,6 +490,10 @@ Item {
              sourceComponent: model.isGroup ? groupDelegate : notificationDelegate
              asynchronous: true
  
@@ -1045,7 +1076,7 @@ index 361b81140..ae9ad5837 100644
              required property var model
              required property int index
  
-@@ -497,6 +584,10 @@ Item {
+@@ -497,8 +590,12 @@ Item {
                              if (typeof model.groupChildrenCount === 'undefined')
                                  return false;
  
@@ -1054,8 +1085,11 @@ index 361b81140..ae9ad5837 100644
 +                                return false;
 +
                              return (model.groupChildrenCount > model.expandedGroupChildrenCount || model.isGroupExpanded)
-                             && delegateLoader.ListView.nextSection != delegateLoader.ListView.section;
+-                            && delegateLoader.ListView.nextSection != delegateLoader.ListView.section;
++                            && list.isLastInGroup(delegateLoader.index, list.count);
                          }
+ 
+                         // state + transition: animates the item when it becomes visible. Fade off is handled by above ListView.onRemove.
 diff --git a/components/shellsettingsplugin/mobileshellsettings.cpp b/components/shellsettingsplugin/mobileshellsettings.cpp
 index 51e687a21..f46c91172 100644
 --- a/components/shellsettingsplugin/mobileshellsettings.cpp

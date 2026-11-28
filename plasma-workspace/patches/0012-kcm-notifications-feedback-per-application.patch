@@ -5,6 +5,9 @@ Description:
  A setting per application for the feedback of new notifications, with
  German translation. Changing the lock screen visibility or the feedback
  of an application marks the module as changed, so it can be applied.
+ .
+ The lists of the privacy section were empty: the model of their entries
+ had become part of the expression of notificationsAvailable.
 Author: masterxq <masterxq@users.noreply.github.com>
 Forwarded: no
 License: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL (as the patched files)
@@ -67,6 +70,26 @@ index 440e40dacf..54d64b6402 100644
                      QQC2.CheckBox {
                          text: i18n("Show in history")
                          checked: !!behaviorSettings && behaviorSettings.showInHistory
+diff --git a/kcms/notifications/ui/main.qml b/kcms/notifications/ui/main.qml
+index 72de099311..c3acbacc73 100644
+--- a/kcms/notifications/ui/main.qml
++++ b/kcms/notifications/ui/main.qml
+@@ -26,6 +26,7 @@ KCM.SimpleKCM {
+     readonly property NotificationManager.ServerInfo currentOwnerInfo: NotificationManager.Server.currentOwner
+ 
+     readonly property bool notificationsAvailable: currentOwnerInfo.status === NotificationManager.ServerInfo.Running
++        && currentOwnerInfo.vendor === ourServerVendor && currentOwnerInfo.name === ourServerName
+ 
+     // values of NotificationManager.Notifications.Visibility
+     readonly property var visibilityModel: [
+@@ -34,7 +35,6 @@ KCM.SimpleKCM {
+         { value: 3, text: i18nc("@item:inlistbox what notifications show", "Only the application") },
+         { value: 4, text: i18nc("@item:inlistbox what notifications show", "Nothing") },
+     ]
+-        && currentOwnerInfo.vendor === ourServerVendor && currentOwnerInfo.name === ourServerName
+ 
+     function openSourcesSettings(args) {
+         // TODO would be nice to re-use the current SourcesPage instead of pushing a new one that lost all state
 diff --git a/po/de/kcm_notifications.po b/po/de/kcm_notifications.po
 index 1b3fe3d7fa..539bba0cac 100644
 --- a/po/de/kcm_notifications.po

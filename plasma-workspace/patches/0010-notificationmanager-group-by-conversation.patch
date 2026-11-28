@@ -8,17 +8,18 @@ Description:
  New hint x-kde-conversation-id (ConversationRole) and group mode
  GroupConversationsFlat: notifications of the same application and
  conversation form a group; without the hint the summary (the sender of
- a message) stands for the conversation. When a view may only show the
- application, summary and conversation are empty and the notifications
- group by application.
+ a message) stands for the conversation, the jobs of an application stay
+ together. When a view may only show the application, summary and
+ conversation are empty and the notifications group by application.
  .
  The grouping model now follows its source when a notification is
  replaced with one that belongs to another group, and when the rows of
  the source change within a layout change; it kept stale rows before.
- The visibility model reports a changed visibility as a filter change and
- a change of the content instead of a layout change. Switching between
- the grouping modes and back from no grouping keeps the proxy chain
- connected.
+ Rebuilding the groups within a model reset no longer announces removed
+ rows (views and proxy models crashed on them). The visibility model
+ reports a changed visibility as a filter change and a change of the
+ content instead of a layout change. Switching between the grouping modes
+ and back from no grouping keeps the proxy chain connected.
 Author: masterxq <masterxq@users.noreply.github.com>
 Forwarded: no
 License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
@@ -54,16 +55,17 @@ index 32578fed18..b9270f8f0c 100644
 +ecm_mark_as_test(groupingproxymodel_test)
 diff --git a/libnotificationmanager/autotests/groupingproxymodel_test.cpp b/libnotificationmanager/autotests/groupingproxymodel_test.cpp
 new file mode 100644
-index 0000000000..603d1313d7
+index 0000000000..14759f89d0
 --- /dev/null
 +++ b/libnotificationmanager/autotests/groupingproxymodel_test.cpp
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,247 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
 +
 +    SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
 +*/
 +
++#include <QAbstractItemModelTester>
 +#include <QSignalSpy>
 +#include <QSortFilterProxyModel>
 +#include <QStandardItemModel>
@@ -89,6 +91,8 @@ index 0000000000..603d1313d7
 +    void hiddenContentGroupsByApplication();
 +    void switchesMode();
 +    void regroupsChangedNotification();
++    void keepsJobsTogether();
++    void removesNotifications();
 +    void followsSourceLayoutChange();
 +
 +private:
@@ -97,13 +101,17 @@ index 0000000000..603d1313d7
 +
 +    QStandardItemModel m_source;
 +    std::unique_ptr<NotificationGroupingProxyModel> m_proxy;
++    std::unique_ptr<QAbstractItemModelTester> m_tester;
 +};
 +
 +void GroupingProxyModelTest::init()
 +{
++    m_tester.reset();
 +    m_source.clear();
 +    m_proxy = std::make_unique<NotificationGroupingProxyModel>();
 +    m_proxy->setSourceModel(&m_source);
++    // checks the signals of the model, e.g. no row changes within a reset
++    m_tester = std::make_unique<QAbstractItemModelTester>(m_proxy.get(), QAbstractItemModelTester::FailureReportingMode::QtTest);
 +}
 +
 +void GroupingProxyModelTest::add(const QString &app, const QString &summary, const QString &conversation)
@@ -220,6 +228,43 @@ index 0000000000..603d1313d7
 +    QCOMPARE(resetSpy.count(), 0);
 +}
 +
++void GroupingProxyModelTest::keepsJobsTogether()
++{
++    m_proxy->setGroupConversations(true);
++
++    add(QStringLiteral("files"), QStringLiteral("Copying"));
++    add(QStringLiteral("files"), QStringLiteral("Moving"));
++    add(QStringLiteral("files"), QStringLiteral("Done"));
++    m_source.item(0)->setData(Notifications::JobType, Notifications::TypeRole);
++    m_source.item(1)->setData(Notifications::JobType, Notifications::TypeRole);
++    QCOMPARE(groupSizes(), (QList<int>{1, 2}));
++
++    // a running job changes its summary without leaving its group
++    QSignalSpy resetSpy(m_proxy.get(), &QAbstractItemModel::modelReset);
++    m_source.item(0)->setData(QStringLiteral("Copied"), Notifications::SummaryRole);
++    QCOMPARE(resetSpy.count(), 0);
++    QCOMPARE(groupSizes(), (QList<int>{1, 2}));
++}
++
++void GroupingProxyModelTest::removesNotifications()
++{
++    m_proxy->setGroupConversations(true);
++
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++    add(QStringLiteral("chat"), QStringLiteral("Erika"));
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++    add(QStringLiteral("chat"), QStringLiteral("Erika"));
++    add(QStringLiteral("chat"), QStringLiteral("Max"));
++    QCOMPARE(groupSizes(), (QList<int>{2, 3}));
++
++    m_source.removeRow(0); // Max: 3 -> 2
++    QCOMPARE(groupSizes(), (QList<int>{2, 2}));
++    m_source.removeRow(0); // Erika: 2 -> 1, the group dissolves
++    QCOMPARE(groupSizes(), (QList<int>{1, 2}));
++    m_source.removeRows(0, 2);
++    QCOMPARE(groupSizes(), (QList<int>{1}));
++}
++
 +class LayoutChangingModel : public QSortFilterProxyModel
 +{
 +public:
@@ -311,10 +356,10 @@ index 4d2bbd90f7..203a1e38c2 100644
      // the arguments of org.kde.NotificationWatcher.Notify for this notification
      QVariantList watcherArguments;
 diff --git a/libnotificationmanager/notificationgroupingproxymodel.cpp b/libnotificationmanager/notificationgroupingproxymodel.cpp
-index 6f30074980..3968ba5012 100644
+index 6f30074980..dc7647aaea 100644
 --- a/libnotificationmanager/notificationgroupingproxymodel.cpp
 +++ b/libnotificationmanager/notificationgroupingproxymodel.cpp
-@@ -34,6 +34,78 @@ bool NotificationGroupingProxyModel::appsMatch(const QModelIndex &a, const QMode
+@@ -34,6 +34,82 @@ bool NotificationGroupingProxyModel::appsMatch(const QModelIndex &a, const QMode
      return !aName.isEmpty() && aName == bName && aDesktopEntry == bDesktopEntry && aOriginName == bOriginName;
  }
  
@@ -331,6 +376,10 @@ index 6f30074980..3968ba5012 100644
 +    // The conversation the application names, otherwise the summary (e.g. the sender of a message).
 +    // Both are empty when only the application may be shown, the notifications then group by application.
 +    const auto conversationKey = [](const QModelIndex &idx) -> QString {
++        // the summary of a job changes while it runs, the jobs of an application stay together
++        if (idx.data(Notifications::TypeRole).toInt() == Notifications::JobType) {
++            return QStringLiteral("j:");
++        }
 +        const QString conversation = idx.data(Notifications::ConversationRole).toString();
 +        if (!conversation.isEmpty()) {
 +            return QStringLiteral("c:") + conversation;
@@ -393,7 +442,7 @@ index 6f30074980..3968ba5012 100644
  bool NotificationGroupingProxyModel::isGroup(int row) const
  {
      if (row < 0 || row >= rowMap.count()) {
-@@ -55,7 +127,7 @@ bool NotificationGroupingProxyModel::tryToGroup(const QModelIndex &sourceIndex,
+@@ -55,7 +131,7 @@ bool NotificationGroupingProxyModel::tryToGroup(const QModelIndex &sourceIndex,
              continue;
          }
  
@@ -402,7 +451,24 @@ index 6f30074980..3968ba5012 100644
              const QModelIndex parent = index(i, 0);
  
              if (!silent) {
-@@ -143,7 +215,7 @@ void NotificationGroupingProxyModel::formGroupFor(const QModelIndex &index)
+@@ -122,9 +198,14 @@ void NotificationGroupingProxyModel::checkGrouping(bool silent)
+         // The new grouping keeps every notification separate, still, so perhaps we don't need to
+ 
+         if (tryToGroup(sourceModel()->index(rowMap.at(i)->constFirst(), 0), silent)) {
+-            beginRemoveRows(QModelIndex(), i, i);
++            // silent: within a reset of the model (rebuildMap), no row changes may be announced
++            if (!silent) {
++                beginRemoveRows(QModelIndex(), i, i);
++            }
+             delete rowMap.takeAt(i); // Safe since we're iterating backwards.
+-            endRemoveRows();
++            if (!silent) {
++                endRemoveRows();
++            }
+         }
+     }
+ }
+@@ -143,7 +224,7 @@ void NotificationGroupingProxyModel::formGroupFor(const QModelIndex &index)
      for (int i = (rowMap.count() - 1); i >= 0; --i) {
          const QModelIndex &sourceIndex = sourceModel()->index(rowMap.at(i)->constFirst(), 0);
  
@@ -411,7 +477,7 @@ index 6f30074980..3968ba5012 100644
              continue;
          }
  
-@@ -254,10 +326,27 @@ void NotificationGroupingProxyModel::setSourceModel(QAbstractItemModel *sourceMo
+@@ -254,10 +335,27 @@ void NotificationGroupingProxyModel::setSourceModel(QAbstractItemModel *sourceMo
              endResetModel();
          });
  

@@ -7,6 +7,9 @@ Description:
  when it is open already. A module can open a page with them, for
  example kcm_notifications the settings of one application
  (--desktop-entry, --notifyrc).
+ .
+ The page of a module is put on the page stack before the module loads,
+ so that pages it pushes while loading come after it instead of below.
 Author: masterxq <masterxq@users.noreply.github.com>
 Forwarded: no
 License: GPL-2.0-or-later (as the patched files)
@@ -107,6 +110,23 @@ index e1525f3..d7443e6 100644
  
      bool m_valid{false};
      bool m_isInSubCategory{false};
+diff --git a/src/qml/Main.qml b/src/qml/Main.qml
+index 66c0f60..b6896a3 100644
+--- a/src/qml/Main.qml
++++ b/src/qml/Main.qml
+@@ -178,9 +178,10 @@ Kirigami.AbstractApplicationWindow {
+                 pageStack,
+                 {"kcm": SettingsApp.activeModule.kcm, "internalPage": SettingsApp.activeModule.kcm.mainUi}
+             );
+-            loadedKCMPage.loadKCM();
+-
++            // pages the module pushes while loading (e.g. for its --args) go on top of it
+             pageStack.push(loadedKCMPage);
++
++            loadedKCMPage.loadKCM();
+         } else if (isWidescreen) {
+             pageStack.push(defaultPage);
+         }
 diff --git a/src/settingsapp.cpp b/src/settingsapp.cpp
 index 933567d..1f2bd20 100644
 --- a/src/settingsapp.cpp
