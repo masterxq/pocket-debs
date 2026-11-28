@@ -1,0 +1,148 @@
+From: masterxq <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 11:00:00 +0100
+Subject: [PATCH] lockscreen: fingerprint slash in the style of the icon, keypad when only the PIN unlocks
+Description:
+ The slash over a fingerprint icon that does not unlock was a wide line
+ over a dark band, heavier than the lines of the symbol and reaching
+ past it. Draw it like the lines of the symbol (1 of 22 units, round
+ ends) within its extent (4 to 18 of 22) and clear a gap of the same
+ width on both sides of it from the symbol, as on the "disabled"
+ Breeze icons.
+ .
+ While a finger does not unlock, the PIN is the only way in: open the
+ keypad when that happens and whenever the screen turns on. It can be
+ swiped away as before.
+Author: masterxq
+Forwarded: no
+License: GPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/shell/contents/lockscreen/BottomIconIndicator.qml b/shell/contents/lockscreen/BottomIconIndicator.qml
+index b93942925..d20881e6a 100644
+--- a/shell/contents/lockscreen/BottomIconIndicator.qml
++++ b/shell/contents/lockscreen/BottomIconIndicator.qml
+@@ -4,6 +4,7 @@
+ import QtQuick
+ import QtQuick.Controls
+ import QtQuick.Layouts
++import QtQuick.Effects
+ 
+ import org.kde.kirigami as Kirigami
+ 
+@@ -38,41 +39,66 @@ Loader {
+ 
+         // struck through while a finger does not unlock; shakes when a finger was not recognized
+         Item {
++            id: fingerprintItem
+             implicitWidth: Kirigami.Units.iconSizes.medium
+             implicitHeight: Kirigami.Units.iconSizes.medium
+ 
+             Kirigami.Theme.colorSet: Kirigami.Theme.Complementary
+             Kirigami.Theme.inherit: false
+ 
++            readonly property bool struck: root.lockScreenState.fingerprintIndicatorStruck
++
++            // the slash is drawn like the lines of the symbol (1 of 22 units wide, round ends) across its extent
++            // (4 to 18 of 22), with a cleared gap of the same width on both sides, as on the "disabled" Breeze icons
++            readonly property real lineWidth: width / 22
++            readonly property real slashLength: width * 14 / 22 * Math.SQRT2
++
+             transform: Translate {
+                 id: shakeOffset
+             }
+ 
+-            Kirigami.Icon {
++            Item {
+                 anchors.fill: parent
+-                source: 'fingerprint-symbolic'
++
++                layer.enabled: fingerprintItem.struck
++                layer.effect: MultiEffect {
++                    maskEnabled: true
++                    maskInverted: true
++                    maskSource: slashGap
++                    maskThresholdMin: 0.5
++                    maskSpreadAtMin: 1.0
++                }
++
++                Kirigami.Icon {
++                    anchors.fill: parent
++                    source: 'fingerprint-symbolic'
++                }
+             }
+ 
+-            // the stroke over a darker band, which sets it off from the lines of the icon below
+-            Rectangle {
+-                visible: root.lockScreenState.fingerprintIndicatorStruck
+-                anchors.centerIn: parent
+-                width: strike.width + height - strike.height
+-                height: strike.height * 3
+-                radius: height / 2
+-                rotation: -45
+-                antialiasing: true
+-                color: Qt.rgba(0, 0, 0, 0.5)
++            Item {
++                id: slashGap
++                anchors.fill: parent
++                visible: false
++                layer.enabled: true
++
++                Rectangle {
++                    anchors.centerIn: parent
++                    width: fingerprintItem.slashLength + 2 * fingerprintItem.lineWidth
++                    height: fingerprintItem.lineWidth * 3
++                    radius: height / 2
++                    rotation: 45
++                    antialiasing: true
++                    color: "white"
++                }
+             }
+ 
+             Rectangle {
+-                id: strike
+-                visible: root.lockScreenState.fingerprintIndicatorStruck
++                visible: fingerprintItem.struck
+                 anchors.centerIn: parent
+-                width: Math.round(parent.width * 1.3)
+-                height: Math.max(2, Math.round(parent.width / 12))
++                width: fingerprintItem.slashLength
++                height: fingerprintItem.lineWidth
+                 radius: height / 2
+-                rotation: -45
++                rotation: 45
+                 antialiasing: true
+                 color: Kirigami.Theme.textColor
+             }
+diff --git a/shell/contents/lockscreen/LockScreen.qml b/shell/contents/lockscreen/LockScreen.qml
+index 4dfaaf64c..1bc939662 100644
+--- a/shell/contents/lockscreen/LockScreen.qml
++++ b/shell/contents/lockscreen/LockScreen.qml
+@@ -106,6 +106,28 @@ Item {
+                 lockScreenState.unlockCancelled();
+             }
+         }
++
++        onDpmsTurnedOn: (screen) => {
++            if (screen.name === Screen.name) {
++                root.openKeypadIfOnlyPin();
++            }
++        }
++    }
++
++    // A finger does not unlock now (the fingerprint icon is struck through): show the keypad right away, when that
++    // happens and whenever the screen turns on; it can still be swiped away
++    function openKeypadIfOnlyPin(): void {
++        if (lockScreenState.fingerprintIndicatorStruck && !lockScreenState.canBeUnlocked) {
++            flickable.goToOpenPosition();
++        }
++    }
++
++    Connections {
++        target: root.lockScreenState
++
++        function onFingerprintIndicatorStruckChanged() {
++            root.openKeypadIfOnlyPin();
++        }
+     }
+ 
+     // Container for lockscreen contents
