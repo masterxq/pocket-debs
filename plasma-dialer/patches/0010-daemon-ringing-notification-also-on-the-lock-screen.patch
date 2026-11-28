@@ -1,0 +1,74 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 12:08:46 +0100
+Subject: [PATCH] daemon: ringing notification also on the lock screen, none for silent calls
+Description:
+ While the screen was locked the daemon used the event
+ ringing-without-popup, which only plays the ringtone and sends no
+ notification. The shell then did not know about the call: it could not
+ vibrate or show it on the lock screen. The notification is now sent in
+ every case; the call screen still opens over the lock screen.
+ .
+ A call that does not ring (a caller outside the allowed patterns with
+ the silent option) gets low urgency, so the shell gives no feedback for
+ it either; with the screen locked it was not shown at all before.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/kde-telephony-daemon/src/notification-manager.cpp b/kde-telephony-daemon/src/notification-manager.cpp
+index 9a96904..47e8d74 100644
+--- a/kde-telephony-daemon/src/notification-manager.cpp
++++ b/kde-telephony-daemon/src/notification-manager.cpp
+@@ -141,7 +141,8 @@ void NotificationManager::openRingingNotification(const QString &deviceUni,
+ {
+     m_ringingNotification->clearActions();
+     m_ringingNotification->setEventId(notificationEvent);
+-    m_ringingNotification->setUrgency(KNotification::CriticalUrgency);
++    // a call that does not ring must not vibrate either
++    m_ringingNotification->setUrgency(notificationEvent == QLatin1String("ringing-silent") ? KNotification::LowUrgency : KNotification::CriticalUrgency);
+     m_ringingNotification->setComponentName(QStringLiteral("plasma-dialer"));
+ 
+     // _ringingNotification->setPixmap(person.photo());
+@@ -233,7 +234,6 @@ void NotificationManager::handleIncomingCall(const QString &deviceUni, const QSt
+ 
+     QString notificationEvent = QStringLiteral("ringing");
+ 
+-    bool silent = false;
+     if (!allowed) {
+         if (Config::self()->ringOption() == 0) {
+             qDebug() << "Blocking call, hanging up";
+@@ -243,19 +243,10 @@ void NotificationManager::handleIncomingCall(const QString &deviceUni, const QSt
+             return;
+         }
+         notificationEvent = QStringLiteral("ringing-silent");
+-        silent = true;
+     }
+ 
+     bool screenLocked = getScreenSaverActive();
+ 
+-    bool skipNotification = false;
+-    if (screenLocked) {
+-        notificationEvent = QStringLiteral("ringing-without-popup");
+-        if (silent) {
+-            skipNotification = true;
+-        }
+-    }
+-
+     if (allowed) {
+         startHapticsFeedback();
+     }
+@@ -273,9 +264,10 @@ void NotificationManager::handleIncomingCall(const QString &deviceUni, const QSt
+                                                              QStringLiteral("wakeup"));
+     QDBusConnection::sessionBus().call(wakeupCall);
+ 
+-    if (!skipNotification) {
+-        openRingingNotification(deviceUni, callUni, callerDisplay, notificationEvent);
+-    }
++    // Also while the screen is locked: the shell gives the feedback for the
++    // notification (vibration, LED) and shows it on the lock screen; the call
++    // screen opens over the lock screen in addition.
++    openRingingNotification(deviceUni, callUni, callerDisplay, notificationEvent);
+ 
+     if (screenLocked) {
+         launchPlasmaDialerDesktopFile();

@@ -1,0 +1,184 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 12:02:25 +0100
+Subject: [PATCH] manager: haptic and sound feedback by priority, events before the haptic interface
+Description:
+ The haptic device plays one effect at a time. A vibra feedback of an
+ event was dropped whenever the device was busy, also when a short
+ pattern of the haptic interface was running, although events are meant
+ to take priority over it: the busy check came before ending the haptic
+ pattern.
+ .
+ Now a vibra feedback ends a running vibra feedback of a lower priority
+ and is dropped otherwise; every event ends a pattern of the haptic
+ interface, which in turn is still refused while an event vibrates. A
+ sound is dropped while a sound of a higher priority plays.
+ .
+ Applications that are not in allow-important use at most priority 128
+ (new messages and notifications in the default theme), so only allowed
+ applications can override them with alerts. The app id is not verified,
+ as for the important hint.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-3.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/src/fbd-feedback-manager.c b/src/fbd-feedback-manager.c
+index bc12a4e..21b5463 100644
+--- a/src/fbd-feedback-manager.c
++++ b/src/fbd-feedback-manager.c
+@@ -46,6 +46,14 @@
+ 
+ FbdDebugFlags fbd_debug_flags;
+ 
++/*
++ * Highest priority of feedbacks for events of applications that are not
++ * in `allow-important`: the class of notifications in the default theme.
++ * Alerts like incoming calls and alarms have a higher priority and win
++ * over them only when they come from an allowed application.
++ */
++#define FBD_PRIORITY_MAX_UNTRUSTED 128
++
+ 
+ typedef struct _FbdFeedbackManager {
+   LfbGdbusFeedbackSkeleton parent;
+@@ -64,6 +72,11 @@ typedef struct _FbdFeedbackManager {
+   /* org.sigxcpu.Feedbackd.Haptic */
+   FbdHapticManager        *haptic_manager;
+ 
++  /* The vibra feedback of an event that runs on the haptic device */
++  FbdFeedbackBase         *vibra_feedback;
++  /* Sound feedbacks started for events */
++  GSList                  *sound_feedbacks;
++
+   /* Hardware interaction */
+   GUdevClient             *client;
+   FbdDevVibra             *vibra;
+@@ -380,45 +393,89 @@ add_event_feedbacks (FbdFeedbackManager      *self,
+                      FbdEvent                *event,
+                      GSList                  *feedbacks,
+                      FbdFeedbackProfileLevel  level,
+-                     const char              *sound_file)
++                     const char              *sound_file,
++                     guint                    priority_cap)
+ {
+-  gboolean has_vibra = FALSE, has_sound = FALSE;
++  g_autoptr (FbdFeedbackSound) custom_sound = NULL;
++  gboolean has_sound = FALSE;
++  guint event_priority = 0;
++
++  for (GSList *l = feedbacks; l; l = l->next) {
++    FbdFeedbackBase *fb = FBD_FEEDBACK_BASE (l->data);
++
++    fbd_feedback_set_priority_cap (fb, priority_cap);
++    event_priority = MAX (event_priority, fbd_feedback_get_priority (fb));
++  }
++
++  /* Drop sounds that ended */
++  for (GSList *l = self->sound_feedbacks; l;) {
++    GSList *next = l->next;
++
++    if (fbd_feedback_get_ended (l->data)) {
++      g_object_unref (l->data);
++      self->sound_feedbacks = g_slist_delete_link (self->sound_feedbacks, l);
++    }
++    l = next;
++  }
+ 
+   /* Synthesize sound event for custom sound */
+   if (sound_file && level >= FBD_FEEDBACK_PROFILE_LEVEL_FULL) {
+-    g_autoptr (FbdFeedbackSound) sound = NULL;
+-
+     g_debug ("Using custom sound event '%s'", sound_file);
+-    sound = fbd_feedback_sound_new_from_file_name (sound_file);
+-
+-    fbd_event_add_feedback (event, FBD_FEEDBACK_BASE (sound));
++    custom_sound = fbd_feedback_sound_new_from_file_name (sound_file);
++    g_object_set (custom_sound, "priority", event_priority, NULL);
++    feedbacks = g_slist_prepend (g_slist_copy (feedbacks), custom_sound);
+     has_sound = TRUE;
++  } else {
++    feedbacks = g_slist_copy (feedbacks);
+   }
+ 
+   for (GSList *l = feedbacks; l; l = l->next) {
+     FbdFeedbackBase *fb = FBD_FEEDBACK_BASE (l->data);
++    guint priority = fbd_feedback_get_priority (fb);
+ 
+     if (!fbd_feedback_is_available (FBD_FEEDBACK_BASE (fb)))
+       continue;
+ 
+-    if (FBD_IS_FEEDBACK_SOUND (fb) && has_sound)
+-      continue;
++    if (FBD_IS_FEEDBACK_SOUND (fb)) {
++      gboolean higher = FALSE;
+ 
+-    /* Handle one haptic feedback at a time. In practice haptics can handle multiple
+-     * patterns but none of the devices supports this atm */
+-    /* TODO: should respect priorities */
+-    if (FBD_IS_FEEDBACK_VIBRA (fb)) {
+-      if (fbd_dev_vibra_is_busy (self->vibra))
++      /* The custom sound replaces the sound of the theme */
++      if (has_sound && l != feedbacks)
++        continue;
++
++      /* A sound is dropped while a sound of a higher priority plays */
++      for (GSList *s = self->sound_feedbacks; s; s = s->next) {
++        if (fbd_feedback_get_priority (s->data) > priority)
++          higher = TRUE;
++      }
++      if (higher)
+         continue;
+-      has_vibra = TRUE;
++
++      if (!g_slist_find (self->sound_feedbacks, fb))
++        self->sound_feedbacks = g_slist_prepend (self->sound_feedbacks, g_object_ref (fb));
+     }
+ 
+-    /* Events take priority over the haptic interface */
+-    if (has_vibra)
+-      fbd_haptic_manager_end_feedback (self->haptic_manager);
++    /* The haptic device plays one effect at a time. A vibra feedback
++     * of a higher priority ends the running one, otherwise the new one
++     * is dropped. Every event takes priority over the haptic interface. */
++    if (FBD_IS_FEEDBACK_VIBRA (fb)) {
++      if (fbd_dev_vibra_is_busy (self->vibra)) {
++        if (self->vibra_feedback && !fbd_feedback_get_ended (self->vibra_feedback)) {
++          if (priority <= fbd_feedback_get_priority (self->vibra_feedback))
++            continue;
++          g_debug ("Vibra feedback with priority %u ends one with priority %u",
++                   priority, fbd_feedback_get_priority (self->vibra_feedback));
++          fbd_feedback_end (self->vibra_feedback);
++        } else if (self->haptic_manager) {
++          fbd_haptic_manager_end_feedback (self->haptic_manager);
++        }
++      }
++      g_set_object (&self->vibra_feedback, fb);
++    }
+ 
+     fbd_event_add_feedback (event, fb);
+   }
++  g_slist_free (feedbacks);
+ 
+   return (fbd_event_get_feedbacks (event) != NULL);
+ }
+@@ -482,7 +539,9 @@ fbd_feedback_manager_handle_trigger_feedback (LfbGdbusFeedback      *object,
+   level = fbd_feedback_manager_get_effective_level (self, arg_app_id, hint_level, hint_important);
+ 
+   feedbacks = fbd_feedback_theme_lookup_feedback (self->theme, level, event);
+-  found_fb = add_event_feedbacks (self, event, feedbacks, level, sound_file);
++  found_fb = add_event_feedbacks (self, event, feedbacks, level, sound_file,
++                                  app_is_important (self, arg_app_id) ?
++                                  G_MAXUINT : FBD_PRIORITY_MAX_UNTRUSTED);
+   if (feedbacks)
+     g_slist_free_full (feedbacks, g_object_unref);
+ 
+@@ -564,6 +623,9 @@ fbd_feedback_manager_dispose (GObject *object)
+   FbdFeedbackManager *self = FBD_FEEDBACK_MANAGER (object);
+ 
+   g_clear_object (&self->haptic_manager);
++  g_clear_object (&self->vibra_feedback);
++  g_slist_free_full (self->sound_feedbacks, g_object_unref);
++  self->sound_feedbacks = NULL;
+ 
+   g_clear_object (&self->settings);
+   g_clear_object (&self->theme);

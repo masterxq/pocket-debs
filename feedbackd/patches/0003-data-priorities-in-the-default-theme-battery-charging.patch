@@ -1,0 +1,228 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 12:02:25 +0100
+Subject: [PATCH] data: priorities in the default theme, battery-charging event
+Description:
+ Alerts (incoming call, alarm, timer, cell broadcast) 192, new messages
+ and notifications 128, reminders of missed ones 120. New event
+ battery-charging (system components) with a constant LED and priority
+ 64, for a charging indicator that a notification pattern overrides and
+ that comes back when the reminder ends. Document the priorities.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-3.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/data/default.json b/data/default.json
+index c8eb14d..600ea79 100644
+--- a/data/default.json
++++ b/data/default.json
+@@ -6,6 +6,7 @@
+       "feedbacks" : [
+         {
+           "event-name" : "alarm-clock-elapsed",
++          "priority"   : 192,
+           "type"       : "Sound",
+           "effect"     : "alarm-clock-elapsed",
+           "media-role" : "Alarm"
+@@ -42,27 +43,32 @@
+         },
+         {
+           "event-name" : "message-new-cellbroadcast",
++          "priority"   : 192,
+           "type"       : "Sound",
+           "effect"     : "cellbroadcast",
+           "media-role" : "Emergency"
+         },
+         {
+           "event-name" : "message-new-email",
++          "priority"   : 128,
+           "type"       : "Sound",
+           "effect"     : "message-new-email"
+         },
+         {
+           "event-name" : "message-new-instant",
++          "priority"   : 128,
+           "type"       : "Sound",
+           "effect"     : "message-new-instant"
+         },
+         {
+           "event-name" : "message-new-sms",
++          "priority"   : 128,
+           "type"       : "Sound",
+           "effect"     : "message-new-instant"
+         },
+         {
+           "event-name" : "phone-incoming-call",
++          "priority"   : 192,
+           "type"       : "Sound",
+           "effect"     : "phone-incoming-call",
+           "media-role" : "Ringtone"
+@@ -89,6 +95,7 @@
+         },
+         {
+           "event-name" : "timeout-completed",
++          "priority"   : 192,
+           "type"       : "Sound",
+           "effect"     : "complete"
+         },
+@@ -142,12 +149,14 @@
+         },
+         {
+           "event-name" : "message-new-cellbroadcast",
++          "priority"   : 192,
+           "type"       : "VibraPattern",
+           "magnitudes" : [1.0, 0.0],
+           "durations"  : [200, 200]
+         },
+         {
+           "event-name" : "message-new-email",
++          "priority"   : 128,
+           "type"       : "VibraRumble",
+           "duration"   : 750,
+           "count"      : 3,
+@@ -155,11 +164,13 @@
+         },
+         {
+           "event-name" : "message-new-instant",
++          "priority"   : 128,
+           "type"       : "VibraRumble",
+           "duration"   : 150
+         },
+         {
+           "event-name" : "message-new-sms",
++          "priority"   : 128,
+           "type"       : "VibraRumble",
+           "duration"   : 500,
+           "count"      : 2,
+@@ -172,18 +183,21 @@
+         },
+         {
+           "event-name" : "notification-new-generic",
++          "priority"   : 128,
+           "type"       : "VibraPattern",
+           "magnitudes" : [ 0.25, 0.0, 0.25 ],
+           "durations"  : [ 50, 250, 50 ]
+         },
+         {
+           "event-name" : "phone-incoming-call",
++          "priority"   : 192,
+           "type"       : "VibraPeriodic",
+           "magnitude"  : 0.5,
+           "duration"   : 1000
+         },
+         {
+           "event-name" : "timeout-completed",
++          "priority"   : 192,
+           "type"       : "VibraRumble",
+           "duration"   : 100
+         },
+@@ -205,42 +219,56 @@
+       "feedbacks" : [
+         {
+           "event-name" : "battery-caution",
++          "priority"   : 128,
+           "type"       : "Led",
+           "color"      : "red",
+           "frequency"  : 5000
+         },
++        {
++          "event-name" : "battery-charging",
++          "priority"   : 64,
++          "type"       : "Led",
++          "color"      : "green",
++          "frequency"  : 0
++        },
+         {
+           "event-name" : "message-missed-email",
++          "priority"   : 120,
+           "type"       : "Led",
+           "color"      : "#800080",
+           "frequency"  : 2000
+         },
+         {
+           "event-name" : "message-missed-instant",
++          "priority"   : 120,
+           "type"       : "Led",
+           "color"      : "blue",
+           "frequency"  : 1000
+         },
+         {
+           "event-name" : "message-missed-notification",
++          "priority"   : 120,
+           "type"       : "Led",
+           "color"      : "blue",
+           "frequency"  : 500
+         },
+         {
+           "event-name" : "message-missed-sms",
++          "priority"   : 120,
+           "type"       : "Led",
+           "color"      : "blue",
+           "frequency"  : 2000
+         },
+         {
+           "event-name" : "notification-missed-generic",
++          "priority"   : 120,
+           "type"       : "Led",
+           "color"      : "blue",
+           "frequency"  : 500
+         },
+         {
+           "event-name" : "phone-missed-call",
++          "priority"   : 120,
+           "type"       : "Led",
+           "color"      : "#00FFFF",
+           "frequency"  : 3000
+diff --git a/doc/Event-naming-spec-0.0.0.md b/doc/Event-naming-spec-0.0.0.md
+index 28b9f49..17ed62f 100644
+--- a/doc/Event-naming-spec-0.0.0.md
++++ b/doc/Event-naming-spec-0.0.0.md
+@@ -101,6 +101,8 @@ These events are meant to be used by system components.
+ #### Notifications
+ 
+ - *battery-caution*: The event used when the battery is nearing exhaustion (below 40%, for example).
++- *battery-charging*: The event used while the battery is being charged. The
++  feedback lasts until the event is ended when charging stops.
+ - *battery-full*: The event used when the battery is fully loaded up.
+ - *device-added*: The event used when a device has become available to the desktop, i.e. due to USB plugging.
+ - *key-pressed*: The event used when a key on e.g. an on screen keyboard is pressed.
+diff --git a/doc/feedback-themes.rst b/doc/feedback-themes.rst
+index a796045..1707282 100644
+--- a/doc/feedback-themes.rst
++++ b/doc/feedback-themes.rst
+@@ -46,6 +46,25 @@ You can use the following feedback types to build a theme:
+ - `VibraPattern`: Specifies a pattern of rumbles using the haptic motor.
+ - `Led`: Blinks a LED in a periodic pattern.
+ 
++Every feedback type takes an optional `priority` (0 to 255, default 0).
++A haptic motor plays one effect and an LED shows one pattern at a time.
++When feedbacks of different events compete for a device the one with
++the higher priority wins:
++
++- An LED shows the pattern with the highest priority (the newest one
++  among equal priorities); when it ends the next one is shown again.
++- A vibration ends a running vibration of a lower priority; otherwise it
++  is dropped. Every event takes priority over the haptic interface
++  (``org.sigxcpu.Feedback.Haptic``), which is refused while an event
++  vibrates.
++- A sound is dropped while a sound of a higher priority plays.
++
++Applications that are not listed in the ``allow-important`` setting use
++at most priority 128. The default theme uses 192 for alerts (incoming
++calls, alarms, cell broadcasts), 128 for new messages and
++notifications, 120 for the reminders of missed ones and 64 for the
++charging indicator.
++
+ Sound feedback
+ ~~~~~~~~~~~~~~
+ 
+@@ -97,7 +116,8 @@ The `Led` feedback type uses two properties to specify how an LED blinks:
+   two-digit hexadecimal values between ``00`` and ``FF``, specifying
+   the values of the red, green, and blue components, respectively. For
+   example, ``#00FFFF`` represents cyan.
+-- `frequency`: The LED blinking frequency, in millihertz (mHz).
++- `frequency`: The LED blinking frequency, in millihertz (mHz). ``0``
++  gives a constant light.
+ 
+ `Led` feedback is usually used only in the `silent` profile section of
+ a theme.
