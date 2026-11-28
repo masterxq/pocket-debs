@@ -1,0 +1,570 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 12:02:25 +0100
+Subject: [PATCH] leds: show the pattern with the highest priority, restore the next one
+Description:
+ An LED shows one pattern at a time. So far the last started pattern
+ won and the end of any LED feedback turned the LED off, also when
+ another feedback was still running on it (e.g. a reminder for a missed
+ message and the end of a short notification pattern).
+ .
+ Every feedback type now has the priority property the LED feedback had
+ (unused so far). FbdDevLeds keeps the requested patterns per LED and
+ shows the one with the highest priority, the newest one among equal
+ priorities; when it ends, the next one is shown again, and the LED is
+ turned off only when no pattern is left.
+ .
+ A constant light (frequency 0) is written as a constant pattern, so it
+ replaces a running blink pattern; setting only the brightness left the
+ pattern trigger running the old pattern.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-3.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/src/fbd-dev-led.c b/src/fbd-dev-led.c
+index 0b57466..f8f359d 100644
+--- a/src/fbd-dev-led.c
++++ b/src/fbd-dev-led.c
+@@ -150,8 +150,15 @@ fbd_dev_led_start_periodic_default (FbdDevLed *led,
+     if (!success)
+       g_warning ("Failed to set led pattern: %s", err->message);
+   } else {
++    g_autofree gchar *str = NULL;
++
+     g_debug ("Constant light, Brightness: %d%%", max_brightness_percentage);
+-    success = fbd_dev_led_set_brightness (led, (gint)max);
++    /* A constant pattern replaces a running blink pattern, a plain
++     * brightness would leave the pattern trigger running it */
++    str = g_strdup_printf ("%d 1000 %d 1000\n", (gint)max, (gint)max);
++    success = fbd_udev_set_sysfs_path_attr_as_string (priv->dev, LED_PATTERN_ATTR, str, NULL);
++    if (!success)
++      success = fbd_dev_led_set_brightness (led, (gint)max);
+   }
+ 
+   return success;
+diff --git a/src/fbd-dev-leds.c b/src/fbd-dev-leds.c
+index 634961b..02381c6 100644
+--- a/src/fbd-dev-leds.c
++++ b/src/fbd-dev-leds.c
+@@ -31,11 +31,31 @@
+  * #FbdDevLeds is used to interface with all LEDs detected in sysfs
+  * It currently only supports one pattern per led at a time.
+  */
++/*
++ * A pattern requested for an LED. An LED shows one pattern at a time:
++ * the request with the highest priority, the newest one among equal
++ * priorities. When it ends the next one is shown again.
++ */
++typedef struct {
++  gconstpointer        owner;
++  guint                priority;
++  guint64              serial;
++  FbdDevLed           *led;
++  FbdFeedbackLedColor  color;
++  FbdLedRgbColor       rgb;
++  guint                max_brightness;
++  guint                freq;
++} FbdLedRequest;
++
+ typedef struct _FbdDevLeds {
+   GObject      parent;
+ 
+   GUdevClient *client;
+   GSList      *leds;
++
++  GList       *requests;
++  guint64      next_serial;
++  GHashTable  *shown;  /* FbdDevLed -> FbdLedRequest */
+ } FbdDevLeds;
+ 
+ static void initable_iface_init (GInitableIface *iface);
+@@ -174,6 +194,9 @@ fbd_dev_leds_dispose (GObject *object)
+ {
+   FbdDevLeds *self = FBD_DEV_LEDS (object);
+ 
++  g_clear_pointer (&self->shown, g_hash_table_destroy);
++  g_list_free_full (self->requests, g_free);
++  self->requests = NULL;
+   g_clear_object (&self->client);
+   g_slist_free_full (self->leds, (GDestroyNotify)g_object_unref);
+   self->leds = NULL;
+@@ -192,6 +215,61 @@ fbd_dev_leds_class_init (FbdDevLedsClass *klass)
+ static void
+ fbd_dev_leds_init (FbdDevLeds *self)
+ {
++  self->shown = g_hash_table_new (g_direct_hash, g_direct_equal);
++}
++
++
++static FbdLedRequest *
++find_request (FbdDevLeds *self, gconstpointer owner)
++{
++  for (GList *l = self->requests; l; l = l->next) {
++    FbdLedRequest *req = l->data;
++
++    if (req->owner == owner)
++      return req;
++  }
++  return NULL;
++}
++
++
++static void
++remove_request (FbdDevLeds *self, FbdLedRequest *req)
++{
++  if (g_hash_table_lookup (self->shown, req->led) == req)
++    g_hash_table_remove (self->shown, req->led);
++  self->requests = g_list_remove (self->requests, req);
++  g_free (req);
++}
++
++
++/* Show the request that wins on @led, turn it off when there is none */
++static gboolean
++update_led (FbdDevLeds *self, FbdDevLed *led)
++{
++  FbdLedRequest *best = NULL;
++
++  for (GList *l = self->requests; l; l = l->next) {
++    FbdLedRequest *req = l->data;
++
++    if (req->led != led)
++      continue;
++    if (!best || req->priority > best->priority ||
++        (req->priority == best->priority && req->serial > best->serial))
++      best = req;
++  }
++
++  if (best && g_hash_table_lookup (self->shown, led) == best)
++    return TRUE;
++
++  if (!best) {
++    g_hash_table_remove (self->shown, led);
++    return fbd_dev_led_set_brightness (led, 0);
++  }
++
++  g_debug ("LED pattern with priority %u, %u mHz", best->priority, best->freq);
++  g_hash_table_insert (self->shown, led, best);
++  fbd_dev_led_set_color (led, best->color, &best->rgb);
++  return fbd_dev_led_start_periodic (led, best->max_brightness, best->freq);
+ }
+ 
+ FbdDevLeds *
+@@ -206,20 +284,27 @@ fbd_dev_leds_new (GError **error)
+ /**
+  * fbd_dev_leds_start_periodic:
+  * @self: The #FbdDevLeds
++ * @owner: Identifies the pattern for [method@DevLeds.stop]
++ * @priority: The priority of the pattern
+  * @color: The color LED to use for the LED pattern
+  * @rgb: The rgb value to set (if `color` indicates an RGB led)
+  * @max_brightness_percentage: The max brightness (in percent) to use for the pattern
+  * @freq: The pattern's frequency in mHz
+  *
+- * Start periodic feedback.
++ * Start periodic feedback. The LED shows the pattern unless a pattern
++ * with a higher priority is running on it; a pattern started earlier
++ * by the same owner is replaced.
+  */
+ gboolean
+ fbd_dev_leds_start_periodic (FbdDevLeds          *self,
++                             gconstpointer        owner,
++                             guint                priority,
+                              FbdFeedbackLedColor  color,
+                              FbdLedRgbColor      *rgb,
+                              guint                max_brightness_percentage,
+                              guint                freq)
+ {
++  FbdLedRequest *req;
+   FbdDevLed *led;
+ 
+   g_return_val_if_fail (FBD_IS_DEV_LEDS (self), FALSE);
+@@ -230,25 +315,49 @@ fbd_dev_leds_start_periodic (FbdDevLeds          *self,
+     return FALSE;
+   }
+ 
+-  fbd_dev_led_set_color (led, color, rgb);
+-
+-  return fbd_dev_led_start_periodic (led, max_brightness_percentage, freq);
++  req = find_request (self, owner);
++  if (req)
++    remove_request (self, req);
++
++  req = g_new0 (FbdLedRequest, 1);
++  req->owner = owner;
++  req->priority = priority;
++  req->serial = self->next_serial++;
++  req->led = led;
++  req->color = color;
++  if (rgb)
++    req->rgb = *rgb;
++  req->max_brightness = max_brightness_percentage;
++  req->freq = freq;
++  self->requests = g_list_prepend (self->requests, req);
++
++  return update_led (self, led);
+ }
+ 
++/**
++ * fbd_dev_leds_stop:
++ * @self: The #FbdDevLeds
++ * @owner: The owner that started the pattern
++ *
++ * Ends the pattern of @owner. If other patterns are requested for the
++ * same LED the one with the highest priority is shown again.
++ */
+ gboolean
+-fbd_dev_leds_stop (FbdDevLeds *self, FbdFeedbackLedColor color)
++fbd_dev_leds_stop (FbdDevLeds *self, gconstpointer owner)
+ {
++  FbdLedRequest *req;
+   FbdDevLed *led;
+ 
+   g_return_val_if_fail (FBD_IS_DEV_LEDS (self), FALSE);
+ 
+-  led = find_led_by_color (self, color);
+-  if (!led) {
+-    g_warning_once ("No usable led found");
+-    return FALSE;
+-  }
++  req = find_request (self, owner);
++  if (!req)
++    return TRUE;
++
++  led = req->led;
++  remove_request (self, req);
+ 
+-  return fbd_dev_led_set_brightness (led, 0);
++  return update_led (self, led);
+ }
+ 
+ /**
+diff --git a/src/fbd-dev-leds.h b/src/fbd-dev-leds.h
+index 368ec2c..f3b779d 100644
+--- a/src/fbd-dev-leds.h
++++ b/src/fbd-dev-leds.h
+@@ -18,11 +18,13 @@ G_DECLARE_FINAL_TYPE (FbdDevLeds, fbd_dev_leds, FBD, DEV_LEDS, GObject);
+ 
+ FbdDevLeds *fbd_dev_leds_new (GError **error);
+ gboolean    fbd_dev_leds_start_periodic (FbdDevLeds          *self,
++                                         gconstpointer        owner,
++                                         guint                priority,
+                                          FbdFeedbackLedColor  color,
+                                          FbdLedRgbColor      *rgb,
+                                          guint                max_brighness,
+                                          guint                freq);
+-gboolean    fbd_dev_leds_stop (FbdDevLeds *self, FbdFeedbackLedColor color);
++gboolean    fbd_dev_leds_stop (FbdDevLeds *self, gconstpointer owner);
+ gboolean    fbd_dev_leds_has_led (FbdDevLeds *self, FbdFeedbackLedColor color);
+ 
+ G_END_DECLS
+diff --git a/src/fbd-feedback-base.c b/src/fbd-feedback-base.c
+index 23946f6..4dbd901 100644
+--- a/src/fbd-feedback-base.c
++++ b/src/fbd-feedback-base.c
+@@ -20,6 +20,7 @@
+ enum {
+   PROP_0,
+   PROP_EVENT_NAME,
++  PROP_PRIORITY,
+   PROP_LAST_PROP,
+ };
+ static GParamSpec *props[PROP_LAST_PROP];
+@@ -33,6 +34,8 @@ static guint signals[N_SIGNALS];
+ typedef struct _FbdFeedbackBasePrivate {
+   gchar *event_name;
+   gboolean ended;
++  guint priority;
++  guint priority_cap;
+ } FbdFeedbackBasePrivate;
+ 
+ G_DEFINE_TYPE_WITH_PRIVATE (FbdFeedbackBase, fbd_feedback_base, G_TYPE_OBJECT);
+@@ -51,6 +54,9 @@ fbd_feedback_base_set_property (GObject        *object,
+     g_free (priv->event_name);
+     priv->event_name = g_value_dup_string (value);
+     break;
++  case PROP_PRIORITY:
++    priv->priority = g_value_get_uint (value);
++    break;
+   default:
+     G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+     break;
+@@ -71,6 +77,9 @@ fbd_feedback_base_get_property (GObject  *object,
+   case PROP_EVENT_NAME:
+     g_value_set_string (value, priv->event_name);
+     break;
++  case PROP_PRIORITY:
++    g_value_set_uint (value, priv->priority);
++    break;
+   default:
+     G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+     break;
+@@ -118,6 +127,17 @@ fbd_feedback_base_class_init (FbdFeedbackBaseClass *klass)
+       "The event this feedback is associated with",
+       NULL,
+       G_PARAM_CONSTRUCT_ONLY | G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
++  /**
++   * FbdFeedbackBase:priority:
++   *
++   * Priority of the feedback. A device can only give a limited amount of
++   * feedback at a time (one vibration pattern, one pattern per LED). If
++   * feedbacks compete for a device the one with the highest priority wins.
++   */
++  props[PROP_PRIORITY] =
++    g_param_spec_uint ("priority", "", "",
++                       0, 255, 0,
++                       G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY | G_PARAM_STATIC_STRINGS);
+ 
+   g_object_class_install_properties (object_class, PROP_LAST_PROP, props);
+ 
+@@ -137,6 +157,9 @@ fbd_feedback_base_class_init (FbdFeedbackBaseClass *klass)
+ static void
+ fbd_feedback_base_init (FbdFeedbackBase *self)
+ {
++  FbdFeedbackBasePrivate *priv = fbd_feedback_base_get_instance_private (self);
++
++  priv->priority_cap = G_MAXUINT;
+ }
+ 
+ /**
+@@ -196,6 +219,46 @@ fbd_feedback_end (FbdFeedbackBase *self)
+ }
+ 
+ 
++/**
++ * fbd_feedback_get_priority:
++ * @self: The feedback
++ *
++ * The priority used when the feedback competes with other feedbacks
++ * for a device: the feedback's priority limited by the cap set with
++ * [method@FbdFeedbackBase.set_priority_cap].
++ *
++ * Returns: The effective priority
++ */
++guint
++fbd_feedback_get_priority (FbdFeedbackBase *self)
++{
++  FbdFeedbackBasePrivate *priv;
++
++  g_return_val_if_fail (FBD_IS_FEEDBACK_BASE (self), 0);
++  priv = fbd_feedback_base_get_instance_private (self);
++
++  return MIN (priv->priority, priv->priority_cap);
++}
++
++/**
++ * fbd_feedback_set_priority_cap:
++ * @self: The feedback
++ * @cap: The highest priority the feedback may use when it runs next
++ *
++ * Limits the priority of the next run, e.g. for events from
++ * applications that may not override other feedback.
++ */
++void
++fbd_feedback_set_priority_cap (FbdFeedbackBase *self, guint cap)
++{
++  FbdFeedbackBasePrivate *priv;
++
++  g_return_if_fail (FBD_IS_FEEDBACK_BASE (self));
++  priv = fbd_feedback_base_get_instance_private (self);
++
++  priv->priority_cap = cap;
++}
++
+ /**
+  * fbd_feedback_get_ended:
+  * @self: The feedback
+diff --git a/src/fbd-feedback-base.h b/src/fbd-feedback-base.h
+index 98dc07e..557234c 100644
+--- a/src/fbd-feedback-base.h
++++ b/src/fbd-feedback-base.h
+@@ -27,6 +27,8 @@ const gchar *fbd_feedback_get_event_name (FbdFeedbackBase *self);
+ void         fbd_feedback_run (FbdFeedbackBase *self);
+ void         fbd_feedback_end (FbdFeedbackBase *self);
+ gboolean     fbd_feedback_get_ended (FbdFeedbackBase *self);
++guint        fbd_feedback_get_priority (FbdFeedbackBase *self);
++void         fbd_feedback_set_priority_cap (FbdFeedbackBase *self, guint cap);
+ void         fbd_feedback_base_done (FbdFeedbackBase *self);
+ gboolean     fbd_feedback_is_available (FbdFeedbackBase *self);
+ 
+diff --git a/src/fbd-feedback-led.c b/src/fbd-feedback-led.c
+index edd4cb3..fc3f0c8 100644
+--- a/src/fbd-feedback-led.c
++++ b/src/fbd-feedback-led.c
+@@ -28,7 +28,6 @@ enum {
+   PROP_FREQUENCY,
+   PROP_COLOR,
+   PROP_MAX_BRIGHTNESS,
+-  PROP_PRIORITY,
+   PROP_LAST_PROP,
+ };
+ static GParamSpec *props[PROP_LAST_PROP];
+@@ -37,7 +36,6 @@ typedef struct _FbdFeedbackLed {
+   FbdFeedbackBase  parent;
+ 
+   guint            frequency;
+-  guint            priority;
+   guint            max_brightness;
+   char            *color;
+   gboolean         prefer_flash;
+@@ -190,9 +188,6 @@ fbd_feedback_led_set_property (GObject      *object,
+   case PROP_FREQUENCY:
+     self->frequency = g_value_get_uint (value);
+     break;
+-  case PROP_PRIORITY:
+-    self->priority = g_value_get_uint (value);
+-    break;
+   case PROP_MAX_BRIGHTNESS:
+     self->max_brightness = g_value_get_uint (value);
+     break;
+@@ -218,9 +213,6 @@ fbd_feedback_led_get_property (GObject    *object,
+   case PROP_FREQUENCY:
+     g_value_set_uint (value, self->frequency);
+     break;
+-  case PROP_PRIORITY:
+-    g_value_set_uint (value, self->priority);
+-    break;
+   case PROP_MAX_BRIGHTNESS:
+     g_value_set_uint (value, self->max_brightness);
+     break;
+@@ -247,8 +239,9 @@ fbd_feedback_led_run (FbdFeedbackBase *base)
+   g_debug ("Periodic led feedback: max brightness: %d, freq: %d", self->max_brightness, self->frequency);
+ 
+   color = color_string_to_color (self->color, self->prefer_flash, &rgb);
+-  /* FIXME: handle priority */
+   fbd_dev_leds_start_periodic (dev,
++                               self,
++                               fbd_feedback_get_priority (base),
+                                color,
+                                &rgb,
+                                self->max_brightness,
+@@ -262,11 +255,9 @@ fbd_feedback_led_end (FbdFeedbackBase *base)
+   FbdFeedbackLed *self = FBD_FEEDBACK_LED (base);
+   FbdFeedbackManager *manager = fbd_feedback_manager_get_default ();
+   FbdDevLeds *dev = fbd_feedback_manager_get_dev_leds (manager);
+-  FbdFeedbackLedColor color;
+ 
+-  color = color_string_to_color (self->color, self->prefer_flash, NULL);
+   if (dev)
+-    fbd_dev_leds_stop (dev, color);
++    fbd_dev_leds_stop (dev, self);
+   fbd_feedback_base_done (FBD_FEEDBACK_BASE (self));
+ }
+ 
+@@ -336,17 +327,6 @@ fbd_feedback_led_class_init (FbdFeedbackLedClass *klass)
+     g_param_spec_string ("color", "", "",
+                          NULL,
+                          G_PARAM_CONSTRUCT_ONLY | G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+-  /**
+-   * FbdFeedbackLed:priority:
+-   *
+-   * Priority of the LED pattern. LED devices can only display a limited
+-   * amount of patterns at a time. In this case the pattern with the highest
+-   * priority wins.
+-   */
+-  props[PROP_PRIORITY] =
+-    g_param_spec_uint ("priority", "", "",
+-                       0, 255, 0,
+-                       G_PARAM_CONSTRUCT_ONLY | G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+   /**
+    * FbdFeedbackLed:max-brightness:
+    *
+diff --git a/tests/test-fbd-dev-led.c b/tests/test-fbd-dev-led.c
+index af47def..559db57 100644
+--- a/tests/test-fbd-dev-led.c
++++ b/tests/test-fbd-dev-led.c
+@@ -11,6 +11,7 @@
+ #include "fbd-dev-led-multicolor.h"
+ #include "fbd-dev-led-qcom.h"
+ #include "fbd-dev-led-qcom-multicolor.h"
++#include "fbd-dev-leds.h"
+ 
+ #include "testlib.h"
+ 
+@@ -188,11 +189,86 @@ test_fbd_dev_led_legacy (FbdUmockdevFixture *fixture, gconstpointer unused)
+ }
+ 
+ 
++static char *
++read_attr (GUdevDevice *dev, const char *attr)
++{
++  g_autofree char *path = g_build_filename (g_udev_device_get_sysfs_path (dev), attr, NULL);
++  g_autoptr (GError) err = NULL;
++  char *contents = NULL;
++
++  g_file_get_contents (path, &contents, NULL, &err);
++  g_assert_no_error (err);
++  return contents;
++}
++
++
++static void
++assert_attr (GUdevDevice *dev, const char *attr, const char *expected)
++{
++  g_autofree char *contents = read_attr (dev, attr);
++
++  g_assert_cmpstr (contents, ==, expected);
++}
++
++
++static void
++test_fbd_dev_leds_priority (FbdUmockdevFixture *fixture, gconstpointer unused)
++{
++  GUdevClient *client;
++  g_autolist (GUdevDevice) devs = NULL;
++  g_autoptr (FbdDevLeds) leds = NULL;
++  g_autoptr (GError) err = NULL;
++  GUdevDevice *dev;
++  int low, high, constant;
++
++  client = g_udev_client_new ((const char *const []){ "leds", NULL});
++  devs = g_udev_client_query_by_subsystem (client, "leds");
++  g_assert_cmpint (g_list_length (devs), ==, 1);
++  dev = G_UDEV_DEVICE (devs->data);
++
++  leds = fbd_dev_leds_new (&err);
++  g_assert_no_error (err);
++
++  /* 1 Hz */
++  g_assert_true (fbd_dev_leds_start_periodic (leds, &low, 10, FBD_FEEDBACK_LED_COLOR_BLUE,
++                                              NULL, 100, 1000));
++  assert_attr (dev, "pattern", "0 500 255 500\n");
++
++  /* A higher priority wins */
++  g_assert_true (fbd_dev_leds_start_periodic (leds, &high, 20, FBD_FEEDBACK_LED_COLOR_BLUE,
++                                              NULL, 100, 2000));
++  assert_attr (dev, "pattern", "0 250 255 250\n");
++
++  /* A lower priority waits */
++  g_assert_true (fbd_dev_leds_start_periodic (leds, &constant, 5, FBD_FEEDBACK_LED_COLOR_BLUE,
++                                              NULL, 100, 0));
++  assert_attr (dev, "pattern", "0 250 255 250\n");
++
++  /* The next one is shown again */
++  g_assert_true (fbd_dev_leds_stop (leds, &high));
++  assert_attr (dev, "pattern", "0 500 255 500\n");
++
++  /* A constant light replaces the blink pattern */
++  g_assert_true (fbd_dev_leds_stop (leds, &low));
++  assert_attr (dev, "pattern", "255 1000 255 1000\n");
++
++  g_assert_true (fbd_dev_leds_stop (leds, &constant));
++  assert_attr (dev, "brightness", "0");
++
++  /* Stopping twice is harmless */
++  g_assert_true (fbd_dev_leds_stop (leds, &constant));
++  g_object_unref (client);
++}
++
++
+ gint
+ main (gint argc, gchar *argv[])
+ {
+   g_test_init (&argc, &argv, NULL);
+ 
++  FBD_UMOCKDEV_TEST_ADD ("/feedbackd/fbd/dev/leds/priority",
++                         test_fbd_dev_leds_priority,
++                         "led-simple");
+   FBD_UMOCKDEV_TEST_ADD ("/feedbackd/fbd/dev/led/simple",
+                          test_fbd_dev_led_simple,
+                          "led-simple");

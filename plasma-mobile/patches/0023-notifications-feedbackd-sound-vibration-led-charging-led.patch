@@ -1,0 +1,614 @@
+From: pocket-debs <masterxq@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 12:08:17 +0100
+Subject: [PATCH] notifications: sound, vibration and LED through feedbackd, charging LED
+Description:
+ The shell gave no feedback for notifications: nothing vibrated and the
+ LED stayed dark, only applications that play their own sound were
+ heard.
+ .
+ The notification popup provider now triggers a feedbackd event for
+ every new notification with normal or critical urgency, chosen by its
+ category: incoming calls and alarms (call.incoming, x-kde.incoming-call,
+ alarm.ringing) last as long as their notification, cell broadcasts,
+ instant messages and emails get their own events, everything else the
+ generic one. Applications using KNotification play their own sounds,
+ their events get no sound from feedbackd (profile quiet). In do not
+ disturb mode only alarms and the applications allowed to show popups
+ keep their feedback; the others only light the LED. Notifications the
+ user hid from popups and the drawer give no feedback.
+ .
+ A notification arriving while the phone is locked or the display is
+ off starts a reminder on the LED until it is seen: unlock, display on
+ without a lock, or the action drawer opening; closing all those
+ notifications ends it as well. While the battery charges the LED shows
+ the battery-charging event. Which event a device shows when they
+ compete is up to the priorities of the feedbackd theme.
+ .
+ A new notification turns the display on (PowerDevil wakeup), except in
+ do not disturb mode; new setting in the shell settings, on by default.
+Author: masterxq <masterxq@users.noreply.github.com>
+Forwarded: no
+License: GPL-2.0-or-later, LGPL-2.0-or-later (as the patched files)
+Last-Update: 2026-11-28
+---
+diff --git a/components/hapticsplugin/CMakeLists.txt b/components/hapticsplugin/CMakeLists.txt
+index 13b5f0287..f2a70c08e 100644
+--- a/components/hapticsplugin/CMakeLists.txt
++++ b/components/hapticsplugin/CMakeLists.txt
+@@ -9,6 +9,7 @@ ecm_add_qml_module(hapticsplugin URI org.kde.plasma.private.mobileshell.hapticsp
+ target_sources(hapticsplugin PRIVATE
+     vibrationevent.h
+     vibrationmanager.cpp
++    feedbackevents.cpp
+     ${dbusinterface_SRCS}
+ )
+ 
+diff --git a/components/hapticsplugin/feedbackevents.cpp b/components/hapticsplugin/feedbackevents.cpp
+new file mode 100644
+index 000000000..02310f63d
+--- /dev/null
++++ b/components/hapticsplugin/feedbackevents.cpp
+@@ -0,0 +1,130 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "feedbackevents.h"
++
++#include <QDBusConnection>
++#include <QDBusMessage>
++#include <QDBusPendingCallWatcher>
++#include <QDBusPendingReply>
++#include <QDBusServiceWatcher>
++#include <QPointer>
++
++using namespace Qt::StringLiterals;
++
++static const QString s_service = u"org.sigxcpu.Feedback"_s;
++static const QString s_path = u"/org/sigxcpu/Feedback"_s;
++static const QString s_interface = u"org.sigxcpu.Feedback"_s;
++
++FeedbackEvents::FeedbackEvents(QObject *parent)
++    : QObject{parent}
++    , m_watcher{new QDBusServiceWatcher(s_service, QDBusConnection::sessionBus(), QDBusServiceWatcher::WatchForRegistration, this)}
++{
++    connect(m_watcher, &QDBusServiceWatcher::serviceRegistered, this, &FeedbackEvents::onDaemonRestarted);
++    QDBusConnection::sessionBus().connect(s_service, s_path, s_interface, u"FeedbackEnded"_s, this, SLOT(onFeedbackEnded(uint, uint)));
++}
++
++void FeedbackEvents::trigger(const QString &key, const QString &appId, const QString &event, const QVariantMap &hints, int timeout)
++{
++    end(key);
++
++    Event e;
++    e.appId = appId;
++    e.event = event;
++    e.hints = hints;
++    e.timeout = timeout;
++    e.serial = ++m_serial;
++    m_events.insert(key, e);
++    send(key);
++}
++
++void FeedbackEvents::send(const QString &key)
++{
++    const Event &e = m_events.value(key);
++    const quint64 serial = e.serial;
++
++    QDBusMessage msg = QDBusMessage::createMethodCall(s_service, s_path, s_interface, u"TriggerFeedback"_s);
++    msg << e.appId << e.event << e.hints << e.timeout;
++
++    auto watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(msg), this);
++    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, key, serial](QDBusPendingCallWatcher *watcher) {
++        watcher->deleteLater();
++        const QDBusPendingReply<uint> reply = *watcher;
++        if (reply.isError()) {
++            if (m_events.value(key).serial == serial) {
++                m_events.remove(key);
++            }
++            return;
++        }
++        auto it = m_events.find(key);
++        if (it == m_events.end() || it->serial != serial) {
++            // ended or replaced while the call was pending
++            endId(reply.value());
++            return;
++        }
++        it->id = reply.value();
++    });
++}
++
++void FeedbackEvents::end(const QString &key)
++{
++    const auto it = m_events.constFind(key);
++    if (it == m_events.constEnd()) {
++        return;
++    }
++    const uint id = it->id;
++    m_events.erase(it);
++    if (id) {
++        endId(id);
++    }
++}
++
++bool FeedbackEvents::isActive(const QString &key) const
++{
++    return m_events.contains(key);
++}
++
++void FeedbackEvents::endId(uint id)
++{
++    QDBusMessage msg = QDBusMessage::createMethodCall(s_service, s_path, s_interface, u"EndFeedback"_s);
++    msg << id;
++    QDBusConnection::sessionBus().asyncCall(msg);
++}
++
++void FeedbackEvents::onFeedbackEnded(uint id, uint reason)
++{
++    Q_UNUSED(reason)
++    for (auto it = m_events.begin(); it != m_events.end(); ++it) {
++        if (it->id == id) {
++            m_events.erase(it);
++            return;
++        }
++    }
++}
++
++void FeedbackEvents::onDaemonRestarted()
++{
++    // The events of the previous daemon are gone; endless ones come back
++    const QStringList keys = m_events.keys();
++    for (const QString &key : keys) {
++        Event &e = m_events[key];
++        if (e.timeout != 0) {
++            m_events.remove(key);
++            continue;
++        }
++        e.id = 0;
++        e.serial = ++m_serial;
++        send(key);
++    }
++}
++
++void FeedbackEvents::wakeScreen()
++{
++    QDBusMessage msg = QDBusMessage::createMethodCall(u"org.kde.Solid.PowerManagement"_s,
++                                                      u"/org/kde/Solid/PowerManagement"_s,
++                                                      u"org.kde.Solid.PowerManagement"_s,
++                                                      u"wakeup"_s);
++    QDBusConnection::sessionBus().asyncCall(msg);
++}
++
++#include "moc_feedbackevents.cpp"
+diff --git a/components/hapticsplugin/feedbackevents.h b/components/hapticsplugin/feedbackevents.h
+new file mode 100644
+index 000000000..64bd9734a
+--- /dev/null
++++ b/components/hapticsplugin/feedbackevents.h
+@@ -0,0 +1,64 @@
++// SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <QHash>
++#include <QObject>
++#include <QVariantMap>
++#include <qqmlregistration.h>
++
++class QDBusServiceWatcher;
++
++/**
++ * Events for the feedback daemon (feedbackd, org.sigxcpu.Feedback).
++ *
++ * Each event is triggered under a key chosen by the caller. Triggering a
++ * key again ends the previous event of that key, end() ends it. Events
++ * without a timeout (0) are triggered again when the daemon restarts.
++ * Without the daemon nothing happens.
++ */
++class FeedbackEvents : public QObject
++{
++    Q_OBJECT
++    QML_ELEMENT
++    QML_SINGLETON
++
++public:
++    explicit FeedbackEvents(QObject *parent = nullptr);
++
++    /**
++     * Trigger @p event (event naming spec of feedbackd) for @p appId.
++     * @p hints are passed on (e.g. profile, important, sound-file).
++     * @p timeout in seconds, 0 runs until end(), -1 runs every feedback once.
++     */
++    Q_INVOKABLE void trigger(const QString &key, const QString &appId, const QString &event, const QVariantMap &hints, int timeout);
++    Q_INVOKABLE void end(const QString &key);
++    Q_INVOKABLE bool isActive(const QString &key) const;
++
++    /**
++     * Turn the display on as for user activity (PowerDevil wakeup).
++     */
++    Q_INVOKABLE void wakeScreen();
++
++private Q_SLOTS:
++    void onFeedbackEnded(uint id, uint reason);
++
++private:
++    struct Event {
++        QString appId;
++        QString event;
++        QVariantMap hints;
++        int timeout = -1;
++        quint64 serial = 0;
++        uint id = 0; // 0 while the reply of the daemon is pending
++    };
++
++    void send(const QString &key);
++    void endId(uint id);
++    void onDaemonRestarted();
++
++    QHash<QString, Event> m_events;
++    quint64 m_serial = 0;
++    QDBusServiceWatcher *m_watcher = nullptr;
++};
+diff --git a/components/mobileshell/CMakeLists.txt b/components/mobileshell/CMakeLists.txt
+index 31a89f69f..0f905cd67 100644
+--- a/components/mobileshell/CMakeLists.txt
++++ b/components/mobileshell/CMakeLists.txt
+@@ -77,6 +77,7 @@ ecm_target_qml_sources(mobileshellplugin SOURCES
+     qml/popups/actionbuttons/ActionButtonsProvider.qml
+     qml/popups/actionbuttons/RotationButton.qml
+ 
++    qml/popups/notifications/NotificationFeedback.qml
+     qml/popups/notifications/NotificationPopup.qml
+     qml/popups/notifications/NotificationPopupManager.qml
+     qml/popups/notifications/NotificationPopupProvider.qml
+diff --git a/components/mobileshell/qml/dataproviders/BatteryInfo.qml b/components/mobileshell/qml/dataproviders/BatteryInfo.qml
+index 97c01c831..e4a939d3d 100644
+--- a/components/mobileshell/qml/dataproviders/BatteryInfo.qml
++++ b/components/mobileshell/qml/dataproviders/BatteryInfo.qml
+@@ -21,5 +21,6 @@ Item {
+     property bool isVisible: batteryControl.hasInternalBatteries
+     property int percent: batteryControl.percent
+     property bool pluggedIn: batteryControl.pluggedIn
++    property bool charging: batteryControl.state === BatteryControlModel.Charging
+     property alias batteries: batteryControl
+ }
+diff --git a/components/mobileshell/qml/popups/notifications/NotificationFeedback.qml b/components/mobileshell/qml/popups/notifications/NotificationFeedback.qml
+new file mode 100644
+index 000000000..d15d0f013
+--- /dev/null
++++ b/components/mobileshell/qml/popups/notifications/NotificationFeedback.qml
+@@ -0,0 +1,201 @@
++/*
++ *  SPDX-FileCopyrightText: 2026 masterxq <masterxq@users.noreply.github.com>
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++import QtQuick
++
++import org.kde.notificationmanager as NotificationManager
++import org.kde.plasma.private.mobileshell as MobileShell
++import org.kde.plasma.private.mobileshell.state as MobileShellState
++import org.kde.plasma.private.mobileshell.shellsettingsplugin as ShellSettings
++import org.kde.plasma.private.mobileshell.hapticsplugin as HapticsPlugin
++import org.kde.plasma.private.mobileshell.dpmsplugin as DPMS
++
++/**
++ * Sound, vibration and LED for notifications through feedbackd, and the
++ * charging indicator on the LED. The event depends on the category and
++ * the urgency of a notification; feedbackd decides by the priorities of
++ * its theme which event a device shows when several compete.
++ *
++ * - Applications using KNotification play their own sounds, so their
++ *   events get no sound from feedbackd.
++ * - Do not disturb: only alarms keep their feedback, everything else
++ *   (incoming calls too) only lights the LED.
++ * - A notification that arrives while the phone is locked or the
++ *   display is off starts the reminder on the LED until it is seen:
++ *   unlock, display on without a lock, or the action drawer opens.
++ */
++Item {
++    id: root
++
++    required property bool inhibited
++    required property QtObject notificationSettings
++
++    readonly property string shellId: "org.kde.plasmashell"
++
++    readonly property bool locked: MobileShellState.LockscreenDBusClient.lockscreenActive
++    readonly property bool drawerOpen: MobileShellState.ShellDBusClient.isActionDrawerOpen
++    property bool screenOn: true
++    readonly property bool seen: drawerOpen || (!locked && screenOn)
++
++    // ids of the notifications the reminder on the LED stands for
++    property var unseen: []
++    property bool ready: false
++
++    readonly property bool charging: MobileShell.BatteryInfo.charging
++
++    onChargingChanged: updateCharging()
++    onSeenChanged: {
++        if (seen) {
++            clearUnseen();
++        }
++    }
++
++    Component.onCompleted: {
++        updateCharging();
++        // notifications that are there already got their feedback before
++        Qt.callLater(() => { root.ready = true; });
++    }
++
++    function updateCharging() {
++        if (charging) {
++            if (!HapticsPlugin.FeedbackEvents.isActive("charging")) {
++                HapticsPlugin.FeedbackEvents.trigger("charging", shellId, "battery-charging", {}, 0);
++            }
++        } else {
++            HapticsPlugin.FeedbackEvents.end("charging");
++        }
++    }
++
++    function clearUnseen() {
++        unseen = [];
++        HapticsPlugin.FeedbackEvents.end("unseen");
++    }
++
++    function listed(applications, services, desktopEntry, notifyRcName) {
++        return (desktopEntry !== "" && applications.includes(desktopEntry))
++            || (notifyRcName !== "" && services.includes(notifyRcName));
++    }
++
++    // Event for the category of a notification (event naming spec of feedbackd)
++    function eventFor(category) {
++        if (category === "call.incoming" || category === "x-kde.incoming-call") {
++            return { kind: "call", event: "phone-incoming-call", missed: "" };
++        }
++        if (category === "alarm.ringing") {
++            return { kind: "alarm", event: "alarm-clock-elapsed", missed: "" };
++        }
++        if (category.startsWith("cellbroadcast.")) {
++            return { kind: "alert", event: "message-new-cellbroadcast", missed: "notification-missed-generic" };
++        }
++        if (category === "call.unanswered") {
++            return { kind: "", event: "notification-new-generic", missed: "phone-missed-call" };
++        }
++        if (category === "im" || category.startsWith("im.")) {
++            return { kind: "", event: "message-new-instant", missed: "message-missed-instant" };
++        }
++        if (category === "email" || category.startsWith("email.")) {
++            return { kind: "", event: "message-new-email", missed: "message-missed-email" };
++        }
++        return { kind: "", event: "notification-new-generic", missed: "notification-missed-generic" };
++    }
++
++    function added(idx) {
++        const N = NotificationManager.Notifications;
++        if (notifications.data(idx, N.TypeRole) !== N.NotificationType) {
++            return;
++        }
++        const urgency = notifications.data(idx, N.UrgencyRole);
++        if (urgency === N.LowUrgency || notifications.data(idx, N.UserActionFeedbackRole)) {
++            return;
++        }
++
++        const desktopEntry = notifications.data(idx, N.DesktopEntryRole) || "";
++        const notifyRcName = notifications.data(idx, N.NotifyRcNameRole) || "";
++        const s = notificationSettings;
++        // shown neither as popup nor in the drawer
++        if (listed(s.popupBlacklistedApplications, s.popupBlacklistedServices, desktopEntry, notifyRcName)
++            && listed(s.historyBlacklistedApplications, s.historyBlacklistedServices, desktopEntry, notifyRcName)) {
++            return;
++        }
++
++        const id = notifications.data(idx, N.IdRole);
++        const category = notifications.data(idx, N.CategoryRole) || "";
++        const notificationHints = notifications.data(idx, N.HintsRole) || {};
++        const appId = desktopEntry || notifyRcName || notifications.data(idx, N.ApplicationNameRole) || shellId;
++        const f = eventFor(category);
++
++        const exempt = f.kind === "alarm"
++            || listed(s.doNotDisturbPopupWhitelistedApplications, s.doNotDisturbPopupWhitelistedServices, desktopEntry, notifyRcName);
++        const quiet = inhibited && !exempt;
++
++        const hints = {};
++        if (quiet) {
++            hints.profile = "silent";
++        } else if (notificationHints["suppress-sound"] === true || ("x-kde-appname" in notificationHints)) {
++            // the application plays its sound itself
++            hints.profile = "quiet";
++        } else if (notificationHints["sound-file"]) {
++            hints["sound-file"] = notificationHints["sound-file"];
++        }
++        if (f.kind !== "" || urgency === N.CriticalUrgency) {
++            hints.important = true;
++        }
++
++        // calls and alarms last as long as their notification
++        const endless = f.kind === "call" || f.kind === "alarm";
++        HapticsPlugin.FeedbackEvents.trigger("n" + id, appId, f.event, hints, endless ? 0 : -1);
++
++        if (f.missed !== "" && !seen && !notifications.data(idx, N.TransientRole)) {
++            unseen = unseen.concat([id]);
++            HapticsPlugin.FeedbackEvents.trigger("unseen", shellId, f.missed, {}, 0);
++        }
++
++        if (!quiet && !screenOn && f.kind !== "call" && ShellSettings.Settings.wakeScreenOnNotification) {
++            HapticsPlugin.FeedbackEvents.wakeScreen();
++        }
++    }
++
++    function removed(id) {
++        HapticsPlugin.FeedbackEvents.end("n" + id);
++        if (unseen.includes(id)) {
++            unseen = unseen.filter(other => other !== id);
++            if (unseen.length === 0) {
++                HapticsPlugin.FeedbackEvents.end("unseen");
++            }
++        }
++    }
++
++    DPMS.DPMSUtil {
++        onDpmsTurnedOn: root.screenOn = true
++        onDpmsTurnedOff: root.screenOn = false
++    }
++
++    NotificationManager.Notifications {
++        id: notifications
++
++        showExpired: true
++        showDismissed: true
++        showJobs: false
++        groupMode: NotificationManager.Notifications.GroupDisabled
++        urgencies: NotificationManager.Notifications.LowUrgency
++                   | NotificationManager.Notifications.NormalUrgency
++                   | NotificationManager.Notifications.CriticalUrgency
++
++        onRowsInserted: (parent, first, last) => {
++            if (!root.ready) {
++                return;
++            }
++            for (let row = first; row <= last; ++row) {
++                root.added(notifications.index(row, 0));
++            }
++        }
++        onRowsAboutToBeRemoved: (parent, first, last) => {
++            for (let row = first; row <= last; ++row) {
++                root.removed(notifications.data(notifications.index(row, 0), NotificationManager.Notifications.IdRole));
++            }
++        }
++    }
++}
+diff --git a/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml b/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml
+index 1c32757a0..0b558959a 100644
+--- a/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml
++++ b/components/mobileshell/qml/popups/notifications/NotificationPopupProvider.qml
+@@ -134,6 +134,11 @@ QtObject {
+         }
+     }
+ 
++    property var feedback: NotificationFeedback {
++        inhibited: notificationProvider.inhibited
++        notificationSettings: notificationProvider.notificationSettings
++    }
++
+     property var npm: NotificationPopupManager {
+         notificationModelType: notificationProvider.notificationModelType
+         notificationSettings: notificationProvider.notificationSettings
+diff --git a/components/shellsettingsplugin/mobileshellsettings.cpp b/components/shellsettingsplugin/mobileshellsettings.cpp
+index c5bbd13bb..51e687a21 100644
+--- a/components/shellsettingsplugin/mobileshellsettings.cpp
++++ b/components/shellsettingsplugin/mobileshellsettings.cpp
+@@ -31,6 +31,7 @@ MobileShellSettings::MobileShellSettings(QObject *parent)
+         if (group.name() == GENERAL_CONFIG_GROUP) {
+             Q_EMIT vibrationsEnabledChanged();
+             Q_EMIT vibrationDurationChanged();
++            Q_EMIT wakeScreenOnNotificationChanged();
+             Q_EMIT animationsEnabledChanged();
+             Q_EMIT dateInStatusBarChanged();
+             Q_EMIT statusBarScaleFactorChanged();
+@@ -70,6 +71,19 @@ void MobileShellSettings::setVibrationsEnabled(bool vibrationsEnabled)
+     m_config->sync();
+ }
+ 
++bool MobileShellSettings::wakeScreenOnNotification() const
++{
++    auto group = KConfigGroup{m_config, GENERAL_CONFIG_GROUP};
++    return group.readEntry("wakeScreenOnNotification", true);
++}
++
++void MobileShellSettings::setWakeScreenOnNotification(bool wakeScreen)
++{
++    auto group = KConfigGroup{m_config, GENERAL_CONFIG_GROUP};
++    group.writeEntry("wakeScreenOnNotification", wakeScreen, KConfigGroup::Notify);
++    m_config->sync();
++}
++
+ int MobileShellSettings::vibrationDuration() const
+ {
+     auto group = KConfigGroup{m_config, GENERAL_CONFIG_GROUP};
+diff --git a/components/shellsettingsplugin/mobileshellsettings.h b/components/shellsettingsplugin/mobileshellsettings.h
+index adb33d603..669bf0cd6 100644
+--- a/components/shellsettingsplugin/mobileshellsettings.h
++++ b/components/shellsettingsplugin/mobileshellsettings.h
+@@ -27,6 +27,7 @@ class MobileShellSettings : public QObject
+     // general
+     Q_PROPERTY(bool vibrationsEnabled READ vibrationsEnabled WRITE setVibrationsEnabled NOTIFY vibrationsEnabledChanged)
+     Q_PROPERTY(int vibrationDuration READ vibrationDuration WRITE setVibrationDuration NOTIFY vibrationDurationChanged)
++    Q_PROPERTY(bool wakeScreenOnNotification READ wakeScreenOnNotification WRITE setWakeScreenOnNotification NOTIFY wakeScreenOnNotificationChanged)
+     Q_PROPERTY(bool animationsEnabled READ animationsEnabled WRITE setAnimationsEnabled NOTIFY animationsEnabledChanged)
+ 
+     // status bar
+@@ -111,6 +112,18 @@ public:
+      */
+     void setVibrationDuration(int vibrationDuration);
+ 
++    /**
++     * Whether a new notification turns the display on.
++     */
++    bool wakeScreenOnNotification() const;
++
++    /**
++     * Set whether a new notification turns the display on.
++     *
++     * @param wakeScreen Whether the display is turned on.
++     */
++    void setWakeScreenOnNotification(bool wakeScreen);
++
+     /**
+      * Whether animations are enabled in the shell.
+      *
+@@ -312,6 +325,7 @@ public:
+ Q_SIGNALS:
+     void vibrationsEnabledChanged();
+     void vibrationDurationChanged();
++    void wakeScreenOnNotificationChanged();
+     void navigationPanelEnabledChanged();
+     void gesturePanelEnabledChanged();
+     void alwaysShowKeyboardToggleOnNavigationPanelChanged();
+diff --git a/kcms/mobileshell/ui/main.qml b/kcms/mobileshell/ui/main.qml
+index 8ad07d0d8..6a5cbe522 100644
+--- a/kcms/mobileshell/ui/main.qml
++++ b/kcms/mobileshell/ui/main.qml
+@@ -75,6 +75,20 @@ KCM.SimpleKCM {
+                     }
+                 }
+             }
++
++            FormCard.FormDelegateSeparator { above: doubleTapWakeup; below: wakeScreenOnNotification }
++
++            FormCard.FormSwitchDelegate {
++                id: wakeScreenOnNotification
++                text: i18n("Turn on the screen for notifications")
++                description: i18n("A new notification turns on the screen when it is off.")
++                checked: ShellSettings.Settings.wakeScreenOnNotification
++                onCheckedChanged: {
++                    if (checked != ShellSettings.Settings.wakeScreenOnNotification) {
++                        ShellSettings.Settings.wakeScreenOnNotification = checked;
++                    }
++                }
++            }
+         }
+ 
+         FormCard.FormHeader {
+diff --git a/po/de/kcm_mobileshell.po b/po/de/kcm_mobileshell.po
+index ff313ef63..a2a0c71e9 100644
+--- a/po/de/kcm_mobileshell.po
++++ b/po/de/kcm_mobileshell.po
+@@ -64,6 +64,16 @@ msgstr ""
+ msgid "Double Tap to Wakeup"
+ msgstr "Doppelt antippen, um aufzuwecken"
+ 
++#: ui/main.qml
++#, kde-format
++msgid "Turn on the screen for notifications"
++msgstr "Bildschirm bei Benachrichtigungen einschalten"
++
++#: ui/main.qml
++#, kde-format
++msgid "A new notification turns on the screen when it is off."
++msgstr "Eine neue Benachrichtigung schaltet den ausgeschalteten Bildschirm ein."
++
+ #: ui/main.qml:70
+ #, kde-format
+ msgid "When the screen is off, double tap to wakeup the device."
