@@ -10,6 +10,10 @@ Description:
  .
  The page of a module is put on the page stack before the module loads,
  so that pages it pushes while loading come after it instead of below.
+ Switching between the narrow and the wide layout rebuilds the page
+ stack; the pages the module pushed on top of its main page are put back
+ as well. A window that starts wide and gets its narrow size afterwards
+ (a phone) lost the page the module opened for its arguments.
 Author: masterxq <masterxq@users.noreply.github.com>
 Forwarded: no
 License: GPL-2.0-or-later (as the patched files)
@@ -110,11 +114,78 @@ index e1525f3..d7443e6 100644
  
      bool m_valid{false};
      bool m_isInSubCategory{false};
+diff --git a/src/qml/KCMContainer.qml b/src/qml/KCMContainer.qml
+index 04f6f52..c739aa3 100644
+--- a/src/qml/KCMContainer.qml
++++ b/src/qml/KCMContainer.qml
+@@ -25,6 +25,11 @@ KCMPageContainer {
+         }
+     }
+ 
++    // Puts a page of the module back on the page stack after the stack was rebuilt
++    function restoreSubPage(page) {
++        applicationWindow().pageStack.push(kcmPageContainer, {"kcm": kcm, "internalPage": page}, Controls.StackView.Immediate);
++    }
++
+     Component {
+         id: kcmPageContainer
+         KCMPageContainer {}
 diff --git a/src/qml/Main.qml b/src/qml/Main.qml
-index 66c0f60..b6896a3 100644
+index 66c0f60..a0cffde 100644
 --- a/src/qml/Main.qml
 +++ b/src/qml/Main.qml
-@@ -178,9 +178,10 @@ Kirigami.AbstractApplicationWindow {
+@@ -41,10 +41,30 @@ Kirigami.AbstractApplicationWindow {
+         id: contextDrawer
+     }
+ 
++    // The pages the module pushed on top of its main page. Their containers belong to the page stack,
++    // the pages themselves to the module.
++    function kcmSubPages() {
++        const pages = [];
++        let aboveKCMPage = false;
++        for (let i = 0; i < pageStack.depth; ++i) {
++            const item = pageStack.get(i);
++            const page = item && item.page !== undefined ? item.page : item;
++            if (page === root.loadedKCMPage) {
++                aboveKCMPage = true;
++            } else if (aboveKCMPage && page && page.internalPage) {
++                pages.push(page.internalPage);
++            }
++        }
++        return pages;
++    }
++
+     // change between sidebar and single page listview
+     function changeNav(toWidescreen) {
+         if (SettingsApp.singleModule) return;
+ 
++        // rebuilding the page stack destroys the containers of the pages of the module
++        const kcmPages = kcmSubPages();
++
+         if (toWidescreen) {
+             sidebarLoader.active = true;
+             root.globalDrawer = sidebarLoader.item;
+@@ -58,6 +78,9 @@ Kirigami.AbstractApplicationWindow {
+             // restore the kcm page
+             if (SettingsApp.activeModule.name && root.loadedKCMPage) {
+                 pageStack.push(root.loadedKCMPage, null, QQC2.StackView.Immediate);
++                for (const page of kcmPages) {
++                    root.loadedKCMPage.restoreSubPage(page);
++                }
+             }
+ 
+             // go to correct sidebar page
+@@ -90,6 +113,9 @@ Kirigami.AbstractApplicationWindow {
+             // restore the kcm page
+             if (SettingsApp.activeModule.name && root.loadedKCMPage) {
+                 pageStack.push(root.loadedKCMPage, null, QQC2.StackView.Immediate);
++                for (const page of kcmPages) {
++                    root.loadedKCMPage.restoreSubPage(page);
++                }
+             }
+         }
+     }
+@@ -178,9 +204,10 @@ Kirigami.AbstractApplicationWindow {
                  pageStack,
                  {"kcm": SettingsApp.activeModule.kcm, "internalPage": SettingsApp.activeModule.kcm.mainUi}
              );

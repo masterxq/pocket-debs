@@ -8,6 +8,8 @@ Description:
  .
  The lists of the privacy section were empty: the model of their entries
  had become part of the expression of notificationsAvailable.
+ They showed no value either: the binding of the current index was
+ evaluated before the entries were there and depends on their count now.
 Author: masterxq <masterxq@users.noreply.github.com>
 Forwarded: no
 License: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL (as the patched files)
@@ -71,7 +73,7 @@ index 440e40dacf..54d64b6402 100644
                          text: i18n("Show in history")
                          checked: !!behaviorSettings && behaviorSettings.showInHistory
 diff --git a/kcms/notifications/ui/main.qml b/kcms/notifications/ui/main.qml
-index 72de099311..c3acbacc73 100644
+index 72de099311..8d0da22aef 100644
 --- a/kcms/notifications/ui/main.qml
 +++ b/kcms/notifications/ui/main.qml
 @@ -26,6 +26,7 @@ KCM.SimpleKCM {
@@ -90,6 +92,36 @@ index 72de099311..c3acbacc73 100644
  
      function openSourcesSettings(args) {
          // TODO would be nice to re-use the current SourcesPage instead of pushing a new one that lost all state
+@@ -234,7 +234,8 @@ KCM.SimpleKCM {
+             textRole: "text"
+             valueRole: "value"
+             model: root.visibilityModel
+-            currentIndex: indexOfValue(kcm.notificationSettings.lockScreenVisibility)
++            // depends on count: the model is not there yet when the binding is first evaluated
++            currentIndex: count > 0 ? indexOfValue(kcm.notificationSettings.lockScreenVisibility) : -1
+             onActivated: kcm.notificationSettings.lockScreenVisibility = currentValue
+ 
+             KCM.SettingStateBinding {
+@@ -249,7 +250,8 @@ KCM.SimpleKCM {
+             textRole: "text"
+             valueRole: "value"
+             model: root.visibilityModel
+-            currentIndex: indexOfValue(kcm.notificationSettings.popupVisibility)
++            // depends on count: the model is not there yet when the binding is first evaluated
++            currentIndex: count > 0 ? indexOfValue(kcm.notificationSettings.popupVisibility) : -1
+             onActivated: kcm.notificationSettings.popupVisibility = currentValue
+ 
+             KCM.SettingStateBinding {
+@@ -264,7 +266,8 @@ KCM.SimpleKCM {
+             textRole: "text"
+             valueRole: "value"
+             model: root.visibilityModel
+-            currentIndex: indexOfValue(kcm.notificationSettings.historyVisibility)
++            // depends on count: the model is not there yet when the binding is first evaluated
++            currentIndex: count > 0 ? indexOfValue(kcm.notificationSettings.historyVisibility) : -1
+             onActivated: kcm.notificationSettings.historyVisibility = currentValue
+ 
+             KCM.SettingStateBinding {
 diff --git a/po/de/kcm_notifications.po b/po/de/kcm_notifications.po
 index 1b3fe3d7fa..539bba0cac 100644
 --- a/po/de/kcm_notifications.po
